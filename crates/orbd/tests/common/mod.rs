@@ -234,7 +234,8 @@ offerings:
         self.start_agent(id, "");
     }
 
-    /// Starts the coordinator and all agents and waits until every agent is connected.
+    /// Starts the coordinator and all agents and waits until every agent is connected
+    /// and has reported its disk (admission refuses an agent's first orb until then).
     pub fn start_all(&mut self) {
         self.start_coordinator("");
         let ids: Vec<String> = self.agents.keys().cloned().collect();
@@ -242,6 +243,15 @@ offerings:
             self.start_agent(a, "");
         }
         self.wait_connected(ids.len());
+        wait_until(
+            Duration::from_secs(20),
+            "agents reported their disks",
+            || {
+                let m = self.metrics().unwrap_or_default();
+                ids.iter()
+                    .all(|a| m.contains(&format!("orbd_agent_disk_free_bytes{{agent=\"{a}\"}}")))
+            },
+        );
     }
 
     /// Hard-kills (SIGKILL) a process, like a power cut.
