@@ -149,6 +149,78 @@ fn orb_delete_takes_only_orbs_asleep_long_enough() {
     assert!(running[0].bootstraps.iter().all(|b| b.cold_boot));
 }
 
+/// `orbd orb pause` pauses an orb Amp no longer pauses (e.g. its provider token is no
+/// longer served) as Amp would, and the thread's next spawn wakes it.
+#[test]
+fn orb_pause_pauses_as_amp_would() {
+    let mut c = Cluster::new(&["agent-a"], 2);
+    c.start_all();
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn");
+
+    let paused = c.admin(&["orb", "pause", "amp-1"]);
+    assert_ok(&paused, "orb pause");
+    assert_eq!(paused.stdout, "amp-1 paused: pause succeeded");
+    let s = c.only_orb("agent-a");
+    assert!(!s.running && s.disk);
+    assert_eq!(s.counters.checkpoints, 1, "paused with a memory checkpoint");
+    let list = c.admin(&["orb", "list"]).stdout;
+    assert!(list.starts_with("amp-1\tasleep for 0m"), "{list}");
+    let again = c.admin(&["orb", "pause", "amp-1"]);
+    assert_ok(&again, "repeated orb pause");
+    assert!(again.stdout.contains("already stopped"), "{}", again.stdout);
+    assert_eq!(c.only_orb("agent-a").counters.checkpoints, 1);
+
+    let unknown = c.admin(&["orb", "pause", "amp-2"]);
+    assert!(
+        unknown.stderr.contains("no orb amp-2"),
+        "{}",
+        unknown.stderr
+    );
+
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake");
+    let s = c.only_orb("agent-a");
+    assert!(s.running && !s.bootstraps.last().unwrap().cold_boot);
+    assert_eq!(s.counters.restores, 1);
+}
+
+/// `orbd orb delete --force` deletes an orb whatever it is doing: a running orb is
+/// stopped and deleted, and a later spawn starts a fresh one.
+#[test]
+fn orb_delete_force_takes_a_running_orb() {
+    let mut c = Cluster::new(&["agent-a"], 2);
+    c.start_all();
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn");
+
+    let both = c.admin(&[
+        "orb",
+        "delete",
+        "amp-1",
+        "--force",
+        "--min-asleep-mins",
+        "0",
+    ]);
+    assert_ne!(both.code, 0, "--force takes no --min-asleep-mins");
+    let unknown = c.admin(&["orb", "delete", "amp-2", "--force"]);
+    assert!(
+        unknown.stderr.contains("no orb amp-2"),
+        "{}",
+        unknown.stderr
+    );
+    assert!(c.only_orb("agent-a").running);
+
+    let forced = c.admin(&["orb", "delete", "amp-1", "--force"]);
+    assert_ok(&forced, "forced delete of a running orb");
+    assert_eq!(forced.stdout, "amp-1 deleted: delete succeeded");
+    let s = c.only_orb("agent-a");
+    assert!(!s.running && !s.disk);
+    assert_eq!(c.admin(&["orb", "list"]).stdout, "");
+
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn after delete");
+    let orbs = c.fake_orbs("agent-a");
+    assert_eq!(orbs.len(), 2, "a fresh incarnation");
+    assert!(orbs.iter().any(|o| o.running && o.bootstraps[0].cold_boot));
+}
+
 /// One provider whose orb types are offerings: a spawn of a new orb runs on the
 /// offering its ORB_TYPE names (the first orb type when it has none), every later job
 /// acts on the orb as created, and an orb type orbd does not serve fails without
