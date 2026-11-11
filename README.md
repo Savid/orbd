@@ -116,6 +116,12 @@ Static binaries for x86_64 and aarch64 are attached to each release.
 
 Threads you create on that provider in Amp then run on your hosts.
 
+Agents that cannot dial `public_url` (another network, or one reached over a VPN such as
+Tailscale) can use another address of the same listener: list it in `extra_urls`
+(`extra_urls: [https://coordinator.tailnet.ts.net:7443]`), whose hosts are added to the
+coordinator's certificate, and pass it to `orbd join-token <id> --url <url>`. An enrolled
+agent moves to one with `ORBD_COORDINATOR_URL=<url>`, without enrolling again.
+
 The coordinator creates its CA and keys in its volume on first start; keep that volume.
 Agents detect their runtime and capacity (override with `ORBD_CAPACITY_VCPUS`,
 `ORBD_CAPACITY_MEMORY_MIB`, `ORBD_CAPACITY_DISK_GIB`); orbs use DNS `1.1.1.1` and `9.9.9.9`

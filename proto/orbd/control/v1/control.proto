@@ -575,6 +575,8 @@ message CreateJoinTokenRequest {
   string agent_id = 1;
   // 0 = default (1 hour).
   uint64 ttl_secs = 2;
+  // URL the agent dials: public_url or one of extra_urls. Empty = public_url.
+  string url = 3;
 }
 
 message CreateJoinTokenResponse {

@@ -52,6 +52,42 @@ fn join_tokens_are_single_use_and_expire() {
     assert!(!c.logs().contains(&token), "join token leaked into logs");
 }
 
+/// An agent can dial any of the coordinator's URLs (`public_url` or `extra_urls`): one
+/// picked for its join token, or one set later with `ORBD_COORDINATOR_URL`, without
+/// enrolling again. The coordinator's certificate names every host.
+#[test]
+fn agents_dial_any_coordinator_url() {
+    let mut c = Cluster::new(&["agent-a"], 1);
+    c.start_all();
+    let extra = format!("https://127.0.0.1:{}", c.control_port());
+
+    let bad = c.admin(&[
+        "join-token",
+        "agent-b",
+        "--url",
+        "https://elsewhere.example:1",
+    ]);
+    assert_ne!(bad.code, 0);
+    assert!(bad.stderr.contains("extra_urls"), "{}", bad.stderr);
+
+    let j = c.admin(&["join-token", "agent-b", "--url", &extra]);
+    assert_ok(&j, "join-token --url");
+    c.start_agent_with_token("agent-b", &j.stdout);
+    c.wait_connected(2);
+
+    c.terminate_agent("agent-a", Duration::from_secs(30));
+    c.wait_connected(1);
+    c.agent_env
+        .push(("ORBD_COORDINATOR_URL".into(), extra.clone()));
+    c.start_agent("agent-a", "");
+    c.wait_connected(2);
+    assert!(
+        c.logs()
+            .contains("dialing the coordinator at an override URL"),
+        "agent-a did not use ORBD_COORDINATOR_URL"
+    );
+}
+
 /// `orbd agent remove` cuts the agent off for good: its session ends, it cannot
 /// reconnect, and its orbs stay recorded on it (unavailable, never moved elsewhere).
 #[test]

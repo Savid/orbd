@@ -213,8 +213,13 @@ pub async fn run(
     let first_init = !config.db_path().exists();
     let key = SecretKey::load_or_create(&config.agent.secret_key_file, first_init)?;
     let db = db::Db::open(&config.db_path())?;
-    let Some(identity) =
-        identity::Identity::establish(&config.agent.state_dir, join.as_deref(), &stop).await?
+    let Some(identity) = identity::Identity::establish(
+        &config.agent.state_dir,
+        join.as_deref(),
+        config.agent.coordinator_url.as_deref(),
+        &stop,
+    )
+    .await?
     else {
         return Ok(());
     };

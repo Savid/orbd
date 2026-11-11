@@ -37,7 +37,7 @@ const ENROLL_BURST: usize = 30;
 const ENROLL_WINDOW: Duration = Duration::from_secs(60);
 const MAX_CSR_BYTES: usize = 4096;
 
-fn tls_config(inner: &Inner, host: &str) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+fn tls_config(inner: &Inner, hosts: &[String]) -> anyhow::Result<Arc<rustls::ServerConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(inner.ca.cert_der.clone()))?;
@@ -47,7 +47,7 @@ fn tls_config(inner: &Inner, host: &str) -> anyhow::Result<Arc<rustls::ServerCon
     )
     .allow_unauthenticated()
     .build()?;
-    let (chain, key) = inner.ca.issue_server(host)?;
+    let (chain, key) = inner.ca.issue_server(hosts)?;
     let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_client_cert_verifier(verifier)
@@ -60,8 +60,13 @@ fn tls_config(inner: &Inner, host: &str) -> anyhow::Result<Arc<rustls::ServerCon
 }
 
 pub(super) async fn serve(inner: Arc<Inner>, config: &CoordinatorConfig) -> anyhow::Result<()> {
-    let host = pki::url_host(&config.public_url).map_err(anyhow::Error::msg)?;
-    let tls = Arc::new(RwLock::new(tls_config(&inner, &host)?));
+    let hosts = config
+        .agent_urls()
+        .iter()
+        .map(|u| pki::url_host(u))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::msg)?;
+    let tls = Arc::new(RwLock::new(tls_config(&inner, &hosts)?));
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("binding AgentControl listener {}", config.listen))?;
@@ -76,7 +81,7 @@ pub(super) async fn serve(inner: Arc<Inner>, config: &CoordinatorConfig) -> anyh
                     _ = shutdown.cancelled() => return,
                     _ = tokio::time::sleep(SERVER_CERT_ROTATION) => {}
                 }
-                match tls_config(&inner, &host) {
+                match tls_config(&inner, &hosts) {
                     Ok(cfg) => *tls.write().unwrap_or_else(|e| e.into_inner()) = cfg,
                     Err(e) => tracing::error!(error = %e, "renewing server certificate"),
                 }
