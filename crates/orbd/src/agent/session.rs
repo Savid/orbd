@@ -61,7 +61,11 @@ pub(super) async fn run_loop(sh: &Arc<Shared>) {
         first = false;
         match connect_once(sh, &mut attempt).await {
             Ok(()) => {}
-            Err(e) => tracing::warn!(error = %format!("{e:#}"), "control session ended"),
+            Err(e) => tracing::warn!(
+                coordinator = %sh.identity.coordinator_url,
+                error = %format!("{e:#}"),
+                "control session ended"
+            ),
         }
         if sh.shutdown.is_cancelled() {
             break;

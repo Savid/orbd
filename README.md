@@ -180,7 +180,10 @@ Agents use QEMU and Firecracker when `/dev/kvm` works, otherwise Docker (mount
 `/var/run/docker.sock`). On `docker stop` an agent saves its running VM orbs and restores
 them when it starts again,
 so give it time (`--stop-timeout 300`; under systemd, `KillMode=mixed` and
-`TimeoutStopSec=300`). Orb disk sizes must be at least Amp's image
+`TimeoutStopSec=300`). When the host shuts down, systemd stops `docker.service` itself,
+which by default it kills after 90 s, cutting saves short whatever `--stop-timeout` says:
+raise it too, e.g. a drop-in `/etc/systemd/system/docker.service.d/orbd.conf` with
+`[Service]` and `TimeoutStopSec=360`. Orb disk sizes must be at least Amp's image
 (~5 GiB).
 
 The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Linux 6.18
