@@ -120,7 +120,8 @@ Agents that cannot dial `public_url` (another network, or one reached over a VPN
 Tailscale) can use another address of the same listener: list it in `extra_urls`
 (`extra_urls: [https://coordinator.tailnet.ts.net:7443]`), whose hosts are added to the
 coordinator's certificate, and pass it to `orbd join-token <id> --url <url>`. An enrolled
-agent moves to one with `ORBD_COORDINATOR_URL=<url>`, without enrolling again.
+agent dials one instead while `ORBD_COORDINATOR_URL=<url>` is set (keep it set: the
+enrolled URL is not changed), without enrolling again.
 
 The coordinator creates its CA and keys in its volume on first start; keep that volume.
 Agents detect their runtime and capacity (override with `ORBD_CAPACITY_VCPUS`,

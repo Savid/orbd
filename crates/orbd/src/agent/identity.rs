@@ -6,8 +6,9 @@
 //! `agent.pem`. The key and CSR are written before the CSR is sent, so a retry after a
 //! lost response presents the same CSR and gets the same certificate.
 //!
-//! `ORBD_COORDINATOR_URL` overrides the stored coordinator URL for this run (e.g. to move
-//! an agent to one of the coordinator's `extra_urls`); `enrollment.json` is left as is.
+//! `ORBD_COORDINATOR_URL` overrides the stored coordinator URL while it is set (e.g. to
+//! move an agent to one of the coordinator's `extra_urls`); `enrollment.json` is left as
+//! is, so without it the agent dials the enrolled URL again.
 
 use super::Shared;
 use crate::model::AgentId;
@@ -50,6 +51,8 @@ impl Identity {
         url_override: Option<&str>,
         shutdown: &CancellationToken,
     ) -> Result<Option<Self>> {
+        // An empty value (e.g. compose's `${VAR:-}`) means unset.
+        let url_override = url_override.filter(|u| !u.is_empty());
         if let Some(u) = url_override {
             pki::url_host(u).map_err(|e| anyhow::anyhow!("ORBD_COORDINATOR_URL: {e}"))?;
         }

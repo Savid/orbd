@@ -60,12 +60,13 @@ fn tls_config(inner: &Inner, hosts: &[String]) -> anyhow::Result<Arc<rustls::Ser
 }
 
 pub(super) async fn serve(inner: Arc<Inner>, config: &CoordinatorConfig) -> anyhow::Result<()> {
-    let hosts = config
-        .agent_urls()
-        .iter()
-        .map(|u| pki::url_host(u))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(anyhow::Error::msg)?;
+    let mut hosts: Vec<String> = Vec::new();
+    for u in config.agent_urls() {
+        let h = pki::url_host(&u).map_err(anyhow::Error::msg)?;
+        if !hosts.contains(&h) {
+            hosts.push(h);
+        }
+    }
     let tls = Arc::new(RwLock::new(tls_config(&inner, &hosts)?));
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
