@@ -93,6 +93,8 @@ pub struct PlacementCandidate {
     pub memory: Option<crate::model::MemoryReport>,
     /// True when the location already holds the requested project snapshot.
     pub has_project_snapshot: bool,
+    /// The location takes new orbs only when no other location fits them.
+    pub overflow: bool,
 }
 
 /// Domain form of a delivery. `secrets` is secret-bearing: never logged.

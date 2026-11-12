@@ -405,6 +405,9 @@ message Hello {
   Resources capacity = 5;
   uint64 last_controller_epoch = 6; // highest epoch this agent has accepted
   repeated string project_snapshot_keys = 7; // project snapshots published on this host
+  // Overflow agent (e.g. a laptop or workstation): a new orb goes here only when no other
+  // agent fits it.
+  bool overflow = 8;
 }
 
 message Heartbeat {
@@ -610,6 +613,7 @@ message AgentInfo {
   // The host's available memory and the agent's memory reserve (0 = not reported).
   uint64 memory_available_bytes = 15;
   uint64 memory_reserve_bytes = 16;
+  bool overflow = 17; // as in Hello
 }
 
 message ListAgentsResponse {

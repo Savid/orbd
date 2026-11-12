@@ -116,6 +116,8 @@ pub struct AgentSection {
     pub metrics_listen: Option<SocketAddr>,
     /// Overrides the coordinator URL from enrollment (`ORBD_COORDINATOR_URL`).
     pub coordinator_url: Option<String>,
+    /// New orbs come here only when no other agent fits them (`ORBD_OVERFLOW`).
+    pub overflow: bool,
 }
 
 pub const DEFAULT_DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
@@ -214,6 +216,7 @@ impl AgentSection {
             guest_network: GuestNetwork::default(),
             metrics_listen: None,
             coordinator_url: None,
+            overflow: false,
         }
     }
 }

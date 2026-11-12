@@ -115,6 +115,7 @@ async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
         capacity: Some(sh.capacity.into()),
         last_controller_epoch: epoch,
         project_snapshot_keys,
+        overflow: sh.config.agent.overflow,
     })))
 }
 

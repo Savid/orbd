@@ -1066,6 +1066,11 @@ impl Core {
                 ),
             )));
         }
+        // Overflow agents (not always on) take a new orb only when nothing else fits it:
+        // an orb stays where it was created.
+        if fitting.iter().any(|(c, _)| !c.overflow) {
+            fitting.retain(|(c, _)| !c.overflow);
+        }
         // Prefer a host holding the project snapshot (v1: snapshots are
         // host-local); otherwise fall back to the base image for this new orb.
         if snap_key.is_some() && fitting.iter().any(|(c, _)| c.has_project_snapshot) {
@@ -2103,6 +2108,7 @@ mod tests {
                 reserve_bytes: 8 * GIB,
             }),
             has_project_snapshot: false,
+            overflow: false,
         };
         // Three running orbs reserve 34 GiB and 17 vCPUs nominally, as on 2026-10-30.
         let used = store::PoolUse {
