@@ -87,6 +87,7 @@ impl Cluster {
             &root.join("coordinator.yaml"),
             format!(
                 r#"public_url: https://localhost:{control_port}
+extra_urls: [https://127.0.0.1:{control_port}]
 listen: 127.0.0.1:{control_port}
 state_dir: {root}/coordinator
 metrics_listen: 127.0.0.1:{metrics_port}
@@ -119,6 +120,11 @@ offerings:
                 vec![("ORBD_DISK_RESERVE_GIB".into(), "1".into())]
             },
         }
+    }
+
+    /// The coordinator's AgentControl port (on 127.0.0.1).
+    pub fn control_port(&self) -> u16 {
+        self.control_port
     }
 
     pub fn root(&self) -> &Path {

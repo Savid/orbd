@@ -38,7 +38,16 @@ impl Admin for AdminService {
             s => Duration::from_secs(s),
         };
         let expires = unix_ms_now().saturating_add(ttl.as_millis() as u64);
-        let token = JoinToken::new(&self.0.public_url, &self.0.ca.cert_der, &r.agent_id);
+        let url = match r.url.as_str() {
+            "" => &self.0.agent_urls[0],
+            u => self.0.agent_urls.iter().find(|a| *a == u).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "{u:?} is not public_url or one of extra_urls ({})",
+                    self.0.agent_urls.join(", ")
+                ))
+            })?,
+        };
+        let token = JoinToken::new(url, &self.0.ca.cert_der, &r.agent_id);
         let encoded = token.encode();
         self.0
             .db
@@ -142,12 +151,14 @@ pub async fn cli_join_token(
     socket: &std::path::Path,
     agent_id: &str,
     ttl: Duration,
+    url: Option<&str>,
 ) -> anyhow::Result<String> {
     let r = client(socket)
         .await?
         .create_join_token(pb::CreateJoinTokenRequest {
             agent_id: agent_id.to_owned(),
             ttl_secs: ttl.as_secs().max(1),
+            url: url.unwrap_or_default().to_owned(),
         })
         .await
         .map_err(status)?;

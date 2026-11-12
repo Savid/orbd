@@ -114,6 +114,8 @@ pub struct AgentSection {
     /// The network VM orbs see.
     pub guest_network: GuestNetwork,
     pub metrics_listen: Option<SocketAddr>,
+    /// Overrides the coordinator URL from enrollment (`ORBD_COORDINATOR_URL`).
+    pub coordinator_url: Option<String>,
 }
 
 pub const DEFAULT_DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
@@ -211,6 +213,7 @@ impl AgentSection {
             dns_servers: DEFAULT_DNS.map(String::from).to_vec(),
             guest_network: GuestNetwork::default(),
             metrics_listen: None,
+            coordinator_url: None,
         }
     }
 }

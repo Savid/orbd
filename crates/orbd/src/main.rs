@@ -40,6 +40,9 @@ enum Command {
         /// Validity in seconds.
         #[arg(long, default_value_t = 3600)]
         ttl_secs: u64,
+        /// URL the agent dials: `public_url` (default) or one of `extra_urls`.
+        #[arg(long)]
+        url: Option<String>,
         #[command(flatten)]
         coordinator: CoordinatorArgs,
     },
@@ -97,6 +100,10 @@ struct AgentArgs {
     /// Join token from `orbd join-token`; needed only for the first start.
     #[arg(long, env = "ORBD_JOIN", hide_env_values = true)]
     join: Option<String>,
+    /// Dial the coordinator here instead of the URL from enrollment, e.g. one of its
+    /// `extra_urls`. Its host must be named on the coordinator's certificate.
+    #[arg(long, env = "ORBD_COORDINATOR_URL")]
+    coordinator_url: Option<String>,
     #[arg(long, env = "ORBD_STATE_DIR", default_value = "/var/lib/orbd")]
     state_dir: PathBuf,
     /// DNS servers for orbs, comma-separated.
@@ -152,13 +159,19 @@ fn main() -> anyhow::Result<()> {
         Command::JoinToken {
             agent_id,
             ttl_secs,
+            url,
             coordinator,
         } => {
             let socket = admin_socket(&coordinator)?;
             let ttl = std::time::Duration::from_secs(ttl_secs);
             println!(
                 "{}",
-                rt.block_on(admin::cli_join_token(&socket, &agent_id, ttl))?
+                rt.block_on(admin::cli_join_token(
+                    &socket,
+                    &agent_id,
+                    ttl,
+                    url.as_deref()
+                ))?
             );
             Ok(())
         }
@@ -233,6 +246,7 @@ fn main() -> anyhow::Result<()> {
                 memory_reserve_gib: a.memory_reserve_gib,
             };
             s.metrics_listen = a.metrics_listen;
+            s.coordinator_url = a.coordinator_url;
             config.agent = s;
             rt.block_on(async {
                 let shutdown = shutdown_on_signal();

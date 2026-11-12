@@ -235,14 +235,23 @@ impl Ca {
         Ok((cert.der().to_vec(), key_sha256(csr.public_key.der_bytes())))
     }
 
-    /// A fresh server certificate for `host`: DER chain (leaf, CA) and PKCS#8 DER key.
-    pub fn issue_server(&self, host: &str) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
-        let san = match host.parse::<std::net::IpAddr>() {
-            Ok(ip) => SanType::IpAddress(ip),
-            Err(_) => SanType::DnsName(host.try_into().map_err(|e| anyhow!("{e:?}"))?),
+    /// A fresh server certificate naming `hosts` (DNS names or IP addresses; the first is
+    /// also the CN): DER chain (leaf, CA) and PKCS#8 DER key.
+    pub fn issue_server(&self, hosts: &[String]) -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
+        let Some(cn) = hosts.first() else {
+            bail!("a server certificate needs at least one host");
         };
+        let sans = hosts
+            .iter()
+            .map(|h| match h.parse::<std::net::IpAddr>() {
+                Ok(ip) => Ok(SanType::IpAddress(ip)),
+                Err(_) => Ok(SanType::DnsName(
+                    h.as_str().try_into().map_err(|e| anyhow!("{e:?}"))?,
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
-        let cert = Self::leaf(vec![san], host, ExtendedKeyUsagePurpose::ServerAuth)
+        let cert = Self::leaf(sans, cn, ExtendedKeyUsagePurpose::ServerAuth)
             .signed_by(&key, &self.issuer)?;
         Ok((
             vec![cert.der().to_vec(), self.cert_der.clone()],

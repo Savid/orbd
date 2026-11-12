@@ -64,7 +64,8 @@ struct Inner {
     id: BackendId,
     controller_epoch: u64,
     heartbeat_interval: Duration,
-    public_url: String,
+    /// URLs agents may dial (`public_url` first); join tokens carry one of them.
+    agent_urls: Vec<String>,
     ca: Ca,
     db: Db,
     state: Mutex<State>,
@@ -143,7 +144,7 @@ impl FleetBackend {
             id: BackendId::new(FLEET_BACKEND),
             controller_epoch,
             heartbeat_interval: Duration::from_millis(config.heartbeat_interval_ms),
-            public_url: config.public_url.clone(),
+            agent_urls: config.agent_urls(),
             ca,
             db,
             state: Mutex::new(state),

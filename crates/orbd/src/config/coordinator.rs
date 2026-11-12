@@ -47,6 +47,12 @@ pub struct CoordinatorConfig {
     /// URL agents dial, e.g. `https://coordinator.example:7443`. Join tokens carry it, and
     /// its host is the name on the coordinator's certificate.
     pub public_url: String,
+    /// Other URLs that reach the same listener, for agents that cannot dial `public_url`
+    /// (e.g. a Tailscale or VPN address). Their hosts are also named on the certificate.
+    /// `orbd join-token --url` puts one in a token; `ORBD_COORDINATOR_URL` moves an
+    /// enrolled agent to one without enrolling again.
+    #[serde(default)]
+    pub extra_urls: Vec<String>,
     /// AgentControl listener (TLS).
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
@@ -492,12 +498,27 @@ impl CoordinatorConfig {
         Ok(())
     }
 
+    /// Every URL agents may dial: `public_url` first, then `extra_urls` (duplicates dropped).
+    pub fn agent_urls(&self) -> Vec<String> {
+        let mut urls = vec![self.public_url.clone()];
+        for u in &self.extra_urls {
+            if !urls.contains(u) {
+                urls.push(u.clone());
+            }
+        }
+        urls
+    }
+
     /// Structural validation. Capability validation against the backend happens when
     /// it is constructed (see `coordinator`).
     pub fn validate(&self) -> Result<(), ConfigError> {
         let inv = |m: String| Err(ConfigError::Invalid(m));
         crate::pki::url_host(&self.public_url)
             .map_err(|e| ConfigError::Invalid(format!("public_url: {e}")))?;
+        for u in &self.extra_urls {
+            crate::pki::url_host(u)
+                .map_err(|e| ConfigError::Invalid(format!("extra_urls: {e}")))?;
+        }
         if self.heartbeat_interval_ms == 0 {
             return inv("heartbeat_interval_ms must be > 0".into());
         }
@@ -648,6 +669,32 @@ mod tests {
         }
         .to_offering()
         .unwrap()
+    }
+
+    #[test]
+    fn extra_urls_are_checked_and_follow_public_url() {
+        let load = |extra: &str| {
+            let yaml = format!(
+                "config_version: v2\npublic_url: https://c.example:7443\n{extra}\
+                 provider: {{ token_file: /t/p }}\n\
+                 orb_types:\n  - {{ id: a, vcpus: 2, memory_mib: 2048, disk_gib: 10 }}\n"
+            );
+            let mut c = serde_saphyr::from_str::<CoordinatorConfig>(&yaml).unwrap();
+            c.normalize().unwrap();
+            c.validate().map(|()| c.agent_urls())
+        };
+        assert_eq!(load("").unwrap(), vec!["https://c.example:7443".to_owned()]);
+        assert_eq!(
+            load("extra_urls: [https://100.64.0.1:7443, https://c.example:7443]\n").unwrap(),
+            vec![
+                "https://c.example:7443".to_owned(),
+                "https://100.64.0.1:7443".to_owned()
+            ]
+        );
+        let err = load("extra_urls: [http://c.ts.net:7443]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("extra_urls"), "{err}");
     }
 
     #[test]

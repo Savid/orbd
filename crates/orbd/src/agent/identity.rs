@@ -5,6 +5,10 @@
 //! and coordinator URL), `ca.pem`, `agent.key`, `agent.csr` and, once enrolled,
 //! `agent.pem`. The key and CSR are written before the CSR is sent, so a retry after a
 //! lost response presents the same CSR and gets the same certificate.
+//!
+//! `ORBD_COORDINATOR_URL` overrides the stored coordinator URL while it is set (e.g. to
+//! move an agent to one of the coordinator's `extra_urls`); `enrollment.json` is left as
+//! is, so without it the agent dials the enrolled URL again.
 
 use super::Shared;
 use crate::model::AgentId;
@@ -38,13 +42,33 @@ impl Identity {
         self.dir.join(name)
     }
 
-    /// Loads the enrolled identity, or enrolls with `join`. Returns `None` if shut down
-    /// while waiting for the coordinator.
+    /// Loads the enrolled identity, or enrolls with `join`, dialing `url_override` if
+    /// given instead of the enrolled (or token's) URL. Returns `None` if shut down while
+    /// waiting for the coordinator.
     pub async fn establish(
         state_dir: &Path,
         join: Option<&str>,
+        url_override: Option<&str>,
         shutdown: &CancellationToken,
     ) -> Result<Option<Self>> {
+        // An empty value (e.g. compose's `${VAR:-}`) means unset.
+        let url_override = url_override.filter(|u| !u.is_empty());
+        if let Some(u) = url_override {
+            pki::url_host(u).map_err(|e| anyhow::anyhow!("ORBD_COORDINATOR_URL: {e}"))?;
+        }
+        let dial = |enrolled: &str| -> String {
+            match url_override {
+                Some(u) if u != enrolled => {
+                    tracing::info!(
+                        enrolled,
+                        url = u,
+                        "dialing the coordinator at an override URL"
+                    );
+                    u.to_owned()
+                }
+                _ => enrolled.to_owned(),
+            }
+        };
         let dir = state_dir.join("identity");
         let meta: Option<Enrollment> = match std::fs::read(dir.join("enrollment.json")) {
             Ok(b) => Some(serde_json::from_slice(&b).context("reading enrollment.json")?),
@@ -64,7 +88,7 @@ impl Identity {
             }
             return Ok(Some(Self {
                 agent_id: AgentId::new(m.agent_id.clone()),
-                coordinator_url: m.coordinator_url.clone(),
+                coordinator_url: dial(&m.coordinator_url),
                 dir,
             }));
         }
@@ -103,7 +127,7 @@ impl Identity {
         pki::write_private(&dir.join("ca.pem"), ca_pem.as_bytes())?;
         let id = Self {
             agent_id: AgentId::new(token.agent_id.clone()),
-            coordinator_url: token.coordinator_url.clone(),
+            coordinator_url: dial(&token.coordinator_url),
             dir,
         };
         let csr = std::fs::read(id.path("agent.csr")).context("reading agent.csr")?;
