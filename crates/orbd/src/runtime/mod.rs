@@ -130,6 +130,14 @@ pub trait Runtime: Send + Sync {
 
     async fn inspect(&self, orb: OrbId) -> Result<RuntimeObservation, RuntimeError>;
 
+    /// Cheap check, without the orb lock or a call into the VMM, that the orb's VMM
+    /// process launched last still exists: `Some(false)` once it is gone, `None` when the
+    /// runtime cannot tell. Lets the agent's liveness sweep skip `inspect` (which settles
+    /// and may wait on the VMM) for orbs that are plainly still running.
+    fn vmm_alive(&self, _orb: OrbId) -> Option<bool> {
+        None
+    }
+
     /// Starts the orb. Must not return Ok until the VMM/container is running.
     ///
     /// `MemoryCheckpoint`: the runtime must durably mark the checkpoint consumed *before*

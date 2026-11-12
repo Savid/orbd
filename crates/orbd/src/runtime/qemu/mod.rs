@@ -1074,6 +1074,12 @@ impl Runtime for QemuRuntime {
         }
     }
 
+    fn vmm_alive(&self, orb: OrbId) -> Option<bool> {
+        let rp = self.run_paths(orb);
+        let record: LaunchRecord = process::read_record(&rp.launch)?;
+        Some(Process::adopt(&record, &launch_name(orb, &record), Some(&rp.pidfile)).is_some())
+    }
+
     async fn inspect(&self, orb: OrbId) -> Result<RuntimeObservation, RuntimeError> {
         self.inspect_inner(orb).await
     }
