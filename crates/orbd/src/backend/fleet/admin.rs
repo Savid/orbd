@@ -105,6 +105,7 @@ impl Admin for AdminService {
                     reserved: Some(used.held.into()),
                     orbs: used.orbs,
                     running_orbs: used.running,
+                    overflow: s.hello.as_ref().is_some_and(|h| h.overflow),
                 }
             })
             .collect();
@@ -183,6 +184,11 @@ pub async fn cli_list(socket: &std::path::Path) -> anyhow::Result<String> {
             (true, _) => "removed",
             (false, true) => "connected",
             (false, false) => "disconnected",
+        };
+        let state = if a.overflow {
+            format!("{state} (overflow)")
+        } else {
+            state.to_owned()
         };
         let days = a.certificate_expires_unix_ms.saturating_sub(now) / 86_400_000;
         let cap = a.capacity.unwrap_or_default();

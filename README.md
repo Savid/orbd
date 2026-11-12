@@ -135,6 +135,11 @@ each agent's orbs, its reservations against its capacity, and its disk: free, al
 by orbd, reserved and limit (also exported as `orbd_agent_disk_*_bytes` and
 `orbd_reserved_disk_bytes`).
 
+A new orb goes to the agent with the most free memory that fits it. An agent started with
+`ORBD_OVERFLOW=true`, e.g. on a laptop or a workstation that is not always on, gets one only
+when no other agent fits it, since an orb stays on the agent it was created on and cannot
+wake while that host is off. `orbd agent list` marks such agents `(overflow)`.
+
 Running orbs reserve their vCPUs and memory; sleeping orbs reserve nothing. An orb type's
 `disk_gib` is each orb's disk size, a sparse file that grows as the orb writes, so disk is
 admitted by what the host actually has: a new or waking orb needs free space for its

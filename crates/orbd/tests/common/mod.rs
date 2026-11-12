@@ -237,6 +237,18 @@ offerings:
         self.agents.insert(id.to_string(), Some(child));
     }
 
+    /// Starts agent `id` (minting its token) with extra environment on top of `agent_env`.
+    pub fn start_agent_with_env(&mut self, id: &str, env: &[(&str, &str)]) {
+        let token = self.join_token(id);
+        self.tokens.insert(id.to_string(), token.clone());
+        let child = self
+            .agent_command(id, &token, "")
+            .envs(env.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+            .spawn()
+            .unwrap();
+        self.agents.insert(id.to_string(), Some(child));
+    }
+
     /// Starts an agent that is not part of the initial cluster, with a given token.
     pub fn start_agent_with_token(&mut self, id: &str, token: &str) {
         self.tokens.insert(id.to_string(), token.to_string());
@@ -318,7 +330,7 @@ offerings:
         self.root().join("coordinator/dispatch.sock")
     }
 
-    fn metrics(&self) -> Option<String> {
+    pub fn metrics(&self) -> Option<String> {
         let mut s = TcpStream::connect(("127.0.0.1", self.metrics_port)).ok()?;
         s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         s.write_all(b"GET /metrics HTTP/1.0\r\nHost: x\r\n\r\n")

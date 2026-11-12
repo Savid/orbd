@@ -218,6 +218,7 @@ impl ComputeBackend for BoatBackend {
                 reserve_bytes: 0,
             }),
             has_project_snapshot: false,
+            overflow: false,
         }])
     }
 

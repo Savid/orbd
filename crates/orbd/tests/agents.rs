@@ -88,6 +88,47 @@ fn agents_dial_any_coordinator_url() {
     );
 }
 
+/// An overflow agent (`ORBD_OVERFLOW`) gets a new orb only when no other agent fits it,
+/// even with more room than they have.
+#[test]
+fn overflow_agents_take_new_orbs_only_when_the_others_are_full() {
+    let mut c = Cluster::new(&["agent-a"], 2);
+    c.start_all();
+    c.start_agent_with_env(
+        "spare",
+        &[
+            ("ORBD_OVERFLOW", "true"),
+            ("ORBD_CAPACITY_VCPUS", "16"),
+            ("ORBD_CAPACITY_MEMORY_MIB", "16384"),
+        ],
+    );
+    c.wait_connected(2);
+    wait_until(Duration::from_secs(20), "spare reported its disk", || {
+        c.metrics()
+            .unwrap_or_default()
+            .contains("orbd_agent_disk_free_bytes{agent=\"spare\"}")
+    });
+    let list = c.admin(&["agent", "list"]);
+    assert!(
+        list.stdout.contains("spare\tconnected (overflow)"),
+        "{}",
+        list.stdout
+    );
+
+    for orb in ["amp-1", "amp-2"] {
+        assert_ok(&c.dispatch("spawn", orb, &[]), orb);
+    }
+    assert_eq!(c.fake_orbs("agent-a").len(), 2, "agent-a fills first");
+    assert!(c.fake_orbs("spare").is_empty(), "spare stays empty");
+
+    assert_ok(&c.dispatch("spawn", "amp-3", &[]), "amp-3");
+    assert_eq!(
+        c.fake_orbs("spare").len(),
+        1,
+        "agent-a is full: spare takes it"
+    );
+}
+
 /// `orbd agent remove` cuts the agent off for good: its session ends, it cannot
 /// reconnect, and its orbs stay recorded on it (unavailable, never moved elsewhere).
 #[test]

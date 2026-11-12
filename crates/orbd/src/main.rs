@@ -150,6 +150,10 @@ struct AgentArgs {
     /// Prometheus listener, e.g. `127.0.0.1:9465`.
     #[arg(long, env = "ORBD_METRICS_LISTEN")]
     metrics_listen: Option<std::net::SocketAddr>,
+    /// Take new orbs only when no other agent fits them, e.g. on a laptop or workstation
+    /// that is not always on (orbs stay on the agent they were created on).
+    #[arg(long, env = "ORBD_OVERFLOW")]
+    overflow: bool,
     /// Optional YAML with advanced runtime and image settings.
     #[arg(long, short, env = "ORBD_AGENT_CONFIG")]
     config: Option<PathBuf>,
@@ -280,6 +284,7 @@ fn main() -> anyhow::Result<()> {
             };
             s.metrics_listen = a.metrics_listen;
             s.coordinator_url = a.coordinator_url;
+            s.overflow = a.overflow;
             config.agent = s;
             rt.block_on(async {
                 let shutdown = shutdown_on_signal();

@@ -619,6 +619,7 @@ impl ComputeBackend for FleetBackend {
                     .project_snapshot
                     .as_ref()
                     .is_some_and(|k| slot.snapshots.contains(k.as_str())),
+                overflow: slot.hello.as_ref().is_some_and(|h| h.overflow),
             });
         }
         Ok(out)
