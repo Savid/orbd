@@ -5,7 +5,7 @@
 //! * [`session`]: the AgentControl client (connect/backoff, Hello, heartbeat, delivery
 //!   handling, cancel, reconcile, ack, completion replay).
 //! * [`executor`]: one actor per orb; strictly serialized, idempotent action logic,
-//!   pinned deadlines, recovery after restart.
+//!   pinned deadlines, recovery after restart, liveness checks of running orbs.
 //! * [`logs`]: bounded log queue kept apart from control messages.
 //! * [`maintenance`]: graceful stop (drain: checkpoint running orbs, leave restore
 //!   intents) and their restore at the next start.
@@ -62,6 +62,9 @@ pub(crate) struct Shared {
     /// accepted), running orbs checkpointed.
     pub draining: CancellationToken,
     pub reserved: Mutex<HashMap<OrbId, Resources>>,
+    /// Orbs with a liveness check queued or running, so a slow `inspect` cannot pile
+    /// checks up behind it.
+    pub liveness_queued: Mutex<std::collections::HashSet<OrbId>>,
     /// Last measurement of the bytes allocated under the state directory.
     pub disk_allocated: AtomicU64,
     /// Free disk to keep (see [`crate::model::disk_reserve`]).
@@ -304,6 +307,7 @@ pub async fn run(
         shutdown: CancellationToken::new(),
         draining: CancellationToken::new(),
         reserved: Mutex::default(),
+        liveness_queued: Mutex::default(),
         disk_allocated: AtomicU64::new(0),
         disk_reserve,
         memory_reserve,
@@ -320,6 +324,7 @@ pub async fn run(
 
     // Ready (Hello) only after interrupted work is requeued and drained orbs restored.
     executor::recover(&shared).await?;
+    tokio::spawn(executor::watch(shared.clone()));
     tokio::spawn(gc::run_loop(shared.clone()));
     measure_disk(&shared).await;
     tokio::spawn({

@@ -192,6 +192,11 @@ pub enum BackendEvent {
         location: Location,
         availability: Availability,
     },
+    /// Orb states observed outside any command (a VM that exited on its own).
+    OrbsObserved {
+        location: Location,
+        orbs: Vec<(crate::model::OrbId, u64, crate::model::OrbState)>,
+    },
 }
 
 #[async_trait]

@@ -490,6 +490,8 @@ message OrbObservation {
   OrbState state = 3;
 }
 
+// Also sent unsolicited, with an empty correlation_id, for an orb whose state changed
+// outside any command (its VM exited on its own).
 message ReconcileResponse {
   string correlation_id = 1;
   repeated OperationReport operations = 2;

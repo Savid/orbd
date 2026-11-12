@@ -1161,9 +1161,9 @@ impl Core {
     }
 
     /// Asks a host that just became available for every orb it holds. Its VMs may have
-    /// died while it was away (a host reboot or freeze); the core only hears of state
-    /// changes from commands, so without this such an orb stays "running", holding its
-    /// compute, until its next command.
+    /// died while it was away (a host reboot or freeze), when it could not report them
+    /// (`BackendEvent::OrbsObserved`); without this such an orb stays "running", holding
+    /// its compute, until its next command.
     fn reconcile_location(&self, location: Location) {
         let Some(backend) = self.backends.get(location.backend_id()).cloned() else {
             return;
@@ -1294,6 +1294,9 @@ impl Core {
                     }
                     self.reconcile_location(location);
                 }
+            }
+            BackendEvent::OrbsObserved { location, orbs } => {
+                self.orbs_reported(location, orbs).await?;
             }
         }
         Ok(())

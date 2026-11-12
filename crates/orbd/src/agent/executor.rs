@@ -13,6 +13,9 @@
 //!   already-stopped orb is reported from `inspect` plus that intent.
 //! * Delete is state-based and idempotent.
 //!
+//! Between operations, a liveness check on the same actor notices a VMM that ended on
+//! its own and reports the orb stopped (see [`watch`]).
+//!
 //! Deadlines are pinned at acceptance as unix ms; here they become `Instant`s. Past the
 //! work deadline only cleanup runs, until the cleanup deadline.
 
@@ -37,6 +40,8 @@ use tokio_util::sync::CancellationToken;
 /// How long a newly admitted orb's memory counts against the host on top of what the
 /// host reports: a cold boot or a restore takes a while to show up as used.
 const RECENT_ADMIT: Duration = Duration::from_secs(120);
+/// How often orbs holding a reservation are checked for a VMM that ended on its own.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) fn runtime_for(sh: &Shared, orb: &OrbDefinition) -> Option<Arc<dyn Runtime>> {
     match &orb.spec.template.target {
@@ -66,6 +71,8 @@ pub(crate) enum Work {
         super::maintenance::Task,
         tokio::sync::oneshot::Sender<super::maintenance::Outcome>,
     ),
+    /// Liveness check of an orb holding a reservation (see [`watch`]).
+    Check(Box<OrbDefinition>),
 }
 
 /// Startup: rebuild reservations from what is actually running, requeue every
@@ -92,27 +99,13 @@ pub(crate) async fn recover(sh: &Arc<Shared>) -> anyhow::Result<()> {
         let observed = rt.inspect(d.id).await;
         // A VMM that ended while the agent was down (host reboot, container stop
         // without a drain) took its processes with it: record that, not "running".
-        if let Ok(RuntimeObservation::Stopped { checkpoint }) = &observed {
-            let id = d.id;
-            let row = sh.db.call(move |c| db::get_orb(c, id)).await?;
-            if row
-                .and_then(|r| r.last_state)
-                .is_some_and(|s| matches!(s.last_known(), StableOrbState::Running))
-            {
-                let state = OrbState::known(match checkpoint {
-                    Some(cp) => StableOrbState::Sleeping {
-                        checkpoint: cp.clone(),
-                    },
-                    None => StableOrbState::DiskOnlyStopped {
-                        reason: "the VM stopped while the agent was down; processes lost".into(),
-                    },
-                });
-                tracing::warn!(orb = %id, state = ?state, "orb is no longer running");
-                sh.db
-                    .call(move |c| db::set_last_state(c, id, &state))
-                    .await?;
-            }
-        }
+        record_stopped(
+            sh,
+            d.id,
+            &observed,
+            "the VM stopped while the agent was down; processes lost",
+        )
+        .await?;
         // An orb we cannot inspect is assumed to hold its resources.
         let running = !matches!(
             observed,
@@ -133,6 +126,116 @@ pub(crate) async fn recover(sh: &Arc<Shared>) -> anyhow::Result<()> {
         enqueue(sh, r.orb.id, r.operation_id);
     }
     super::maintenance::restore_all(sh, &busy).await
+}
+
+/// Records that an orb last known running was observed stopped, its VMM gone without a
+/// command. Returns the orb as recorded, or None if it was not recorded as running or
+/// was not observed stopped.
+async fn record_stopped(
+    sh: &Shared,
+    id: OrbId,
+    observed: &Result<RuntimeObservation, RuntimeError>,
+    reason: &str,
+) -> anyhow::Result<Option<db::OrbRow>> {
+    let Ok(RuntimeObservation::Stopped { checkpoint }) = observed else {
+        return Ok(None);
+    };
+    let Some(mut row) = sh.db.call(move |c| db::get_orb(c, id)).await? else {
+        return Ok(None);
+    };
+    if !row
+        .last_state
+        .as_ref()
+        .is_some_and(|s| matches!(s.last_known(), StableOrbState::Running))
+    {
+        return Ok(None);
+    }
+    let state = OrbState::known(match checkpoint {
+        Some(cp) => StableOrbState::Sleeping {
+            checkpoint: cp.clone(),
+        },
+        None => StableOrbState::DiskOnlyStopped {
+            reason: reason.into(),
+        },
+    });
+    tracing::warn!(orb = %id, state = ?state, "orb is no longer running");
+    let st = state.clone();
+    sh.db.call(move |c| db::set_last_state(c, id, &st)).await?;
+    row.last_state = Some(state);
+    Ok(Some(row))
+}
+
+/// While the agent runs, checks every [`LIVENESS_INTERVAL`] that orbs holding a
+/// reservation still have their VMM, so one that dies on its own (killed, crashed) is
+/// reported stopped and its compute freed within seconds. The check runs on the orb's
+/// actor, never alongside its operations; an orb with an operation pending is left to
+/// that operation, which reports what it finds.
+pub(crate) async fn watch(sh: Arc<Shared>) {
+    loop {
+        tokio::select! {
+            _ = sh.shutdown.cancelled() => return,
+            _ = sh.draining.cancelled() => return,
+            _ = tokio::time::sleep(LIVENESS_INTERVAL) => {}
+        }
+        let held: std::collections::HashSet<OrbId> = sh
+            .reserved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
+        if held.is_empty() {
+            continue;
+        }
+        let found = sh
+            .db
+            .call(|c| Ok((db::list_orb_definitions(c)?, db::list_unfinished(c)?)))
+            .await;
+        let (defs, pending) = match found {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(error = %e, "liveness check: cannot list orbs");
+                continue;
+            }
+        };
+        let busy: std::collections::HashSet<OrbId> = pending.iter().map(|r| r.orb.id).collect();
+        for d in defs {
+            if held.contains(&d.id)
+                && !busy.contains(&d.id)
+                && sh
+                    .liveness_queued
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(d.id)
+            {
+                enqueue_work(&sh, d.id, Work::Check(Box::new(d)));
+            }
+        }
+    }
+}
+
+/// Reports an orb whose VMM has ended on its own as stopped (see [`watch`]).
+async fn check_alive(sh: &Arc<Shared>, orb: &OrbDefinition) -> anyhow::Result<()> {
+    let Some(rt) = runtime_for(sh, orb) else {
+        return Ok(());
+    };
+    let observed = rt.inspect(orb.id).await;
+    let Some(row) = record_stopped(
+        sh,
+        orb.id,
+        &observed,
+        "the VM stopped on its own; processes lost",
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    sh.reserved
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&orb.id);
+    sh.send_control(session::orb_report_event(&row));
+    Ok(())
 }
 
 pub(crate) fn enqueue(sh: &Arc<Shared>, orb: OrbId, op: OperationId) {
@@ -166,6 +269,18 @@ async fn actor(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Work>) {
             Work::Op(op) => op,
             Work::Maintenance(orb, task, done) => {
                 let _ = done.send(super::maintenance::run(&sh, &orb, task).await);
+                continue;
+            }
+            Work::Check(orb) => {
+                if !sh.draining.is_cancelled()
+                    && let Err(e) = check_alive(&sh, &orb).await
+                {
+                    tracing::warn!(orb = %orb.id, error = %format!("{e:#}"), "liveness check failed");
+                }
+                sh.liveness_queued
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&orb.id);
                 continue;
             }
         };

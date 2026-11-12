@@ -233,16 +233,7 @@ fn orbs_whose_vm_died_with_the_host_are_stopped_when_it_returns() {
 
     // The host goes down hard: no drain, and the VM is gone when it comes back.
     c.kill_agent("agent-a");
-    let fake = c.root().join("agents/agent-a/state/fake");
-    let file = std::fs::read_dir(&fake)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let mut st: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    st["running"] = false.into();
-    std::fs::write(&file, serde_json::to_vec(&st).unwrap()).unwrap();
+    c.kill_vm("agent-a");
     c.start_agent("agent-a", "");
     c.wait_connected(1);
 
@@ -250,6 +241,35 @@ fn orbs_whose_vm_died_with_the_host_are_stopped_when_it_returns() {
         c.admin(&["orb", "list"]).stdout.contains("amp-1\tstopped")
     });
     // Its compute is free again: the agent has room for only one running orb.
+    assert_ok(
+        &c.dispatch("spawn", "amp-2", &[]),
+        "spawn 2 in amp-1's room",
+    );
+    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2");
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake 1");
+    let one = c
+        .fake_orbs("agent-a")
+        .into_iter()
+        .find(|o| o.running)
+        .unwrap();
+    assert_eq!(one.counters.boots, 2, "amp-1 cold-booted again");
+    assert!(one.bootstraps.last().unwrap().cold_boot);
+}
+
+/// A VM that dies while its agent runs (killed, crashed) is noticed within seconds: the
+/// orb is recorded as stopped and its compute freed without an agent restart, and the
+/// next wake cold-boots it.
+#[test]
+fn orbs_whose_vm_dies_while_the_agent_runs_are_stopped() {
+    let mut c = Cluster::new(&["agent-a"], 1);
+    c.start_all();
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn 1");
+
+    c.kill_vm("agent-a");
+    wait_until(Duration::from_secs(20), "amp-1 recorded as stopped", || {
+        c.admin(&["orb", "list"]).stdout.contains("amp-1\tstopped")
+    });
+    // Its compute is free again, on the agent too: it has room for one running orb.
     assert_ok(
         &c.dispatch("spawn", "amp-2", &[]),
         "spawn 2 in amp-1's room",

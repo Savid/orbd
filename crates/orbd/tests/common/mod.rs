@@ -423,6 +423,25 @@ offerings:
         .collect()
     }
 
+    /// Ends the VM of the single orb on `agent` behind the agent's back, as a killed or
+    /// crashed VMM would: the fake runtime then observes it stopped.
+    pub fn kill_vm(&self, agent: &str) {
+        let fake = self.root().join("agents").join(agent).join("state/fake");
+        let file = std::fs::read_dir(&fake)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "json"))
+            .unwrap();
+        let mut st: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        st["running"] = false.into();
+        // Atomically: a running agent may be reading it.
+        let tmp = file.with_extension("json.kill");
+        std::fs::write(&tmp, serde_json::to_vec(&st).unwrap()).unwrap();
+        std::fs::rename(&tmp, &file).unwrap();
+    }
+
     /// The single orb on `agent` (panics if there isn't exactly one).
     pub fn only_orb(&self, agent: &str) -> FakeOrbState {
         let mut orbs = self.fake_orbs(agent);
