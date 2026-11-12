@@ -137,7 +137,11 @@ impl Identity {
             {
                 bail!("enrollment as {} refused: {}", id.agent_id, s.message());
             }
-            tracing::warn!(error = %format!("{err:#}"), "enrollment failed; retrying");
+            tracing::warn!(
+                coordinator = %id.coordinator_url,
+                error = %format!("{err:#}"),
+                "enrollment failed; retrying"
+            );
             tokio::select! {
                 _ = shutdown.cancelled() => return Ok(None),
                 _ = tokio::time::sleep(delay) => {}
