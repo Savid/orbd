@@ -46,7 +46,7 @@ enum Command {
         #[command(flatten)]
         coordinator: CoordinatorArgs,
     },
-    /// List or delete orbs (run on the coordinator).
+    /// List, pause or delete orbs (run on the coordinator).
     #[command(subcommand)]
     Orb(OrbCommand),
     /// Handle one Amp dispatch job from the environment (run by `amp orb provider`).
@@ -79,17 +79,35 @@ enum AgentCommand {
 enum OrbCommand {
     /// List orbs: Amp orb id, state and for how long, agent, offering.
     List(CoordinatorArgs),
+    /// Pause an orb as if Amp had sent `pause` (a memory checkpoint where the runtime
+    /// keeps one), after any job Amp has queued for it. For an orb Amp no longer
+    /// pauses, e.g. one whose provider token is no longer served; its thread's next
+    /// spawn wakes it.
+    Pause {
+        /// Amp orb id (Amp's ORB_ID, `amp-<thread id>`), as `orbd orb list` shows it.
+        amp_orb_id: String,
+        #[command(flatten)]
+        coordinator: CoordinatorArgs,
+    },
     /// Delete an orb whose thread is gone (Amp sends no delete for an archived thread),
     /// as if Amp had sent `delete`. Refused unless the orb was last seen asleep or
     /// stopped at least `--min-asleep-mins` ago, with no job from Amp open or started
-    /// since (the coordinator keeps finished jobs for about an hour). A later spawn
-    /// starts a fresh orb.
+    /// since (the coordinator keeps finished jobs for about an hour), or `--force`. A
+    /// later spawn starts a fresh orb.
     Delete {
         /// Amp orb id (Amp's ORB_ID, `amp-<thread id>`), as `orbd orb list` shows it.
         amp_orb_id: String,
         /// How long ago the orb must have been last seen asleep or stopped.
         #[arg(long, default_value_t = 60)]
         min_asleep_mins: u64,
+        /// Delete the orb whatever it is doing, stopping it if it runs (its processes
+        /// and files are lost), even if its thread is in use, and also an orb whose
+        /// earlier delete did not finish. For an orb Amp no longer drives; prefer
+        /// `orbd orb pause`, then a plain delete once `--min-asleep-mins` has passed.
+        /// Once queued (behind any job Amp has for the orb) it runs even if this command
+        /// is interrupted.
+        #[arg(long, conflicts_with = "min_asleep_mins")]
+        force: bool,
         #[command(flatten)]
         coordinator: CoordinatorArgs,
     },
@@ -202,12 +220,27 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Orb(OrbCommand::Pause {
+            amp_orb_id,
+            coordinator,
+        }) => {
+            println!(
+                "{}",
+                rt.block_on(orbd::coordinator::orbs::cli_pause(
+                    &admin_socket(&coordinator)?,
+                    &amp_orb_id
+                ))?
+            );
+            Ok(())
+        }
         Command::Orb(OrbCommand::Delete {
             amp_orb_id,
             min_asleep_mins,
+            force,
             coordinator,
         }) => {
-            let min_asleep = std::time::Duration::from_secs(min_asleep_mins.saturating_mul(60));
+            let min_asleep = (!force)
+                .then(|| std::time::Duration::from_secs(min_asleep_mins.saturating_mul(60)));
             println!(
                 "{}",
                 rt.block_on(orbd::coordinator::orbs::cli_delete(

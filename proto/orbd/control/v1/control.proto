@@ -623,8 +623,13 @@ service Orbs {
   // the orb asleep or stopped at least `min_asleep_secs` ago and no command or request
   // for it is open or started since then (finished requests are only kept for about
   // an hour). An orb in use is never deleted. A later spawn of the same Amp orb id
-  // starts a fresh orb.
+  // starts a fresh orb. With `force` none of that is checked: the delete queues behind
+  // any job already queued for the orb and stops it first if it is running.
   rpc DeleteOrb(DeleteOrbRequest) returns (DeleteOrbResponse);
+  // Pauses one orb through the ordinary pause path, as if Amp had sent `pause`, and
+  // returns its result: for an orb Amp no longer pauses, e.g. one whose provider token
+  // is no longer served. Its thread's next spawn wakes it.
+  rpc PauseOrb(PauseOrbRequest) returns (PauseOrbResponse);
 }
 
 message ListOrbsRequest {}
@@ -648,9 +653,19 @@ message ListOrbsResponse {
 message DeleteOrbRequest {
   string amp_orb_id = 1;
   uint64 min_asleep_secs = 2;
+  // Delete whatever the orb's state; min_asleep_secs is ignored.
+  bool force = 3;
 }
 
 message DeleteOrbResponse {
+  string message = 1;
+}
+
+message PauseOrbRequest {
+  string amp_orb_id = 1;
+}
+
+message PauseOrbResponse {
   string message = 1;
 }
 

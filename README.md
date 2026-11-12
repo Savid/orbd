@@ -160,6 +160,13 @@ it was last seen asleep or stopped at least `--min-asleep-mins` ago (default 60)
 no job from Amp open or started since (finished jobs are kept for about an hour), so an
 orb in use is never deleted.
 
+An orb Amp no longer drives, e.g. one left running after its provider's token was
+replaced without listing the old one in `retired_token_files`, is never paused by Amp.
+`orbd orb pause <amp orb id>` pauses it as Amp would (its thread's next spawn wakes it),
+and `orbd orb delete --force <amp orb id>` deletes it whatever it is doing, stopping it
+first if it runs. Both queue behind any job Amp has for the orb; a forced delete loses
+the orb's files and processes even if its thread is in use.
+
 Amp never deletes project snapshots either: it reuses one for at most 72 hours, then
 names a new one. An agent deletes a project snapshot or prepared image once no orb on it
 is built on it and nothing has used it for 72 hours (the current image of a prewarmed

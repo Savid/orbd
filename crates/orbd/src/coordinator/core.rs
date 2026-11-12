@@ -63,16 +63,26 @@ pub enum Msg {
         location: Location,
         orbs: Vec<(OrbId, u64, OrbState)>,
     },
-    /// `orbd orb delete`: delete the orb if it has been asleep, with no job, for
-    /// `min_asleep`. Refusals arrive on `tx` as an error, results as dispatch events.
-    DeleteAsleep {
+    /// `orbd orb pause|delete`: a job for one orb, queued as if Amp had sent it.
+    /// Refusals arrive on `tx` as an error, results as dispatch events.
+    OperatorJob {
         amp_orb_id: AmpOrbId,
-        min_asleep: Duration,
+        job: OperatorJob,
         tx: EventTx,
     },
     HookFinished {
         hook: Hook,
         result: std::result::Result<(), String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum OperatorJob {
+    Pause,
+    /// Only an orb asleep, with no job, for `min_asleep`; `None` (`--force`) deletes
+    /// it whatever it is doing.
+    Delete {
+        min_asleep: Option<Duration>,
     },
 }
 
@@ -217,13 +227,13 @@ impl Core {
                     tracing::error!(error = %format!("{err:#}"), "applying reported orb states failed");
                 }
             }
-            Msg::DeleteAsleep {
+            Msg::OperatorJob {
                 amp_orb_id,
-                min_asleep,
+                job,
                 tx,
             } => {
-                if let Err(err) = self.delete_asleep(amp_orb_id, min_asleep, tx.clone()).await {
-                    tracing::error!(error = %format!("{err:#}"), "orb delete request failed");
+                if let Err(err) = self.operator_job(amp_orb_id, job, tx.clone()).await {
+                    tracing::error!(error = %format!("{err:#}"), "operator orb job failed");
                     let _ = tx
                         .send(Err(GrpcStatus::unavailable("coordinator internal error")))
                         .await;
@@ -1734,26 +1744,36 @@ impl Core {
                 "deleting orb asleep past the idle TTL"
             );
             metrics::counter!("orbd_idle_orbs_reclaimed_total").increment(1);
-            self.queue_delete(&orb, now, None).await?;
+            self.queue_job(&orb, ReqAction::Delete, now, None).await?;
         }
         Ok(())
     }
 
-    /// Deletes one orb on an operator's request (`orbd orb delete`, e.g. from a job
-    /// that finds archived threads), through the ordinary delete path. The orb
-    /// qualifies as [`store::idle_orbs`] judges it with a cutoff `min_asleep` ago: last
-    /// seen asleep or stopped before the cutoff, no open command, and no request
+    /// Pauses or deletes one orb on an operator's request (`orbd orb pause|delete`),
+    /// through the ordinary path, queued behind any job Amp has for it.
+    ///
+    /// A delete with `min_asleep` (e.g. from a job that finds archived threads) takes
+    /// only an orb [`store::idle_orbs`] judges idle with a cutoff `min_asleep` ago:
+    /// last seen asleep or stopped before the cutoff, no open command, and no request
     /// queued, running, or started since the cutoff (finished requests are pruned
     /// after about an hour). An orb Amp is using is never deleted; checking and
     /// queueing here in the actor leaves no gap for a spawn to slip in between.
-    async fn delete_asleep(
+    ///
+    /// Pause and a forced delete are for orbs Amp no longer drives, e.g. one left
+    /// running when its provider's token stopped being served: nothing else would
+    /// ever stop it.
+    async fn operator_job(
         &mut self,
         amp_orb_id: AmpOrbId,
-        min_asleep: Duration,
+        job: OperatorJob,
         tx: EventTx,
     ) -> Result<()> {
         let now = unix_ms_now();
-        let cutoff = now.saturating_sub(min_asleep.as_millis() as u64);
+        let min_asleep = match job {
+            OperatorJob::Delete { min_asleep } => min_asleep,
+            OperatorJob::Pause => None,
+        };
+        let cutoff = min_asleep.map(|m| now.saturating_sub(m.as_millis() as u64));
         let mut endpoints: Vec<AmpEndpointId> = self
             .offerings
             .values()
@@ -1761,6 +1781,9 @@ impl Core {
             .collect();
         endpoints.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         endpoints.dedup();
+        // A forced delete also takes an orb whose earlier delete did not finish (it has a
+        // tombstone, so Amp's spawns are refused, but it is not deleted): the case it is for.
+        let force = matches!(job, OperatorJob::Delete { min_asleep: None });
         let id = amp_orb_id.clone();
         let (orbs, idle) = self
             .db
@@ -1768,29 +1791,41 @@ impl Core {
                 let mut orbs = Vec::new();
                 for ep in &endpoints {
                     if let Some(o) = store::get_orb_by_identity(c, ep.as_str(), id.as_str())?
-                        && !store::is_tombstoned(c, o.id)?
+                        && (!store::is_tombstoned(c, o.id)?
+                            || force
+                                && !matches!(
+                                    o.observation.state,
+                                    OrbState::Known {
+                                        state: StableOrbState::Deleted
+                                    }
+                                ))
                     {
                         orbs.push(o);
                     }
                 }
-                let idle: Vec<OrbId> = store::idle_orbs(c, cutoff)?.iter().map(|o| o.id).collect();
+                let idle: Vec<OrbId> = match cutoff {
+                    Some(cutoff) => store::idle_orbs(c, cutoff)?.iter().map(|o| o.id).collect(),
+                    None => Vec::new(),
+                };
                 Ok((orbs, idle))
             })
             .await?;
-        let mins = min_asleep.as_secs() / 60;
+        let mins = min_asleep.unwrap_or_default().as_secs() / 60;
         let refusal = match orbs.as_slice() {
             [] => Some(GrpcStatus::not_found(format!("no orb {amp_orb_id}"))),
             [_, _, ..] => Some(GrpcStatus::failed_precondition(format!(
                 "{amp_orb_id} names orbs under {} Amp endpoints",
                 orbs.len()
             ))),
-            [o] if !idle.contains(&o.id) => Some(GrpcStatus::failed_precondition(format!(
-                "{amp_orb_id} is {} (recorded {} min ago); it must have been last seen asleep \
-                 or stopped at least {mins} min ago, with no job from Amp open or started \
-                 since (finished jobs are kept for about an hour)",
-                state_label(&o.observation.state),
-                now.saturating_sub(o.observation.observed_at_unix_ms) / 60_000
-            ))),
+            [o] if cutoff.is_some() && !idle.contains(&o.id) => {
+                Some(GrpcStatus::failed_precondition(format!(
+                    "{amp_orb_id} is {} (recorded {} min ago); it must have been last seen \
+                     asleep or stopped at least {mins} min ago, with no job from Amp open or \
+                     started since (finished jobs are kept for about an hour)",
+                    state_label(&o.observation.state),
+                    now.saturating_sub(o.observation.observed_at_unix_ms) / 60_000
+                )))
+            }
             [_] => None,
         };
         if let Some(status) = refusal {
@@ -1798,25 +1833,41 @@ impl Core {
             return Ok(());
         }
         let orb = orbs.into_iter().next().expect("checked above");
+        let action = match job {
+            OperatorJob::Pause => ReqAction::Pause { snapshot_id: None },
+            OperatorJob::Delete { .. } => ReqAction::Delete,
+        };
         tracing::info!(
             orb = %orb.id,
             amp_orb_id = %orb.identity.amp_orb_id,
             location = ?orb.location,
-            asleep_mins = now.saturating_sub(orb.observation.observed_at_unix_ms) / 60_000,
-            "deleting orb on request"
+            state = %state_label(&orb.observation.state),
+            state_age_mins = now.saturating_sub(orb.observation.observed_at_unix_ms) / 60_000,
+            ?job,
+            "{} orb on request",
+            match action {
+                ReqAction::Delete => "deleting",
+                _ => "pausing",
+            }
         );
-        self.queue_delete(&orb, now, Some(tx)).await
+        self.queue_job(&orb, action, now, Some(tx)).await
     }
 
-    /// Queues a Delete request for `orb`, as if Amp had sent it, and starts it if the
-    /// orb is free. With `tx`, the caller follows it like a dispatch.
-    async fn queue_delete(&mut self, orb: &OrbRecord, now: u64, tx: Option<EventTx>) -> Result<()> {
+    /// Queues a pause or delete request for `orb`, as if Amp had sent it, and starts it
+    /// if the orb is free. With `tx`, the caller follows it like a dispatch.
+    async fn queue_job(
+        &mut self,
+        orb: &OrbRecord,
+        action: ReqAction,
+        now: u64,
+        tx: Option<EventTx>,
+    ) -> Result<()> {
         let req = Req {
             invocation_id: InvocationId::generate(),
             offering_id: orb.offering_id.clone(),
             amp_endpoint: orb.identity.amp_endpoint.clone(),
             amp_orb_id: orb.identity.amp_orb_id.clone(),
-            action: ReqAction::Delete,
+            action,
             fingerprint: None,
             seq: 0,
             start_ms: now,

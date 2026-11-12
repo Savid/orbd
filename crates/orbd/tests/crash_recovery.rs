@@ -157,3 +157,32 @@ fn deadlines_cancel_work_and_expire_queued_requests() {
     );
     assert!(c.only_orb("agent-a").running);
 }
+
+/// A delete that failed on the agent leaves the orb tombstoned (Amp's spawns are
+/// refused) but not deleted; `orbd orb delete --force` still reaches it.
+#[test]
+fn forced_delete_finishes_an_orb_whose_delete_failed() {
+    let mut c = Cluster::new(&["agent-a"], 2);
+    c.start_coordinator("");
+    c.start_agent("agent-a", "fake::delete=return");
+    c.wait_connected(1);
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn");
+    let failed = c.dispatch("delete", "amp-1", &[]);
+    assert_ne!(
+        failed.code, 0,
+        "delete fails on the agent: {}",
+        failed.stdout
+    );
+    assert!(c.only_orb("agent-a").disk, "not deleted");
+    let plain = c.admin(&["orb", "delete", "amp-1"]);
+    assert!(plain.stderr.contains("no orb amp-1"), "{}", plain.stderr);
+
+    c.kill_agent("agent-a");
+    c.wait_connected(0);
+    c.start_agent("agent-a", "");
+    c.wait_connected(1);
+    let forced = c.admin(&["orb", "delete", "amp-1", "--force"]);
+    assert_ok(&forced, "forced delete of a tombstoned orb");
+    let s = c.only_orb("agent-a");
+    assert!(!s.running && !s.disk, "deleted");
+}
