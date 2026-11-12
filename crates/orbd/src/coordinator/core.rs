@@ -1676,6 +1676,9 @@ impl Core {
             .collect();
         endpoints.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         endpoints.dedup();
+        // A forced delete also takes an orb whose earlier delete did not finish (it has a
+        // tombstone, so Amp's spawns are refused, but it is not deleted): the case it is for.
+        let force = matches!(job, OperatorJob::Delete { min_asleep: None });
         let id = amp_orb_id.clone();
         let (orbs, idle) = self
             .db
@@ -1683,7 +1686,14 @@ impl Core {
                 let mut orbs = Vec::new();
                 for ep in &endpoints {
                     if let Some(o) = store::get_orb_by_identity(c, ep.as_str(), id.as_str())?
-                        && !store::is_tombstoned(c, o.id)?
+                        && (!store::is_tombstoned(c, o.id)?
+                            || force
+                                && !matches!(
+                                    o.observation.state,
+                                    OrbState::Known {
+                                        state: StableOrbState::Deleted
+                                    }
+                                ))
                     {
                         orbs.push(o);
                     }
@@ -1730,7 +1740,10 @@ impl Core {
             state_age_mins = now.saturating_sub(orb.observation.observed_at_unix_ms) / 60_000,
             ?job,
             "{} orb on request",
-            action.name()
+            match action {
+                ReqAction::Delete => "deleting",
+                _ => "pausing",
+            }
         );
         self.queue_job(&orb, action, now, Some(tx)).await
     }

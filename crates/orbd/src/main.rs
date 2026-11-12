@@ -98,8 +98,11 @@ enum OrbCommand {
         #[arg(long, default_value_t = 60)]
         min_asleep_mins: u64,
         /// Delete the orb whatever it is doing, stopping it if it runs (its processes
-        /// and files are lost), even if its thread is in use. For an orb Amp no longer
-        /// drives; prefer `orbd orb pause`, then a plain delete.
+        /// and files are lost), even if its thread is in use, and also an orb whose
+        /// earlier delete did not finish. For an orb Amp no longer drives; prefer
+        /// `orbd orb pause`, then a plain delete once `--min-asleep-mins` has passed.
+        /// Once queued (behind any job Amp has for the orb) it runs even if this command
+        /// is interrupted.
         #[arg(long, conflicts_with = "min_asleep_mins")]
         force: bool,
         #[command(flatten)]
