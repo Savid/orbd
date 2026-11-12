@@ -467,6 +467,13 @@ impl Inner {
                     _ => return Err(wire::WireError(format!("cancel status {}", c.status))),
                 }
             }
+            // Unsolicited: an orb the agent saw stop outside any command.
+            E::Reconcile(r) if r.correlation_id.is_empty() => {
+                self.emit(BackendEvent::OrbsObserved {
+                    location: self.location(agent),
+                    orbs: page_from_wire(r)?.orbs,
+                });
+            }
             E::Reconcile(r) => {
                 let waiter = st
                     .agents

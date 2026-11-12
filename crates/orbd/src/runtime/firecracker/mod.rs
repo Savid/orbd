@@ -1072,6 +1072,11 @@ impl Runtime for FirecrackerRuntime {
         }
     }
 
+    fn vmm_alive(&self, orb: OrbId) -> Option<bool> {
+        let record: LaunchRecord = process::read_record(&self.run_paths(orb).launch)?;
+        Some(Process::adopt(&record, &marker(&record), None).is_some())
+    }
+
     async fn inspect(&self, orb: OrbId) -> Result<RuntimeObservation, RuntimeError> {
         self.inspect_inner(orb).await
     }

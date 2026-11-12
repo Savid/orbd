@@ -49,6 +49,17 @@ fn rejected_event(key: pb::CommandKey, code: FailureCode, message: String) -> pb
     }))
 }
 
+/// Reports an orb's state outside any command (its VMM ended on its own): a reconcile
+/// response no request asked for, with an empty correlation id.
+pub(super) fn orb_report_event(row: &db::OrbRow) -> pb::AgentEvent {
+    ev(pb::agent_event::Event::Reconcile(pb::ReconcileResponse {
+        correlation_id: String::new(),
+        operations: vec![],
+        orbs: vec![orb_observation(row)],
+        next_page_token: String::new(),
+    }))
+}
+
 // --- connection loop --------------------------------------------------------
 
 pub(super) async fn run_loop(sh: &Arc<Shared>) {
@@ -419,6 +430,14 @@ fn orb_state_pb(s: Option<&OrbState>) -> pb::OrbState {
     }
 }
 
+fn orb_observation(row: &db::OrbRow) -> pb::OrbObservation {
+    pb::OrbObservation {
+        orb_id: row.orb_id.to_string(),
+        generation: row.highest_generation,
+        state: Some(orb_state_pb(row.last_state.as_ref())),
+    }
+}
+
 async fn handle_reconcile(sh: &Arc<Shared>, r: pb::ReconcileRequest) -> anyhow::Result<()> {
     let ops: Vec<OperationId> = r
         .operation_ids
@@ -499,14 +518,7 @@ async fn handle_reconcile(sh: &Arc<Shared>, r: pb::ReconcileRequest) -> anyhow::
         pb::ReconcileResponse {
             correlation_id: r.correlation_id,
             operations: op_reports,
-            orbs: orb_rows
-                .iter()
-                .map(|row| pb::OrbObservation {
-                    orb_id: row.orb_id.to_string(),
-                    generation: row.highest_generation,
-                    state: Some(orb_state_pb(row.last_state.as_ref())),
-                })
-                .collect(),
+            orbs: orb_rows.iter().map(orb_observation).collect(),
             next_page_token: next,
         },
     )));
