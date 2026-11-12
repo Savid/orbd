@@ -84,6 +84,8 @@ pub struct CoordinatorConfig {
     /// Boat (boat.dev) sandboxes: offerings with `runtime: boat` (v1), or orb types of a
     /// Boat size that `prefer` allows on Boat (v2).
     pub boat: Option<BoatConfig>,
+    /// Commands that start and stop the agents' hosts.
+    pub wake: Option<WakeConfig>,
     /// v1: each offering is one runtime and size. v2: generated from `orb_types`.
     #[serde(default)]
     pub offerings: Vec<OfferingConfig>,
@@ -183,6 +185,34 @@ pub struct BoatCapacity {
     pub vcpus: u32,
     pub memory_mib: u64,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeConfig {
+    /// Argv, no shell. Run when a spawn finds no agent; the spawn waits for one.
+    pub command: Vec<String>,
+    /// At most 200, to fit Amp's job budget.
+    #[serde(default = "default_wake_timeout")]
+    pub timeout_secs: u64,
+    /// Sleeping orbs do not count as activity.
+    pub sleep_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub sleep_after_idle_secs: u64,
+    /// Either command is killed after this long.
+    #[serde(default = "default_hook_timeout")]
+    pub hook_timeout_secs: u64,
+}
+
+fn default_hook_timeout() -> u64 {
+    120
+}
+
+fn default_wake_timeout() -> u64 {
+    180
+}
+
+/// Longest `wake.timeout_secs`: Amp's job budget, less time to start the orb.
+pub const MAX_WAKE_TIMEOUT_SECS: u64 = 200;
 
 fn default_boat_auto_stop() -> u64 {
     24 * 60 * 60
@@ -516,6 +546,31 @@ impl CoordinatorConfig {
         {
             return inv("boat.capacity must be non-zero".into());
         }
+        if let Some(w) = &self.wake {
+            if w.command.is_empty() {
+                return inv("wake.command is empty".into());
+            }
+            if !(1..=MAX_WAKE_TIMEOUT_SECS).contains(&w.timeout_secs) {
+                return inv(format!(
+                    "wake.timeout_secs must be between 1 and {MAX_WAKE_TIMEOUT_SECS}"
+                ));
+            }
+            if !(1..=3600).contains(&w.hook_timeout_secs) {
+                return inv("wake.hook_timeout_secs must be between 1 and 3600".into());
+            }
+            match (&w.sleep_command, w.sleep_after_idle_secs) {
+                (Some(c), _) if c.is_empty() => {
+                    return inv("wake.sleep_command is empty".into());
+                }
+                (Some(_), 0) => {
+                    return inv("wake.sleep_command needs sleep_after_idle_secs".into());
+                }
+                (None, s) if s > 0 => {
+                    return inv("wake.sleep_after_idle_secs needs sleep_command".into());
+                }
+                _ => {}
+            }
+        }
         let mut providers = HashSet::new();
         for p in &self.providers {
             if offerings.contains(p.id.as_str()) || !providers.insert(p.id.as_str()) {
@@ -725,6 +780,56 @@ mod tests {
                       provider: { token_file: /t/p, retired_token_files: [/t/p] }\n\
                       orb_types:\n  - { id: a, vcpus: 2, memory_mib: 4096, disk_gib: 20 }\n";
         assert!(load_str(shared).unwrap_err().contains("/t/p is used twice"));
+    }
+
+    #[test]
+    fn wake_needs_a_command_and_sleep_settings_together() {
+        let check = |wake: &str| {
+            load_str(&format!(
+                "public_url: https://c.example:7443\n\
+                 offerings:\n  - id: fake-2vcpu-2gb\n    runtime: fake\n    \
+                 resources: {{ vcpus: 2, memory_mib: 2048, disk_gib: 4 }}\n\
+                 wake:\n{wake}"
+            ))
+            .err()
+        };
+        assert_eq!(check("  command: [start-host]\n"), None);
+        assert_eq!(
+            check(
+                "  command: [start-host]\n  sleep_command: [stop-host]\n  \
+                 sleep_after_idle_secs: 7200\n"
+            ),
+            None
+        );
+        let err = |wake: &str, want: &str| {
+            let e = check(wake).expect("refused");
+            assert!(e.contains(want), "{e}");
+        };
+        err("  command: []\n", "wake.command is empty");
+        err(
+            "  command: [start-host]\n  hook_timeout_secs: 0\n",
+            "hook_timeout_secs must be between 1 and 3600",
+        );
+        err(
+            "  command: [start-host]\n  timeout_secs: 0\n",
+            "between 1 and 200",
+        );
+        err(
+            "  command: [start-host]\n  timeout_secs: 300\n",
+            "between 1 and 200",
+        );
+        err(
+            "  command: [start-host]\n  sleep_command: [stop-host]\n",
+            "needs sleep_after_idle_secs",
+        );
+        err(
+            "  command: [start-host]\n  sleep_after_idle_secs: 60\n",
+            "needs sleep_command",
+        );
+        err(
+            "  command: [start-host]\n  sleep_command: []\n  sleep_after_idle_secs: 60\n",
+            "wake.sleep_command is empty",
+        );
     }
 
     #[test]

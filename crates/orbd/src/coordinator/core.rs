@@ -7,10 +7,12 @@ use super::db::Db;
 use super::logs::{self, LogStore};
 use super::store::{self, Applied, CreatePlan};
 use super::types::*;
+use super::wake::{Hold, Hook, Waker};
 use crate::backend::{
     Availability, BackendEvent, CancelRequest, CommandDelivery, CommandSecrets, ComputeBackend,
     OperationStatus, PlacementCandidate, PlacementRequest, ReconcileQuery,
 };
+use crate::config::coordinator::FLEET_BACKEND;
 use crate::model::*;
 use crate::secrets::{PermittedGuestEnv, SecretKey};
 use anyhow::Result;
@@ -68,6 +70,10 @@ pub enum Msg {
         min_asleep: Duration,
         tx: EventTx,
     },
+    HookFinished {
+        hook: Hook,
+        result: std::result::Result<(), String>,
+    },
 }
 
 pub struct Core {
@@ -86,6 +92,7 @@ pub struct Core {
     last_reclaim: HashMap<OrbId, Instant>,
     policy: Policy,
     ticks: u64,
+    waker: Option<Waker>,
 }
 
 /// Placement and lifecycle policy from the coordinator config.
@@ -102,6 +109,7 @@ enum Step {
     Finished,
     /// A command now occupies the orb.
     Started,
+    Waiting,
 }
 
 type Refusal = CommandFailure;
@@ -128,6 +136,7 @@ impl Core {
         policy: Policy,
     ) -> Self {
         Self {
+            waker: None,
             db,
             key,
             epoch,
@@ -143,6 +152,11 @@ impl Core {
             policy,
             ticks: 0,
         }
+    }
+
+    pub fn with_waker(mut self, waker: Option<Waker>) -> Self {
+        self.waker = waker;
+        self
     }
 
     /// Recovery: re-submit every non-terminal command (same operation id, generation and
@@ -213,6 +227,11 @@ impl Core {
                     let _ = tx
                         .send(Err(GrpcStatus::unavailable("coordinator internal error")))
                         .await;
+                }
+            }
+            Msg::HookFinished { hook, result } => {
+                if let Some(w) = &mut self.waker {
+                    w.finished(hook, result);
                 }
             }
         }
@@ -482,7 +501,7 @@ impl Core {
         }
         match self.start(&head).await? {
             Step::Finished => Ok(true),
-            Step::Started => Ok(false),
+            Step::Started | Step::Waiting => Ok(false),
         }
     }
 
@@ -612,10 +631,30 @@ impl Core {
                 }
             },
         };
+        let spawn = matches!(head.action, ReqAction::Spawn { .. });
+        let wakes =
+            spawn && self.waker.is_some() && self.on_fleet(orb.as_ref(), offering.as_ref(), true);
+        // During and after the sleep command, the agent may still look available.
+        if spawn
+            && self.waker.as_ref().is_some_and(|w| w.holding())
+            && self.on_fleet(orb.as_ref(), offering.as_ref(), false)
+            && let Some(step) = self.hold(head, orb.as_ref(), None).await?
+        {
+            return Ok(step);
+        }
         let plan = match self.plan(head, offering.as_ref(), orb.as_ref()).await? {
             Ok(p) => p,
+            Err(r) if wakes && r.code == FailureCode::BackendUnavailable => {
+                return match self.hold(head, orb.as_ref(), Some(r.clone())).await? {
+                    Some(step) => Ok(step),
+                    None => self.finish_refused(head, orb.as_ref(), r).await,
+                };
+            }
             Err(r) => return self.finish_refused(head, orb.as_ref(), r).await,
         };
+        if let Some(w) = &mut self.waker {
+            w.forget(head.invocation_id);
+        }
         let op = plan.operation_id;
         let p = plan;
         let (generation, orb_id) = (p.generation, p.orb_id);
@@ -625,6 +664,55 @@ impl Core {
         tracing::info!(operation = %op, orb = %orb_id, generation, action = head.action.name(), "command created");
         self.submit_command(op).await;
         Ok(Step::Started)
+    }
+
+    /// `spill`: a new orb also counts when a spill target is on the agents.
+    fn on_fleet(&self, orb: Option<&OrbRecord>, offering: Option<&Offering>, spill: bool) -> bool {
+        let fleet = |o: &Offering| o.backend_id.as_str() == FLEET_BACKEND;
+        match (orb, offering) {
+            (Some(o), _) => matches!(o.location, Location::Fleet { .. }),
+            (None, Some(o)) => {
+                fleet(o)
+                    || spill
+                        && o.spill_to
+                            .iter()
+                            .filter_map(|id| self.offerings.get(id))
+                            .any(fleet)
+            }
+            (None, None) => false,
+        }
+    }
+
+    /// `refusal`: placement found no host. None: carry on as without `wake:`.
+    async fn hold(
+        &mut self,
+        head: &Req,
+        orb: Option<&OrbRecord>,
+        refusal: Option<Refusal>,
+    ) -> Result<Option<Step>> {
+        let Some(w) = &mut self.waker else {
+            return Ok(None);
+        };
+        let inv = head.invocation_id;
+        let (hold, note) = w.hold(inv, refusal.is_some());
+        if let Some(message) = note {
+            self.send_event(
+                inv,
+                event(pb::dispatch_event::Event::Progress(pb::DispatchProgress {
+                    operation_id: String::new(),
+                    phase: "waking".into(),
+                    message,
+                })),
+            );
+        }
+        match (hold, refusal) {
+            (Hold::Wait, _) => Ok(Some(Step::Waiting)),
+            (Hold::GiveUp(why), Some(mut r)) => {
+                r.message = format!("{}; {why}", r.message);
+                Ok(Some(self.finish_refused(head, orb, r).await?))
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn candidates(
@@ -1285,6 +1373,13 @@ impl Core {
                 availability,
             } => {
                 tracing::info!(?location, ?availability, "backend availability changed");
+                if let (Location::Fleet { agent_id, .. }, Some(w)) = (&location, &mut self.waker) {
+                    if availability == Availability::Available {
+                        w.agent_connected(agent_id.to_string());
+                    } else {
+                        w.agent_disconnected(&agent_id.to_string());
+                    }
+                }
                 if availability == Availability::Available {
                     let open = self.db.call(|c| store::open_commands(c)).await?;
                     for (cmd, orb) in open {
@@ -1477,6 +1572,9 @@ impl Core {
         // 2. Open commands: cancel at the work deadline, resubmit unconfirmed ones,
         //    reconcile uncertain ones.
         let open = self.db.call(|c| store::open_commands(c)).await?;
+        let fleet_jobs = open
+            .iter()
+            .any(|(_, orb)| matches!(orb.location, Location::Fleet { .. }));
         for (cmd, orb) in &open {
             let op = cmd.operation_id;
             let key = CommandKey {
@@ -1588,6 +1686,13 @@ impl Core {
                 ))
             })
             .await?;
+        if let Some(w) = &mut self.waker {
+            let fleet = format!("{FLEET_BACKEND}/");
+            let running = pools
+                .iter()
+                .any(|(pool, u)| pool.starts_with(&fleet) && u.running > 0);
+            w.tick(fleet_jobs || running);
+        }
         metrics::gauge!("orbd_queue_depth").set(queued as f64);
         metrics::gauge!("orbd_active_commands").set(active as f64);
         for (pool, u) in pools {

@@ -16,6 +16,7 @@ pub mod orbs;
 mod service;
 pub(crate) mod store;
 mod types;
+mod wake;
 
 use crate::backend::{BackendHandle, ComputeBackend};
 use crate::config::coordinator::CoordinatorConfig;
@@ -186,6 +187,12 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
         backends,
         core_tx.clone(),
         policy,
+    )
+    .with_waker(
+        config
+            .wake
+            .clone()
+            .map(|w| wake::Waker::start(w, core_tx.clone())),
     );
     core.recover().await.context("recovering commands")?;
 
