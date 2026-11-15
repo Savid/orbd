@@ -2,7 +2,7 @@
 //! preparation need. Prints one line per check; fails if a required check fails.
 
 use crate::config::agent::{DEFAULT_GUEST_HELPER, DEFAULT_GUEST_KERNEL};
-use crate::image::UMOCI_VERSION;
+use crate::image::{DOCKER_RUN, UMOCI_VERSION};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -72,7 +72,34 @@ fn sha256_file(path: &Path) -> Result<(String, u64), String> {
     Ok((hex::encode(h.finalize()), len))
 }
 
+/// The hardware accelerator QEMU orbs need, as named in messages.
+pub(crate) const ACCEL_NAME: &str = if cfg!(target_os = "macos") {
+    "Hypervisor.framework"
+} else {
+    "/dev/kvm"
+};
+
+/// The hardware accelerator QEMU orbs need works: KVM on Linux, Hypervisor.framework
+/// (`kern.hv_support`) on macOS.
+pub(crate) fn accel_usable() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    return match orbd_vm::sysctl::u64("kern.hv_support") {
+        Some(1) => Ok(()),
+        _ => Err("Hypervisor.framework is not supported on this Mac (kern.hv_support)".into()),
+    };
+    #[cfg(not(target_os = "macos"))]
+    kvm_usable()
+}
+
+fn accel() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    return accel_usable().map(|()| "kern.hv_support=1 (orbs get no /dev/kvm)".into());
+    #[cfg(not(target_os = "macos"))]
+    kvm()
+}
+
 /// Opens `/dev/kvm` and checks the KVM API version (12).
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn kvm_usable() -> Result<(), String> {
     // KVM_GET_API_VERSION = _IO(0xAE, 0x00)
     const KVM_GET_API_VERSION: nix::libc::c_ulong = 0xAE00;
@@ -95,6 +122,7 @@ pub(crate) fn kvm_usable() -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn kvm() -> Result<String, String> {
     kvm_usable()?;
     let nested = ["kvm_intel", "kvm_amd"].iter().find_map(|m| {
@@ -113,7 +141,12 @@ fn kernel(path: &Path) -> Result<String, String> {
     std::fs::File::open(path)
         .and_then(|mut f| f.read_exact(&mut header))
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    if &header[0x202..0x206] != b"HdrS" {
+    // arm64 `Image`: magic "ARM\x64" at 0x38; x86 bzImage: "HdrS" at 0x202.
+    if cfg!(target_arch = "aarch64") {
+        if &header[0x38..0x3c] != b"ARM\x64" {
+            return Err(format!("{} is not an arm64 Image", path.display()));
+        }
+    } else if &header[0x202..0x206] != b"HdrS" {
         return Err(format!("{} is not a bzImage", path.display()));
     }
     let (sha, len) = sha256_file(path)?;
@@ -152,9 +185,11 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     let mut mkfs = PathBuf::from("mkfs.ext4");
     let mut helper = PathBuf::from(DEFAULT_GUEST_HELPER);
     let mut kernel_path = opts.kernel.clone();
-    let mut qemu = PathBuf::from("qemu-system-x86_64");
+    let mut qemu = PathBuf::from(orbd_qemu::probe::QEMU_SYSTEM);
     let mut qemu_img = PathBuf::from("qemu-img");
     let mut firecracker = PathBuf::from("firecracker");
+    let mut builder =
+        cfg!(target_os = "macos").then(|| crate::config::agent::DEFAULT_IMAGE_BUILDER.to_owned());
     if let Some(config) = &opts.config {
         let text = std::fs::read_to_string(config)?;
         let v: serde_json::Value = serde_saphyr::from_str(&text)?;
@@ -172,6 +207,9 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
         qemu = get(&["runtime", "qemu"], "qemu").unwrap_or(qemu);
         qemu_img = get(&["runtime", "qemu"], "qemu_img").unwrap_or(qemu_img);
         firecracker = get(&["runtime", "firecracker"], "firecracker").unwrap_or(firecracker);
+        if let Some(b) = get(&["images"], "builder") {
+            builder = Some(b.display().to_string());
+        }
     }
     let kernel_path = kernel_path.unwrap_or_else(|| DEFAULT_GUEST_KERNEL.into());
     if !nix::unistd::geteuid().is_root() && Path::new(&mkfs).components().count() == 1 {
@@ -187,28 +225,45 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     let mut r = Report { failed: false };
     let qemu_check = first_line(&qemu, &["--version"])
         .and_then(|l| orbd_qemu::probe::check_qemu_version(&l).map(|()| l));
-    r.line(qemu_check, "qemu-system-x86_64", true);
+    r.line(qemu_check, orbd_qemu::probe::QEMU_SYSTEM, true);
     r.line(first_line(&qemu_img, &["--version"]), "qemu-img", true);
-    // Firecracker orbs only (and their networking).
-    r.line(
-        first_line(&firecracker, &["--version"]),
-        "firecracker",
-        false,
-    );
-    r.line(first_line(Path::new("ip"), &["-V"]), "ip", false);
-    r.line(first_line(Path::new("nft"), &["--version"]), "nft", false);
-    r.line(kvm(), "/dev/kvm", true);
+    // Firecracker orbs only (and their networking), which are Linux-only.
+    if cfg!(target_os = "linux") {
+        r.line(
+            first_line(&firecracker, &["--version"]),
+            "firecracker",
+            false,
+        );
+        r.line(first_line(Path::new("ip"), &["-V"]), "ip", false);
+        r.line(first_line(Path::new("nft"), &["--version"]), "nft", false);
+    }
+    r.line(accel(), ACCEL_NAME, true);
     r.line(kernel(&kernel_path), "guest kernel", true);
-    let umoci_check = first_line(&umoci, &["--version"]).and_then(|l| {
+    let umoci_version = |l: String| {
         if l == format!("umoci version {UMOCI_VERSION}") {
             Ok(l)
         } else {
             Err(format!("{l:?}; need umoci {UMOCI_VERSION}"))
         }
-    });
-    r.line(umoci_check, "umoci", true);
-    r.line(mke2fs(&mkfs), "mkfs.ext4", true);
+    };
     r.line(guest_helper(&helper), "orbd-guest", true);
+    // Image building: in the builder container (umoci, mkfs.ext4, root inside it), else
+    // with host tools as root.
+    if let Some(b) = &builder {
+        let args: Vec<&str> = DOCKER_RUN
+            .into_iter()
+            .chain([b.as_str(), "umoci", "--version"])
+            .collect();
+        let check = first_line(Path::new("docker"), &args).and_then(umoci_version);
+        r.line(check.map(|l| format!("{b}: {l}")), "image builder", true);
+        return Ok(!r.failed);
+    }
+    r.line(
+        first_line(&umoci, &["--version"]).and_then(umoci_version),
+        "umoci",
+        true,
+    );
+    r.line(mke2fs(&mkfs), "mkfs.ext4", true);
     let privileged = if nix::unistd::geteuid().is_root() {
         Ok("running as root".to_owned())
     } else {

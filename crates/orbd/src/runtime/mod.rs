@@ -15,8 +15,8 @@ pub mod qemu;
 pub mod vm;
 
 use crate::model::{
-    InitialDiskSource, OrbDefinition, OrbId, ProjectSnapshotKey, ProjectSnapshotRef, RuntimeKind,
-    SleepCheckpointRef,
+    Arch, InitialDiskSource, OrbDefinition, OrbId, ProjectSnapshotKey, ProjectSnapshotRef,
+    RuntimeKind, SleepCheckpointRef,
 };
 use crate::secrets::PermittedGuestEnv;
 use async_trait::async_trait;
@@ -53,6 +53,8 @@ pub struct RuntimeCapabilities {
     pub nested_kvm: bool,
     pub nested_state_qualified: bool,
     pub project_snapshots: bool,
+    /// CPU architecture of the orbs it runs: the host's.
+    pub arch: Arch,
 }
 
 /// How to start an orb. Distinct cases, no boolean soup.

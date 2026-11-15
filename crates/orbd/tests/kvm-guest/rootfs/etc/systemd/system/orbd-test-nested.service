@@ -5,7 +5,7 @@ After=orbd-guest.service
 [Service]
 User=user
 ExecStart=/usr/local/bin/orbd-test-nested
-StandardOutput=file:/dev/ttyS0
+StandardOutput=file:/dev/console
 
 [Install]
 WantedBy=multi-user.target

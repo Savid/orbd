@@ -44,6 +44,8 @@ pub struct Cluster {
     pub provider: Option<String>,
     /// Extra agent environment, applied last (e.g. `ORBD_CAPACITY_DISK_GIB`).
     pub agent_env: Vec<(String, String)>,
+    /// Agents with their own config file instead of the shared `agent.yaml`.
+    agent_configs: BTreeMap<String, PathBuf>,
 }
 
 pub struct Job {
@@ -79,6 +81,12 @@ impl Cluster {
         } else {
             format!("{runtime}-2vcpu-2gb")
         };
+        // On arm64 hosts (Macs) QEMU orbs are arm64 orbs.
+        let arch = if runtime == "qemu" && cfg!(target_arch = "aarch64") {
+            "\n    arch: arm64"
+        } else {
+            ""
+        };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let control_port = free_port();
@@ -96,7 +104,7 @@ running_orb_disk_headroom_gib: 1
 offerings:
   - id: {offering}
     runtime: {runtime}
-    resources: {{ vcpus: 2, memory_mib: 2048, disk_gib: 4 }}
+    resources: {{ vcpus: 2, memory_mib: 2048, disk_gib: 4 }}{arch}
 "#,
                 root = root.display(),
             ),
@@ -119,7 +127,15 @@ offerings:
             } else {
                 vec![("ORBD_DISK_RESERVE_GIB".into(), "1".into())]
             },
+            agent_configs: BTreeMap::new(),
         }
+    }
+
+    /// Gives agent `id` its own config file (before it starts).
+    pub fn set_agent_yaml(&mut self, id: &str, yaml: &str) {
+        let path = self.root().join(format!("agent-{id}.yaml"));
+        write(&path, yaml);
+        self.agent_configs.insert(id.to_string(), path);
     }
 
     /// The coordinator's AgentControl port (on 127.0.0.1).
@@ -211,7 +227,12 @@ offerings:
             .arg("--state-dir")
             .arg(state)
             .arg("--config")
-            .arg(self.root().join("agent.yaml"))
+            .arg(
+                self.agent_configs
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| self.root().join("agent.yaml")),
+            )
             .env("ORBD_JOIN", token)
             .env("ORBD_CAPACITY_VCPUS", (2 * n).to_string())
             .env("ORBD_CAPACITY_MEMORY_MIB", (2048 * n).to_string())

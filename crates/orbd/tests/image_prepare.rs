@@ -5,7 +5,9 @@
 //! ORBD_TEST_GUEST_HELPER=target/x86_64-unknown-linux-musl/release/orbd-guest \
 //!   cargo test -p orbd --test image_prepare -- --ignored --nocapture
 //! ```
-//! `ORBD_TEST_IMAGE` overrides the image (default: Amp's orb image).
+//! `ORBD_TEST_IMAGE` overrides the image (default: Amp's orb image). On macOS also set
+//! `ORBD_TEST_IMAGE_BUILDER` (the image built from `guest/builder`) and
+//! `ORBD_TEST_DEBUGFS` (Homebrew's `debugfs`, which is not on PATH).
 
 use orbd::config::agent::ImagesConfig;
 use orbd::image::{ImageError, ImageStore};
@@ -16,7 +18,7 @@ use std::time::{Duration, Instant};
 const AMP_ORB_IMAGE: &str = "us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest";
 
 fn debugfs(image: &Path, request: &str) -> Vec<u8> {
-    let out = Command::new("debugfs")
+    let out = Command::new(std::env::var("ORBD_TEST_DEBUGFS").unwrap_or("debugfs".into()))
         .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin")
         .args(["-R", request])
         .arg(image)
@@ -45,6 +47,7 @@ async fn prepares_amp_image_with_guest_integration() {
         guest_helper: helper.clone(),
         umoci: "umoci".into(),
         mkfs_ext4: "mkfs.ext4".into(),
+        builder: std::env::var("ORBD_TEST_IMAGE_BUILDER").ok(),
         prewarm: vec![],
         refresh_interval_secs: 3600,
         static_images: vec![],

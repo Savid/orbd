@@ -143,6 +143,7 @@ impl BoatBackend {
 
 fn capabilities() -> BackendCapabilities {
     BackendCapabilities {
+        arch: Some(crate::model::Arch::Amd64),
         // A stopped sandbox keeps its disk, not its processes, and bills no compute.
         sleep: SleepCapability::DiskOnly {
             compute: SleepingCompute::Released,

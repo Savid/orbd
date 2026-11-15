@@ -129,6 +129,62 @@ fn overflow_agents_take_new_orbs_only_when_the_others_are_full() {
     );
 }
 
+/// Agents report their architecture and orbs only go to agents of theirs. An amd64
+/// offering spilling to an arm64 one puts a new orb on the arm64 agent once the amd64
+/// one is full, and the orb stays there; an arm64 offering never uses an amd64 agent.
+#[test]
+fn new_orbs_spill_across_architectures_and_stay_on_theirs() {
+    let mut c = Cluster::new(&["amd"], 1);
+    let path = c.root().join("coordinator.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let head = yaml.split("offerings:").next().unwrap();
+    let fake = "runtime: fake\n    resources: { vcpus: 2, memory_mib: 2048, disk_gib: 4 }";
+    std::fs::write(
+        &path,
+        format!(
+            "{head}offerings:\n  - id: {OFFERING}\n    {fake}\n    spill_to: [{OFFERING}@arm64]\n\
+             \x20 - id: {OFFERING}@arm64\n    {fake}\n    arch: arm64\n\
+             \x20 - id: arm-only\n    {fake}\n    arch: arm64\n"
+        ),
+    )
+    .unwrap();
+    c.set_agent_yaml(
+        "mac",
+        "runtime:\n  fake:\n    memory_preserving_sleep: true\n    arch: arm64\n    \
+         disk: { free_gib: 1000, total_gib: 2000 }\n",
+    );
+    c.start_all();
+    c.start_agent_with_env(
+        "mac",
+        &[
+            ("ORBD_CAPACITY_VCPUS", "4"),
+            ("ORBD_CAPACITY_MEMORY_MIB", "4096"),
+        ],
+    );
+    c.wait_connected(2);
+    // Orbs on an agent that still have a disk.
+    let orbs = |c: &Cluster, agent: &str| c.fake_orbs(agent).iter().filter(|o| o.disk).count();
+
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1");
+    assert_eq!(orbs(&c, "amd"), 1, "amd64 first");
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "amp-2");
+    assert_eq!(orbs(&c, "mac"), 1, "amd is full: the arm64 agent takes it");
+
+    // Room on amd again; the arm64 orb wakes where it lives.
+    assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete amp-1");
+    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause amp-2");
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "wake amp-2");
+    assert!(c.only_orb("mac").running, "amp-2 woke on mac");
+
+    // arm64 only: the Mac, never amd, even with the Mac full and amd empty.
+    c.offering = "arm-only".into();
+    assert_ok(&c.dispatch("spawn", "amp-3", &[]), "amp-3");
+    assert_eq!(orbs(&c, "mac"), 2);
+    let full = c.dispatch("spawn", "amp-4", &[]);
+    assert_ne!(full.code, 0, "amp-4 must not be placed:\n{}", full.stdout);
+    assert_eq!(orbs(&c, "amd"), 0, "an arm64 orb went to amd");
+}
+
 /// `orbd agent remove` cuts the agent off for good: its session ends, it cannot
 /// reconnect, and its orbs stay recorded on it (unavailable, never moved elsewhere).
 #[test]

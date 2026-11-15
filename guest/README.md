@@ -2,7 +2,8 @@
 
 - `kernel/`: `build.sh` builds the pinned 6.18 LTS guest kernel (`bzImage`, final
   `config`, `bzImage.sha256`, `manifest.txt`) from `orbd.config`. Everything is built in:
-  no modules, no initrd.
+  no modules, no initrd. `ARCH=arm64` builds an `Image` for macOS agents.
+- `builder/`: the container macOS agents build orb images in.
 - `rootfs/`: files the image pipeline (`crates/orbd/src/image/`) adds to Amp's image as
   one extra layer, next to the static `orbd-guest` binary (`/usr/local/sbin/orbd-guest`),
   an empty `/etc/machine-id` and a mask for `serial-getty@ttyS0.service` (without udev it
@@ -10,8 +11,8 @@
 
 ## Host contract
 
-Kernel command line: `console=ttyS0 root=/dev/vda rw` (the image has no udev and no fstab
-entry for `/`, so the kernel mounts the root read-write). Optionally
+Kernel command line: `console=ttyS0 root=/dev/vda rw` (`ttyAMA0` on arm64; the image has
+no udev and no fstab entry for `/`, so the kernel mounts the root read-write). Optionally
 `systemd.machine_id=<32 hex>` derived from the orb id, which gives project-snapshot
 clones their own machine id from the first boot.
 

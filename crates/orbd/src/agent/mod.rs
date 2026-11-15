@@ -117,7 +117,7 @@ impl Shared {
         if self.config.runtime.fake.is_some() {
             return None;
         }
-        detect::meminfo("MemAvailable:")
+        detect::mem_available()
     }
 
     /// Free and total bytes of the filesystem holding the state directory.
@@ -143,8 +143,12 @@ pub(crate) fn disk_stats(config: &AgentConfig) -> (u64, u64) {
     }
     nix::sys::statvfs::statvfs(&config.agent.state_dir)
         .map(|s| {
-            let frag = s.fragment_size();
-            (s.blocks_available() * frag, s.blocks() * frag)
+            // Field widths differ per OS (block counts are u32 on macOS).
+            #[allow(clippy::unnecessary_cast)]
+            (
+                s.blocks_available() as u64 * s.fragment_size() as u64,
+                s.blocks() as u64 * s.fragment_size() as u64,
+            )
         })
         .unwrap_or((0, 0))
 }
@@ -235,7 +239,7 @@ pub async fn run(
     tracing::info!(disk_reserve_gib = disk_reserve / GIB, "disk reserve");
     let memory_reserve = match config.agent.capacity.memory_reserve_gib {
         Some(g) => g.saturating_mul(GIB),
-        None => (4 * GIB).max(detect::meminfo("MemTotal:").unwrap_or(0) / 10),
+        None => (4 * GIB).max(detect::mem_total().unwrap_or(0) / 10),
     };
     tracing::info!(memory_reserve_gib = memory_reserve / GIB, "memory reserve");
 

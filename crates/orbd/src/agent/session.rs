@@ -110,6 +110,7 @@ async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
                 nested_kvm: c.nested_kvm,
                 nested_state_qualified: c.nested_state_qualified,
                 project_snapshots: c.project_snapshots,
+                arch: pb::Arch::from(c.arch) as i32,
             })
             .collect(),
         capacity: Some(sh.capacity.into()),

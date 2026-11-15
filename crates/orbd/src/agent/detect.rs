@@ -17,13 +17,14 @@ use std::time::Duration;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn qemu_usable() -> Result<(), String> {
-    crate::doctor::kvm_usable()?;
-    let out = std::process::Command::new("qemu-system-x86_64")
+    crate::doctor::accel_usable()?;
+    let qemu = orbd_qemu::probe::QEMU_SYSTEM;
+    let out = std::process::Command::new(qemu)
         .arg("--version")
         .output()
-        .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
+        .map_err(|e| format!("{qemu}: {e}"))?;
     if !out.status.success() {
-        return Err(format!("qemu-system-x86_64 --version: {}", out.status));
+        return Err(format!("{qemu} --version: {}", out.status));
     }
     Ok(())
 }
@@ -129,8 +130,10 @@ async fn detect() -> Result<RuntimeKind> {
     match usable(RuntimeKind::Docker).await {
         Ok(()) => Ok(RuntimeKind::Docker),
         Err(docker) => bail!(
-            "no usable runtime: QEMU needs /dev/kvm and qemu-system-x86_64 ({}); Docker needs \
+            "no usable runtime: QEMU needs {} and {} ({}); Docker needs \
              its socket, e.g. -v /var/run/docker.sock:/var/run/docker.sock ({docker})",
+            crate::doctor::ACCEL_NAME,
+            orbd_qemu::probe::QEMU_SYSTEM,
             qemu.err().unwrap_or_else(|| "usable".into())
         ),
     }
@@ -194,8 +197,33 @@ pub(crate) async fn capacity(config: &AgentConfig) -> Result<Resources> {
     Ok(c)
 }
 
+/// The host's physical memory in bytes.
+#[cfg(target_os = "macos")]
+pub(crate) fn mem_total() -> Option<u64> {
+    orbd_vm::sysctl::u64("hw.memsize")
+}
+
+/// Memory the kernel considers available, in bytes: on macOS `kern.memorystatus_level`
+/// percent of it (counting compressible and purgeable pages).
+#[cfg(target_os = "macos")]
+pub(crate) fn mem_available() -> Option<u64> {
+    let level = orbd_vm::sysctl::u64("kern.memorystatus_level")?.min(100);
+    Some(mem_total()? / 100 * level)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn mem_total() -> Option<u64> {
+    meminfo("MemTotal:")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn mem_available() -> Option<u64> {
+    meminfo("MemAvailable:")
+}
+
 /// A `/proc/meminfo` field in bytes, e.g. `MemAvailable:`.
-pub(crate) fn meminfo(field: &str) -> Option<u64> {
+#[cfg(not(target_os = "macos"))]
+fn meminfo(field: &str) -> Option<u64> {
     std::fs::read_to_string("/proc/meminfo")
         .ok()?
         .lines()
@@ -208,7 +236,14 @@ pub(crate) fn meminfo(field: &str) -> Option<u64> {
         .map(|kib| kib * 1024)
 }
 
+/// Physical memory.
+#[cfg(target_os = "macos")]
+fn local_memory() -> Result<u64> {
+    mem_total().context("reading hw.memsize")
+}
+
 /// Physical memory, capped by this process's cgroup limit (v2 or v1).
+#[cfg(not(target_os = "macos"))]
 fn local_memory() -> Result<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
     let total = meminfo

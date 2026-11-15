@@ -1,7 +1,9 @@
-//! Registry side: resolve a reference to its linux/amd64 manifest and stream blobs into
+//! Registry side: resolve a reference to its manifest for this host's architecture
+//! ([`IMAGE_ARCH`]: linux/amd64, or linux/arm64 on Apple Silicon) and stream blobs into
 //! a content-addressed cache. Uses oci-client's per-blob streaming API (`pull_blob` into
 //! a file), never its whole-image `pull`, which buffers layers in memory.
 
+use crate::model::Arch;
 use futures::{StreamExt, TryStreamExt};
 use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::{
@@ -20,9 +22,38 @@ use tokio::io::AsyncWrite;
 
 const PARALLEL_BLOBS: usize = 4;
 
+/// The OCI architecture of the images this agent prepares: its own, since orbs run
+/// natively (KVM, or Hypervisor.framework on Apple Silicon).
+pub const IMAGE_ARCH: &str = Arch::HOST.as_str();
+
+/// Whether an index entry's platform is what this agent runs: `linux/amd64` or
+/// `linux/arm64`, with no variant or the baseline one.
+fn is_native(os: &str, arch: &str, variant: Option<&str>) -> bool {
+    let baseline = match Arch::HOST {
+        Arch::Amd64 => "v1",
+        Arch::Arm64 => "v8",
+    };
+    os == "linux" && arch == IMAGE_ARCH && variant.is_none_or(|v| v == baseline)
+}
+
+fn linux_native_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> Option<String> {
+    manifests
+        .iter()
+        .find(|e| {
+            e.platform.as_ref().is_some_and(|p| {
+                is_native(
+                    &p.os.to_string(),
+                    &p.architecture.to_string(),
+                    p.variant.as_deref(),
+                )
+            })
+        })
+        .map(|e| e.digest.clone())
+}
+
 pub struct Resolved {
     pub reference: Reference,
-    /// Digest of the linux/amd64 image manifest (not of an index).
+    /// Digest of the linux/[`IMAGE_ARCH`] image manifest (not of an index).
     pub manifest_digest: String,
     pub manifest_raw: Vec<u8>,
     pub manifest: OciImageManifest,
@@ -43,7 +74,7 @@ pub fn client() -> Client {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Client::new(ClientConfig {
         protocol: ClientProtocol::Https,
-        platform_resolver: Some(Box::new(oci_client::client::linux_amd64_resolver)),
+        platform_resolver: Some(Box::new(linux_native_resolver)),
         ..Default::default()
     })
 }
@@ -59,7 +90,8 @@ fn hex_of(digest: &str) -> Result<&str, String> {
     }
 }
 
-/// Resolves `image_ref` (tag or digest, index or manifest) to the linux/amd64 manifest.
+/// Resolves `image_ref` (tag or digest, index or manifest) to the linux/[`IMAGE_ARCH`]
+/// manifest.
 pub async fn resolve(client: &Client, image_ref: &str) -> Result<Resolved, String> {
     let reference: Reference = image_ref
         .parse()
@@ -81,12 +113,11 @@ pub async fn resolve(client: &Client, image_ref: &str) -> Result<Resolved, Strin
             .iter()
             .find(|m| {
                 let p = &m["platform"];
-                p["os"] == "linux"
-                    && p["architecture"] == "amd64"
-                    && p.get("variant").is_none_or(|v| v == "v1")
+                let s = |k: &str| p[k].as_str().unwrap_or_default();
+                is_native(s("os"), s("architecture"), p["variant"].as_str())
             })
             .and_then(|m| m["digest"].as_str())
-            .ok_or_else(|| format!("{image_ref} has no linux/amd64 manifest"))?
+            .ok_or_else(|| format!("{image_ref} has no linux/{IMAGE_ARCH} manifest"))?
             .to_owned();
         let child = Reference::with_digest(
             reference.registry().to_owned(),
@@ -96,7 +127,7 @@ pub async fn resolve(client: &Client, image_ref: &str) -> Result<Resolved, Strin
         let (raw, _) = client
             .pull_manifest_raw(&child, &auth, &[OCI_IMAGE_MEDIA_TYPE])
             .await
-            .map_err(|e| format!("fetching linux/amd64 manifest of {image_ref}: {e}"))?;
+            .map_err(|e| format!("fetching linux/{IMAGE_ARCH} manifest of {image_ref}: {e}"))?;
         (raw, pick)
     } else {
         (raw, digest)

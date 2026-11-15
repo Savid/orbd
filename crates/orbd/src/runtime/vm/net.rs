@@ -23,6 +23,7 @@ use orbd_proto::guest::v1 as gpb;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -320,7 +321,17 @@ fn is_netns(path: &Path) -> bool {
     }
 }
 
+/// Network namespaces are Linux-only (`Tap` attachments are never built elsewhere).
+#[cfg(not(target_os = "linux"))]
+fn in_netns<T: Send>(
+    netns: &str,
+    _f: impl FnOnce() -> Result<T, String> + Send,
+) -> Result<T, String> {
+    Err(format!("joining {netns}: network namespaces need Linux"))
+}
+
 /// Runs `f` on a thread that has joined `netns`; commands it starts run there too.
+#[cfg(target_os = "linux")]
 fn in_netns<T: Send>(
     netns: &str,
     f: impl FnOnce() -> Result<T, String> + Send,

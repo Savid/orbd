@@ -25,10 +25,10 @@ hosts, and hosted [Boat](#boat) sandboxes.
 
 A coordinator runs `amp orb provider` for an Amp orb provider whose orb types say what
 an orb gets (e.g. `4vcpu-8gb`, `kvm-4vcpu-8gb`) and places each orb on an agent or
-Boat. Agents run on your
-own x86_64 hosts, dial the coordinator over mutual-TLS gRPC, and run orbs in QEMU,
-Firecracker or Docker. Coordinator and agent are the same static `orbd` binary; the
-coordinator also runs on aarch64.
+Boat. Agents run on your own x86_64 hosts (or [Apple Silicon Macs](#macos-agents)),
+dial the coordinator over mutual-TLS gRPC, and run orbs in QEMU, Firecracker or Docker.
+Coordinator and agent are the same static `orbd` binary; the coordinator also runs on
+aarch64.
 
 > **Early.** Configuration and on-disk formats may still change.
 
@@ -83,6 +83,7 @@ Static binaries for x86_64 and aarch64 are attached to each release.
    orb_types:                                     # the first is the default
      - { id: 2vcpu-4gb, vcpus: 2, memory_mib: 4096, disk_gib: 40 }
      - { id: kvm-4vcpu-8gb, vcpus: 4, memory_mib: 8192, disk_gib: 40, kvm: true }
+     - { id: 16vcpu-64gb, vcpus: 16, memory_mib: 65536, disk_gib: 200, arch: arm64 }
    ```
 
    An orb type says what an orb gets; orbd decides where it runs. On the agents an orb
@@ -90,6 +91,10 @@ Static binaries for x86_64 and aarch64 are attached to each release.
    (vCPUs: 1 or an even number). A spawn of a new orb uses the orb type the thread
    picked, or the first one if it has none; an orb type not listed fails the spawn. An
    orb keeps its orb type and place for life, whatever later jobs name.
+   `arch` says which CPU architectures a new orb may get: `amd64` (the default),
+   `arm64`, or a list in order of preference, e.g. `[amd64, arm64]` to use arm64 agents
+   when no amd64 one has room. An orb keeps the architecture it was placed with. arm64
+   orbs run on [macOS agents](#macos-agents), without `kvm`.
    `retired_token_files` under `provider` lists tokens of providers you are moving
    away from, e.g. per-offering ones: they are still served, so their threads keep their
    orbs, and new orbs from them get the default orb type.
@@ -239,6 +244,35 @@ namespace behind NAT and cannot reach the agent itself or each other. A sleeping
 VMM build and CPU it slept on, so after an upgrade it cold-boots once; the agent deletes
 such memory checkpoints when it starts, as it deletes every checkpoint that was restored
 or superseded.
+
+### macOS agents
+
+An Apple Silicon Mac runs arm64 orbs (orb types with `arch: arm64`) in QEMU with
+Hypervisor.framework, from Amp's `amp-orb-arm64` image. They sleep and wake with their
+memory as on Linux, even while the Mac is locked. On the Mac:
+
+- `brew install qemu e2fsprogs`, with `$(brew --prefix e2fsprogs)/sbin` on the agent's
+  `PATH`, and Docker (e.g. OrbStack).
+- `docker build -t orbd-image-builder:umoci-0.6.0 guest/builder`: orb images are
+  unpacked in this container.
+- From a [release](https://github.com/samcm/orbd/releases): `orbd-*-aarch64-apple-darwin`
+  (`orbd`), and `orbd-kernel-*-arm64.Image` and `orbd-guest-*-aarch64-unknown-linux-musl`
+  at `/usr/local/share/orbd/{Image,orbd-guest}` (or set `runtime.qemu.kernel` and
+  `images.guest_helper`). To build them: `cargo build --release -p orbd`, and
+  `ARCH=arm64 guest/kernel/build.sh` and `orbd-guest` in a linux/arm64 container.
+- Run `orbd agent` as your user, e.g. from a LaunchAgent; `orbd doctor` checks the setup.
+
+QEMU runs in a Seatbelt sandbox (`sandbox-exec`, where Linux uses seccomp): it reads
+only the system, its installation and its orb's kernel and disks, writes only its orb's
+files, runs no other program, and sends no ICMP and nothing to `localhost`.
+
+macOS has no network namespaces: orbs use QEMU's user-mode network and otherwise reach
+whatever the Mac can, its LAN included. To fence them in, set
+`runtime.qemu.network_group`, install the release's `orbd-netgroup` setgid to that group
+on the agent's `PATH` (`sudo install -o root -g <group> -m 2755 orbd-netgroup
+/usr/local/bin/`; the agent checks it on every launch), and block the group with pf
+`group` rules. pf must not skip `lo0`, and on tunnel interfaces (e.g. Tailscale's) sees
+only inbound replies, so drop those too.
 
 ## Boat
 

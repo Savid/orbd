@@ -109,6 +109,24 @@ fn process_disposition(v: i32) -> Result<ProcessDisposition, WireError> {
     })
 }
 
+impl From<Arch> for pb::Arch {
+    fn from(a: Arch) -> Self {
+        match a {
+            Arch::Amd64 => Self::Amd64,
+            Arch::Arm64 => Self::Arm64,
+        }
+    }
+}
+
+/// Unspecified (older peers) is amd64.
+pub fn arch(v: i32) -> Result<Arch, WireError> {
+    Ok(match pb::Arch::try_from(v) {
+        Ok(pb::Arch::Unspecified | pb::Arch::Amd64) => Arch::Amd64,
+        Ok(pb::Arch::Arm64) => Arch::Arm64,
+        _ => return err(format!("arch {v}")),
+    })
+}
+
 impl From<StartKind> for pb::StartKind {
     fn from(s: StartKind) -> Self {
         match s {
@@ -212,6 +230,7 @@ impl TryFrom<&OrbSpec> for pb::OrbSpec {
             }),
             release_compute_when_paused: req.release_compute_when_paused,
             required_snapshot_scope: snap_scope as i32,
+            arch: pb::Arch::from(req.arch) as i32,
         })
     }
 }
@@ -283,6 +302,7 @@ impl TryFrom<&pb::OrbSpec> for OrbSpec {
                     release_compute_when_paused: s.release_compute_when_paused,
                     nested_kvm,
                     project_snapshots,
+                    arch: arch(s.arch)?,
                 },
                 pause_policy,
             },

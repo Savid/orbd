@@ -3,7 +3,7 @@
 //! plumbing around it, and the supervised start of the process.
 //!
 //! Every launch gets a unique name, `<prefix>.<nonce>` ([`name`]): it is QEMU's `-name`,
-//! the marker [`Process::adopt`] looks for in `/proc/<pid>/cmdline`, and what
+//! the marker [`Process::adopt`] looks for in the process's argv, and what
 //! `query-name` reports, so a QMP socket is known to belong to this launch.
 
 use crate::qmp::Qmp;
@@ -36,11 +36,12 @@ pub struct LaunchConfig {
 
 pub type LaunchRecord = process::LaunchRecord<LaunchConfig>;
 
-/// The guest-visible machine: a q35 KVM VM with a direct-boot kernel, a serial console,
-/// the guest agent's virtio-serial port, one virtio-blk disk (node `disk0`), the
-/// caller's network devices and further arguments, and a free-page-reporting balloon.
+/// The guest-visible machine: a q35 KVM VM (x86_64) or a `virt` HVF VM (Apple Silicon)
+/// with a direct-boot kernel, a serial console, the guest agent's virtio-serial port,
+/// one virtio-blk disk (node `disk0`), the caller's network devices and further
+/// arguments, and a free-page-reporting balloon.
 pub struct Machine<'a> {
-    /// Versioned machine type ([`q35_machine`](crate::probe::q35_machine)).
+    /// Versioned machine type ([`machine_type`](crate::probe::machine_type)).
     pub machine_type: &'a str,
     /// QEMU `-cpu` model ([`DEFAULT_CPU_MODEL`] or a named model).
     pub cpu_model: &'a str,
@@ -58,9 +59,20 @@ pub struct Machine<'a> {
 impl Machine<'_> {
     /// [`LaunchConfig::machine_args`] for this machine.
     pub fn args(&self) -> Vec<String> {
+        // `virt` gets a GICv3 (more than 8 vCPUs; pinned so the machine never depends on
+        // QEMU's default).
+        let machine_opts = if self.machine_type.starts_with("virt") {
+            ",gic-version=3"
+        } else {
+            ""
+        };
         let mut a: Vec<String> = [
             "-machine",
-            &format!("{},accel=kvm", self.machine_type),
+            &format!(
+                "{},accel={}{machine_opts}",
+                self.machine_type,
+                crate::probe::ACCEL
+            ),
             "-cpu",
             self.cpu_model,
             "-smp",
@@ -143,8 +155,15 @@ pub fn host_args(
         "-nodefaults".into(),
         "-no-user-config".into(),
         "-nographic".into(),
-        "-sandbox".into(),
-        "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny".into(),
+    ];
+    // seccomp, Linux only.
+    if cfg!(target_os = "linux") {
+        a.extend([
+            "-sandbox".into(),
+            "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny".into(),
+        ]);
+    }
+    a.extend([
         "-pidfile".into(),
         files.pidfile.display().to_string(),
         "-chardev".into(),
@@ -160,7 +179,7 @@ pub fn host_args(
         format!("file,id=serial0,path={},append=on", esc(files.console_log)),
         "-blockdev".into(),
         blockdev.to_string(),
-    ];
+    ]);
     if let LaunchKind::Restore { .. } = kind {
         a.extend(["-S", "-incoming", "defer"].map(String::from));
     }
@@ -183,20 +202,44 @@ pub struct Launch<'a> {
     pub cgroup: Option<PathBuf>,
     /// Network namespace (`/run/netns/<name>`) QEMU runs in.
     pub netns: Option<PathBuf>,
+    pub sandbox: Sandbox<'a>,
+    /// A setgid program QEMU is started through (`orbd-netgroup`), so its sockets carry
+    /// that group.
+    pub group_exec: Option<&'a Path>,
+}
+
+/// What QEMU may use on macOS besides its installation, the system and the kernel: the
+/// Seatbelt profile (`qemu.sb`) denies everything else. Linux QEMU gets `-sandbox`.
+pub struct Sandbox<'a> {
+    /// Read and written: the orb's directory and the launch's run directory.
+    pub orb_dir: &'a Path,
+    pub run_dir: &'a Path,
+    /// Read only: the directory of the disk's backing file.
+    pub base_dir: &'a Path,
 }
 
 /// Records the launch and starts QEMU in its own session. Returns once the process
 /// exists; [`wait_ready`] waits for its monitor.
 pub fn spawn(l: Launch<'_>) -> std::io::Result<(Process, LaunchRecord)> {
-    let mut args = host_args(
+    let qemu = &l.record.config.qemu.path;
+    let mut argv = if cfg!(target_os = "macos") {
+        sandbox_exec(qemu, &l.record.config.kernel.path, &l.sandbox)?
+    } else {
+        vec![qemu.display().to_string()]
+    };
+    argv.extend(host_args(
         &name(l.name_prefix, &l.record),
         &l.files,
         l.direct_io,
         l.record.kind,
-    );
-    args.extend(l.record.config.machine_args.iter().cloned());
+    ));
+    argv.extend(l.record.config.machine_args.iter().cloned());
+    if let Some(exec) = l.group_exec {
+        argv.insert(0, exec.display().to_string());
+    }
+    let args = argv.split_off(1);
     process::spawn(process::Spawn {
-        program: &l.record.config.qemu.path.clone(),
+        program: Path::new(&argv[0]),
         args,
         stdout: l.log,
         stderr: l.log,
@@ -205,6 +248,28 @@ pub fn spawn(l: Launch<'_>) -> std::io::Result<(Process, LaunchRecord)> {
         cgroup: l.cgroup,
         netns: l.netns,
     })
+}
+
+/// `sandbox-exec` running `qemu` under `qemu.sb`. Seatbelt matches resolved paths.
+fn sandbox_exec(qemu: &Path, kernel: &Path, s: &Sandbox<'_>) -> std::io::Result<Vec<String>> {
+    let qemu = qemu.canonicalize()?;
+    let prefix = qemu.parent().and_then(Path::parent).unwrap_or(&qemu);
+    let mut a: Vec<String> = ["/usr/bin/sandbox-exec", "-p", include_str!("qemu.sb")]
+        .map(String::from)
+        .into();
+    for (key, path) in [
+        ("QEMU", qemu.as_path()),
+        ("PREFIX", prefix),
+        ("KERNEL", kernel),
+        ("BASE", s.base_dir),
+        ("ORB", s.orb_dir),
+        ("RUN", s.run_dir),
+    ] {
+        a.push("-D".into());
+        a.push(format!("{key}={}", path.canonicalize()?.display()));
+    }
+    a.push(qemu.display().to_string());
+    Ok(a)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -238,5 +303,34 @@ pub async fn wait_ready(
             return Err(ReadyError::Timeout);
         }
         tokio::time::sleep(poll).await;
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// `qemu.sb` parses and lets the sandboxed program run, and nothing else.
+    #[test]
+    fn sandbox_runs_only_qemu() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = dir.path().join("Image");
+        std::fs::write(&kernel, "").unwrap();
+        let s = Sandbox {
+            orb_dir: dir.path(),
+            run_dir: dir.path(),
+            base_dir: dir.path(),
+        };
+        let run = |argv: &[String]| {
+            std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let mut argv = sandbox_exec(Path::new("/usr/bin/true"), &kernel, &s).unwrap();
+        assert!(run(&argv));
+        *argv.last_mut().unwrap() = "/bin/echo".into();
+        assert!(!run(&argv));
     }
 }

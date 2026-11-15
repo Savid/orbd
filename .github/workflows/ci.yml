@@ -81,6 +81,24 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked --features "${{ matrix.features }}"
 
+  # Apple Silicon agents. GitHub's macOS runners cannot start Hypervisor.framework
+  # guests, so this lints the macOS code and runs every test that needs no VM; the VM
+  # gates in tests/kvm.rs run on a Mac by hand (see its header).
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # orbd-guest runs inside Linux guests only.
+      - run: cargo clippy --workspace --exclude orbd-guest --all-targets --locked --features orbd/failpoints -- -D warnings
+      - run: cargo test --workspace --exclude orbd-guest --locked --features orbd/failpoints
+
   build:
     uses: ./.github/workflows/build.yml
 
@@ -213,11 +231,11 @@ jobs:
   # Single required status check for branch rules and auto-merge.
   ci-ok:
     if: always()
-    needs: [fmt, deny, clippy, test, build, image, image-multiarch, kvm]
+    needs: [fmt, deny, clippy, test, macos, build, image, image-multiarch, kvm]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: All CI jobs succeeded
         run: test "$RESULTS" = "success"
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success success success success success' && 'success' || 'failure' }}
+          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success success success success success success' && 'success' || 'failure' }}

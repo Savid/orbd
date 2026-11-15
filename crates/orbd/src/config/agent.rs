@@ -37,6 +37,7 @@ fn default_images() -> Option<ImagesConfig> {
         guest_helper: default_guest_helper(),
         umoci: default_umoci(),
         mkfs_ext4: default_mkfs_ext4(),
+        builder: default_builder(),
         prewarm: default_prewarm(),
         refresh_interval_secs: default_refresh_secs(),
         static_images: Vec::new(),
@@ -50,16 +51,30 @@ fn default_prewarm() -> Vec<String> {
 /// Amp's orb image; agents prepare it at startup unless configured otherwise.
 pub const AMP_ORB_IMAGE: &str = "us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest";
 
-/// Where orbd's container image installs the guest kernel and `orbd-guest`.
-pub const DEFAULT_GUEST_KERNEL: &str = "/usr/share/orbd/bzImage";
-pub const DEFAULT_GUEST_HELPER: &str = "/usr/share/orbd/orbd-guest";
+/// Where orbd's container image installs the guest kernel and `orbd-guest` (on macOS,
+/// where `/usr/share` is read-only: `/usr/local/share/orbd`, kernel `Image`).
+pub const DEFAULT_GUEST_KERNEL: &str = if cfg!(target_os = "macos") {
+    "/usr/local/share/orbd/Image"
+} else {
+    "/usr/share/orbd/bzImage"
+};
+pub const DEFAULT_GUEST_HELPER: &str = if cfg!(target_os = "macos") {
+    "/usr/local/share/orbd/orbd-guest"
+} else {
+    "/usr/share/orbd/orbd-guest"
+};
+
+/// The image builder macOS agents use by default (see [`ImagesConfig::builder`]); built
+/// from `guest/builder/Dockerfile`.
+pub const DEFAULT_IMAGE_BUILDER: &str = "orbd-image-builder:umoci-0.6.0";
 
 /// `[images]`: turns Amp's OCI image into a bootable root disk with orbd's guest
 /// integration. Prepared images live under `<state_dir>/images/`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImagesConfig {
-    /// Static `orbd-guest` binary (x86_64 musl) installed into every prepared image.
+    /// Static `orbd-guest` binary (musl, the host's architecture) installed into every
+    /// prepared image.
     #[serde(default = "default_guest_helper")]
     pub guest_helper: PathBuf,
     /// `umoci` binary; must be the pinned version (see `orbd doctor`).
@@ -67,6 +82,12 @@ pub struct ImagesConfig {
     pub umoci: PathBuf,
     #[serde(default = "default_mkfs_ext4")]
     pub mkfs_ext4: PathBuf,
+    /// Docker image that runs umoci and mkfs.ext4 for each build instead of the host
+    /// (`docker run`, no network, only the build's work directory shared); `umoci` and
+    /// `mkfs_ext4` are then unused. Default on macOS: [`DEFAULT_IMAGE_BUILDER`] (built
+    /// from `guest/builder/Dockerfile`, never pulled); elsewhere none.
+    #[serde(default = "default_builder")]
+    pub builder: Option<String>,
     /// Images prepared in the background at startup, so the first spawn does not fail
     /// with ImageNotReady while a multi-GB image is pulled and converted. Defaults to
     /// Amp's orb image.
@@ -92,6 +113,10 @@ fn default_umoci() -> PathBuf {
 
 fn default_mkfs_ext4() -> PathBuf {
     "mkfs.ext4".into()
+}
+
+fn default_builder() -> Option<String> {
+    cfg!(target_os = "macos").then(|| DEFAULT_IMAGE_BUILDER.into())
 }
 
 fn default_refresh_secs() -> u64 {
@@ -245,23 +270,30 @@ pub struct RuntimesConfig {
     pub firecracker: Option<FirecrackerRuntimeConfig>,
 }
 
-/// QEMU q35 VMs with nested KVM and memory-preserving sleep. Every field has a default
-/// matching orbd's container image, so a zero-config agent needs none of them.
+/// QEMU VMs with memory-preserving sleep (q35 with nested KVM on Linux, `virt` under
+/// Hypervisor.framework on Apple Silicon). Every field has a default matching orbd's
+/// container image (or a macOS install), so a zero-config agent needs none of them.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QemuRuntimeConfig {
-    /// `qemu-system-x86_64`; a bare name is looked up on PATH.
+    /// `qemu-system-x86_64` (`qemu-system-aarch64` on arm64); a bare name is looked up
+    /// on PATH.
     #[serde(default = "default_qemu")]
     pub qemu: PathBuf,
     #[serde(default = "default_qemu_img")]
     pub qemu_img: PathBuf,
-    /// Guest kernel (bzImage, everything built in). Its digest is pinned in each
-    /// checkpoint: a replaced kernel makes sleeping orbs cold-boot on their next spawn.
+    /// Guest kernel (bzImage, or arm64 `Image`; everything built in). Its digest is pinned
+    /// in each checkpoint: a replaced kernel makes sleeping orbs cold-boot on their next
+    /// spawn.
     #[serde(default = "default_kernel")]
     pub kernel: PathBuf,
     /// Delegated cgroup v2 directory; each QEMU runs in `<cgroup_parent>/orbd-<orb>`,
     /// outside the agent's cgroup, so stopping the agent service leaves VMs running.
     pub cgroup_parent: Option<PathBuf>,
+    /// A group QEMU runs with, through `orbd-netgroup` (on PATH, setgid to it): host
+    /// firewall rules for that group (macOS pf `group`) then confine orb traffic without
+    /// touching the agent's own. The runtime refuses to start while it is not setgid.
+    pub network_group: Option<String>,
     /// DNS servers delivered to guests (from `agent.dns_servers`).
     #[serde(skip)]
     pub dns_servers: Vec<String>,
@@ -277,6 +309,7 @@ impl Default for QemuRuntimeConfig {
             qemu_img: default_qemu_img(),
             kernel: default_kernel(),
             cgroup_parent: None,
+            network_group: None,
             dns_servers: Vec::new(),
             guest_network: GuestNetwork::default(),
         }
@@ -328,7 +361,7 @@ fn default_firecracker() -> PathBuf {
 }
 
 fn default_qemu() -> PathBuf {
-    "qemu-system-x86_64".into()
+    orbd_qemu::probe::QEMU_SYSTEM.into()
 }
 fn default_qemu_img() -> PathBuf {
     "qemu-img".into()
@@ -347,6 +380,10 @@ pub struct FakeRuntimeConfig {
     /// Report this filesystem instead of the state directory's real one, so tests do
     /// not depend on the host's free space.
     pub disk: Option<FakeDisk>,
+    /// The architecture it reports (default amd64, whatever the host's), to test
+    /// placement by architecture.
+    #[serde(default)]
+    pub arch: crate::model::Arch,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

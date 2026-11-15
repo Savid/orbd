@@ -1069,6 +1069,7 @@ impl Runtime for FirecrackerRuntime {
             nested_kvm: false,
             nested_state_qualified: false,
             project_snapshots: true,
+            arch: crate::model::Arch::HOST,
         }
     }
 
