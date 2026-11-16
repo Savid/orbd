@@ -11,16 +11,17 @@
 //!   (`i` is a durable per-host index). The namespace masquerades the guest behind its
 //!   veth address and the agent's namespace masquerades that onwards, so guests share
 //!   addresses and only leave through NAT. nftables table `inet orbd` drops orb → agent
-//!   traffic (except replies), orb ↔ orb forwarding, orb → link-local (cloud metadata),
-//!   IPv6, and orb → private destinations (the LAN, a tailnet, ...) that the agent's
-//!   [`Egress`] does not allow. The VMM runs inside the namespace and sees nothing but
-//!   its TAP.
+//!   traffic (except replies), orb ↔ orb forwarding, IPv6, packets conntrack cannot
+//!   track or that did not come through an orb's namespace (they would leave un-NATed,
+//!   e.g. with a spoofed source), cloud metadata, and orb → private destinations (the
+//!   LAN, a tailnet, ...) that the agent's [`Egress`] does not allow. The VMM runs inside
+//!   the namespace and sees nothing but its TAP.
 //!
 //! `Tap` is built with `ip` and `nft` run with fixed arguments; every step is
 //! idempotent, so `adopt` repairs what is missing (after a host reboot) without touching
 //! what a running VMM uses.
 
-use crate::config::agent::{Egress, EgressProto, GuestNetwork, PRIVATE_NETS};
+use crate::config::agent::{Egress, EgressProto, GuestNetwork};
 use orbd_proto::guest::v1 as gpb;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -159,6 +160,37 @@ impl NetAttachment {
     }
 }
 
+/// IPv4 destinations orbs do not reach unless [`Egress`] allows them: RFC 6890's
+/// special-purpose addresses that are not globally reachable (private, shared/CGNAT
+/// and so tailnets, loopback, documentation, benchmarking, multicast, reserved,
+/// broadcast). Link-local is in [`ALWAYS_BLOCKED`].
+const PRIVATE_NETS: [&str; 14] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.88.99.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+
+/// Never reachable from orbs, whatever [`Egress`] allows (except their DNS servers on
+/// port 53): link-local (cloud metadata), Azure's WireServer, Alibaba Cloud's metadata
+/// and the host's Tailscale resolver.
+const ALWAYS_BLOCKED: [&str; 4] = [
+    "169.254.0.0/16",
+    "168.63.129.16",
+    "100.100.100.200",
+    "100.100.100.100",
+];
+
 /// Enables forwarding in the agent's namespace and installs orbd's nftables table
 /// (replaced atomically; nothing else is touched). Run once before any `Tap` VM starts.
 pub fn prepare_host(egress: &Egress, dns_servers: &[String]) -> Result<(), String> {
@@ -166,12 +198,17 @@ pub fn prepare_host(egress: &Egress, dns_servers: &[String]) -> Result<(), Strin
         .map_err(|e| format!("enabling IPv4 forwarding: {e}"))?;
     nft(&host_table(egress, dns_servers))?;
     if egress.allow_private {
-        tracing::warn!("orbs may reach private networks (ORBD_ALLOW_PRIVATE_EGRESS)");
+        tracing::warn!(
+            "Firecracker orbs may reach every private destination, the host's LAN included \
+             (ORBD_ALLOW_PRIVATE_EGRESS)"
+        );
     } else {
         let allowed: Vec<String> = egress.allow.iter().map(|r| r.to_string()).collect();
         tracing::info!(
             allowed = %allowed.join(","),
-            "orbs reach the internet and only these private destinations"
+            dns = %dns_servers.join(","),
+            "Firecracker orbs reach the internet, their DNS servers and only these private \
+             destinations (more with ORBD_EGRESS_ALLOW)"
         );
     }
     Ok(())
@@ -179,7 +216,23 @@ pub fn prepare_host(egress: &Egress, dns_servers: &[String]) -> Result<(), Strin
 
 /// orbd's nftables table for `egress`: see the module docs.
 fn host_table(egress: &Egress, dns_servers: &[String]) -> String {
-    let mut allow = String::new();
+    let mut rules = String::new();
+    let mut rule = |r: String| {
+        rules.push_str("        iifname \"orbd*\" ");
+        rules.push_str(&r);
+        rules.push('\n');
+    };
+    // Orbs resolve through the agent's DNS servers, wherever those are (a link-local
+    // resolver too, so before ALWAYS_BLOCKED).
+    for d in dns_servers
+        .iter()
+        .filter_map(|d| d.parse::<std::net::Ipv4Addr>().ok())
+    {
+        rule(format!(
+            "ip daddr {d} meta l4proto {{ tcp, udp }} th dport 53 accept comment \"dns\""
+        ));
+    }
+    rule(format!("ip daddr {{ {} }} drop", ALWAYS_BLOCKED.join(", ")));
     if !egress.allow_private {
         for r in &egress.allow {
             let net = format!("{}/{}", r.net, r.prefix);
@@ -188,35 +241,16 @@ fn host_table(egress: &Egress, dns_servers: &[String]) -> String {
                 false => format!("{a}-{b}"),
             });
             let what = match (r.proto, ports) {
-                (EgressProto::Tcp, Some(p)) => format!("tcp dport {p}"),
-                (EgressProto::Udp, Some(p)) => format!("udp dport {p}"),
-                (EgressProto::Any, Some(p)) => format!("meta l4proto {{ tcp, udp }} th dport {p}"),
-                (EgressProto::Tcp, None) => "meta l4proto tcp".into(),
-                (EgressProto::Udp, None) => "meta l4proto udp".into(),
+                (EgressProto::Tcp, Some(p)) => format!("tcp dport {p} "),
+                (EgressProto::Udp, Some(p)) => format!("udp dport {p} "),
+                (EgressProto::Any, Some(p)) => format!("meta l4proto {{ tcp, udp }} th dport {p} "),
+                (EgressProto::Tcp, None) => "meta l4proto tcp ".into(),
+                (EgressProto::Udp, None) => "meta l4proto udp ".into(),
                 (EgressProto::Any, None) => String::new(),
             };
-            let what = if what.is_empty() {
-                what
-            } else {
-                format!("{what} ")
-            };
-            allow.push_str(&format!(
-                "        iifname \"orbd*\" ip daddr {net} {what}accept  # {r}\n"
-            ));
+            rule(format!("ip daddr {net} {what}accept comment \"{r}\""));
         }
-        // Orbs resolve through the agent's DNS servers, wherever those are.
-        for d in dns_servers
-            .iter()
-            .filter_map(|d| d.parse::<std::net::Ipv4Addr>().ok())
-        {
-            allow.push_str(&format!(
-                "        iifname \"orbd*\" ip daddr {d} meta l4proto {{ tcp, udp }} th dport 53 accept\n"
-            ));
-        }
-        allow.push_str(&format!(
-            "        iifname \"orbd*\" ip daddr {{ {} }} drop\n",
-            PRIVATE_NETS.join(", ")
-        ));
+        rule(format!("ip daddr {{ {} }} drop", PRIVATE_NETS.join(", ")));
     }
     format!(
         r#"table inet orbd
@@ -230,9 +264,10 @@ table inet orbd {{
     chain forward {{
         type filter hook forward priority filter; policy accept;
         iifname "orbd*" meta nfproto ipv6 drop
+        iifname "orbd*" ct state invalid,untracked drop
+        iifname "orbd*" ip saddr != 169.254.0.0/16 drop
         iifname "orbd*" oifname "orbd*" drop
-        iifname "orbd*" ip daddr 169.254.0.0/16 drop
-{allow}    }}
+{rules}    }}
     chain postrouting {{
         type nat hook postrouting priority srcnat; policy accept;
         iifname "orbd*" oifname != "orbd*" masquerade
@@ -466,10 +501,21 @@ mod tests {
     use super::*;
 
     fn egress(allow: &[&str]) -> Egress {
-        Egress {
-            allow_private: false,
-            allow: allow.iter().map(|r| r.parse().unwrap()).collect(),
-        }
+        Egress::new(
+            false,
+            &allow.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn forward(t: &str) -> Vec<String> {
+        let fwd = t.split("chain forward").nth(1).unwrap();
+        let fwd = fwd.split("chain postrouting").next().unwrap();
+        fwd.lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("iifname"))
+            .map(|l| l.trim_start_matches("iifname \"orbd*\" ").to_owned())
+            .collect()
     }
 
     #[test]
@@ -478,50 +524,47 @@ mod tests {
             &egress(&[
                 "udp:192.168.2.201:41641",
                 "any:10.1.0.0/16:80-90",
-                "tcp:*:443",
                 "any:172.20.0.0/16",
+                "",
             ]),
             &[
                 "1.1.1.1".into(),
-                "192.168.2.1".into(),
+                "169.254.169.253".into(),
                 "2606:4700::1111".into(),
             ],
         );
-        let fwd = t.split("chain forward").nth(1).unwrap();
-        let fwd = fwd.split("chain postrouting").next().unwrap();
-        let lines: Vec<&str> = fwd
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.starts_with("iifname"))
-            .collect();
         assert_eq!(
-            lines,
+            forward(&t),
             [
-                r#"iifname "orbd*" meta nfproto ipv6 drop"#,
-                r#"iifname "orbd*" oifname "orbd*" drop"#,
-                r#"iifname "orbd*" ip daddr 169.254.0.0/16 drop"#,
-                r#"iifname "orbd*" ip daddr 192.168.2.201/32 udp dport 41641 accept  # udp:192.168.2.201:41641"#,
-                r#"iifname "orbd*" ip daddr 10.1.0.0/16 meta l4proto { tcp, udp } th dport 80-90 accept  # any:10.1.0.0/16:80-90"#,
-                r#"iifname "orbd*" ip daddr 0.0.0.0/0 tcp dport 443 accept  # tcp:*:443"#,
-                r#"iifname "orbd*" ip daddr 172.20.0.0/16 accept  # any:172.20.0.0/16"#,
-                r#"iifname "orbd*" ip daddr 1.1.1.1 meta l4proto { tcp, udp } th dport 53 accept"#,
-                r#"iifname "orbd*" ip daddr 192.168.2.1 meta l4proto { tcp, udp } th dport 53 accept"#,
-                r#"iifname "orbd*" ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 } drop"#,
+                "meta nfproto ipv6 drop",
+                "ct state invalid,untracked drop",
+                "ip saddr != 169.254.0.0/16 drop",
+                r#"oifname "orbd*" drop"#,
+                r#"ip daddr 1.1.1.1 meta l4proto { tcp, udp } th dport 53 accept comment "dns""#,
+                r#"ip daddr 169.254.169.253 meta l4proto { tcp, udp } th dport 53 accept comment "dns""#,
+                "ip daddr { 169.254.0.0/16, 168.63.129.16, 100.100.100.200, 100.100.100.100 } drop",
+                r#"ip daddr 192.168.2.201/32 udp dport 41641 accept comment "udp:192.168.2.201:41641""#,
+                r#"ip daddr 10.1.0.0/16 meta l4proto { tcp, udp } th dport 80-90 accept comment "any:10.1.0.0/16:80-90""#,
+                r#"ip daddr 172.20.0.0/16 accept comment "any:172.20.0.0/16""#,
+                "ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 172.16.0.0/12, \
+                 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, \
+                 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 } drop",
             ]
         );
-        // Everything private allowed: no private drop, link-local and IPv6 still dropped.
-        let open = host_table(
-            &Egress {
-                allow_private: true,
-                allow: vec![],
-            },
-            &[],
+        // Everything private allowed: metadata, spoofing, invalid packets and IPv6 are
+        // still dropped.
+        let open = forward(&host_table(&Egress::new(true, &[]).unwrap(), &[]));
+        assert!(!open.iter().any(|l| l.contains("10.0.0.0/8")), "{open:?}");
+        assert!(open.iter().any(|l| l.contains("168.63.129.16")), "{open:?}");
+        assert!(
+            open.iter().any(|l| l.contains("ct state invalid")),
+            "{open:?}"
         );
-        assert!(!open.contains("10.0.0.0/8") && open.contains("169.254.0.0/16 drop"));
     }
 
-    /// The table loads into nftables, in a throwaway user and network namespace (skipped
-    /// where unprivileged user namespaces or nft are unavailable).
+    /// The table loads into nftables, in a throwaway user and network namespace. Skipped
+    /// where unprivileged user namespaces or nft are unavailable, unless
+    /// `ORBD_TEST_NFT=1` (CI) requires it.
     #[cfg(target_os = "linux")]
     #[test]
     fn host_table_loads() {
@@ -530,6 +573,10 @@ mod tests {
             .args(["-rn", "nft", "list", "ruleset"])
             .output();
         if !probe.is_ok_and(|o| o.status.success()) {
+            assert!(
+                std::env::var("ORBD_TEST_NFT").is_err(),
+                "ORBD_TEST_NFT is set but `unshare -rn nft` does not work"
+            );
             eprintln!("skipped: no unprivileged network namespace with nft");
             return;
         }
@@ -538,10 +585,10 @@ mod tests {
             egress(&[
                 "udp:192.168.2.201:41641",
                 "any:10.1.0.0/16:80-90",
-                "tcp:*:443",
-                "any:172.20.0.0/16",
+                "tcp:172.16.0.0/12",
                 "udp:10.0.0.0/8",
             ]),
+            Egress::new(true, &[]).unwrap(),
         ] {
             let script = host_table(&e, &["1.1.1.1".into(), "10.0.0.53".into()]);
             let mut child = Command::new("unshare")
@@ -564,7 +611,7 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
             let listed = String::from_utf8_lossy(&out.stdout);
-            assert!(listed.contains("192.168.0.0/16"), "{listed}");
+            assert!(listed.contains("168.63.129.16"), "{listed}");
         }
     }
 

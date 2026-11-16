@@ -136,15 +136,21 @@ its gateway `.2`); if workloads in orbs use that subnet, e.g. Docker Compose net
 set another with `ORBD_GUEST_NETWORK` (e.g. `10.200.0.0/24`). It applies to orbs created
 afterwards; existing orbs keep theirs.
 
-Orbs reach the internet, not the host's LAN: traffic from Firecracker orbs to private
-addresses (`10/8`, `172.16/12`, `192.168/16`, a tailnet's `100.64/10`, loopback, multicast
-and reserved ranges) is dropped, as is link-local (cloud metadata) and IPv6. Allow what
-orbs need with `ORBD_EGRESS_ALLOW`, comma-separated `<tcp|udp|any>:<address, CIDR or
-*>[:<port or range>]` entries, e.g. `udp:192.168.2.201:41641` (direct Tailscale to a LAN
-host) or `tcp:10.0.0.0/8:8000-8100`; the orbs' DNS servers are allowed on port 53.
-`ORBD_ALLOW_PRIVATE_EGRESS=true` lifts the block. The agent's own traffic is not affected.
-QEMU orbs use QEMU's user-mode network and need host firewall rules instead (see macOS
-below).
+Firecracker orbs reach the internet, not the host's LAN. Their traffic to private and
+other non-global addresses (`10/8`, `172.16/12`, `192.168/16`, a tailnet's `100.64/10`,
+loopback, documentation, multicast and reserved ranges) is dropped, and so are IPv6, cloud
+metadata endpoints (link-local, Azure's `168.63.129.16`, Alibaba's `100.100.100.200`) and
+the host's Tailscale resolver `100.100.100.100`, whatever is allowed. Allow what orbs need
+with `ORBD_EGRESS_ALLOW`, comma-separated `<tcp|udp|any>:<address or CIDR>[:<port or
+range>]` entries, e.g. `udp:192.168.2.201:41641` (direct Tailscale to a LAN host) or
+`tcp:10.0.0.0/8:8000-8100`; the orbs' DNS servers are allowed on port 53.
+`ORBD_ALLOW_PRIVATE_EGRESS=true` allows every private destination, as orbd did before
+0.2: **upgrading from 0.1 cuts running orbs off the LAN** (their open connections to it
+too), so list what they need first. The agent's own traffic is not affected, other
+firewalls on the host still apply, and the host's public addresses are internet
+addresses to orbs (keep services there firewalled). QEMU orbs (orb types with `kvm`) use
+QEMU's user-mode network, which orbd does not filter: on Linux they reach what the agent
+reaches, so fence them with host firewall rules (on macOS, see below).
 
 `orbd agent list` and `orbd agent remove <id>`
 manage agents; a removed agent's orbs stay on it, unavailable. `orbd agent list` shows
@@ -277,7 +283,8 @@ raise it too, e.g. a drop-in `/etc/systemd/system/docker.service.d/orbd.conf` wi
 The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Linux 6.18
 LTS guest kernel; an agent run outside it needs QEMU 9.0 or newer, and for Firecracker
 `ip` and `nft` (`orbd doctor` checks). Firecracker orbs run in their own network
-namespace behind NAT and cannot reach the agent itself or each other. A sleeping orb wakes only on the
+namespace behind NAT and cannot reach the agent itself, each other or private networks
+(see above). A sleeping orb wakes only on the
 VMM build and CPU it slept on, so after an upgrade it cold-boots once; the agent deletes
 such memory checkpoints when it starts, as it deletes every checkpoint that was restored
 or superseded.
