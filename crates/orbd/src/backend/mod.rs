@@ -201,6 +201,14 @@ pub enum BackendEvent {
     },
 }
 
+/// What one orb holds on its location's disk, as last measured there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OrbDiskUse {
+    pub allocated_bytes: u64,
+    /// The part held by memory checkpoints.
+    pub checkpoint_bytes: u64,
+}
+
 #[async_trait]
 pub trait ComputeBackend: Send + Sync {
     fn id(&self) -> &BackendId;
@@ -232,4 +240,13 @@ pub trait ComputeBackend: Send + Sync {
         location: &Location,
         key: CommandKey,
     ) -> Result<(), BackendError>;
+
+    /// Disk use of each orb at `location`, by orb id, as the location last reported it
+    /// (for operators). None when the backend does not measure it.
+    fn orb_disk(
+        &self,
+        _location: &Location,
+    ) -> Option<std::collections::HashMap<crate::model::OrbId, OrbDiskUse>> {
+        None
+    }
 }

@@ -179,6 +179,7 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
         );
     }
     let db_for_admin = db.clone();
+    let backends_for_admin = backends.clone();
     let mut core = core::Core::new(
         db,
         key.clone(),
@@ -201,6 +202,8 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
     let orbs = orbd_proto::control::v1::orbs_server::OrbsServer::new(orbs::OrbsService {
         core: core_tx.clone(),
         db: db_for_admin,
+        backends: backends_for_admin,
+        policy,
     });
     let dispatch = serve_unix(
         &socket,

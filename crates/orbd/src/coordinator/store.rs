@@ -298,18 +298,6 @@ pub fn idle_orbs(c: &Connection, cutoff_ms: u64) -> Result<Vec<OrbRecord>> {
         .collect())
 }
 
-/// Orbs that are not deleted (or being deleted), oldest first.
-pub fn live_orbs(c: &Connection) -> Result<Vec<OrbRecord>> {
-    let mut st = c.prepare(&format!(
-        "SELECT {ORB_COLS} FROM orbs o WHERE retired_ms IS NULL
-           AND NOT EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
-         ORDER BY created_ms"
-    ))?;
-    Ok(st
-        .query_map([], orb_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
 /// Retires a deleted orb so a new incarnation can take its Amp id.
 pub fn retire_orb(c: &Connection, orb: OrbId) -> Result<()> {
     c.execute(
@@ -786,4 +774,80 @@ pub fn gc(c: &Connection, older_than_ms: u64) -> Result<()> {
         params![older_than_ms as i64],
     )?;
     Ok(())
+}
+
+// --- operator views (`orbd orb`, `orbd status`) --------------------------------------
+
+/// A command as operators see it.
+#[derive(Clone, Debug)]
+pub struct CmdHistory {
+    pub operation_id: OperationId,
+    pub orb_id: OrbId,
+    pub generation: u64,
+    pub action: Action,
+    pub status: String,
+    pub outcome: Option<CommandOutcome>,
+    pub created_ms: u64,
+    pub accepted_ms: Option<u64>,
+    pub terminal_ms: Option<u64>,
+}
+
+const HIST_COLS: &str = "operation_id, orb_id, generation, action_json, status, outcome_json, \
+                         created_ms, accepted_ms, terminal_ms";
+
+fn hist_row(row: &Row) -> rusqlite::Result<CmdHistory> {
+    Ok(CmdHistory {
+        operation_id: uuid_col(row, 0, OperationId::parse)?,
+        orb_id: uuid_col(row, 1, OrbId::parse)?,
+        generation: u(row, 2)?,
+        action: de(row, 3)?,
+        status: row.get(4)?,
+        outcome: de_opt(row, 5)?,
+        created_ms: u(row, 6)?,
+        accepted_ms: u_opt(row, 7)?,
+        terminal_ms: u_opt(row, 8)?,
+    })
+}
+
+/// Commands created since `since_ms`, plus every open one, oldest first.
+pub fn recent_commands(c: &Connection, since_ms: u64) -> Result<Vec<CmdHistory>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {HIST_COLS} FROM commands WHERE created_ms >= ?1 OR status <> 'terminal'
+         ORDER BY created_ms"
+    ))?;
+    Ok(st
+        .query_map(params![since_ms as i64], hist_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The latest `limit` commands of one orb, latest first.
+pub fn orb_commands(c: &Connection, orb: OrbId, limit: u32) -> Result<Vec<CmdHistory>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {HIST_COLS} FROM commands WHERE orb_id = ?1 ORDER BY created_ms DESC LIMIT ?2"
+    ))?;
+    Ok(st
+        .query_map(params![orb.to_string(), limit], hist_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every request the coordinator holds (finished ones are kept for about an hour),
+/// oldest first.
+pub fn all_requests(c: &Connection) -> Result<Vec<Req>> {
+    let mut st = c.prepare(&format!("SELECT {REQ_COLS} FROM requests ORDER BY seq"))?;
+    Ok(st
+        .query_map([], req_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Orbs that are not deleted (or being deleted), oldest first, with when each was
+/// created.
+pub fn live_orbs_created(c: &Connection) -> Result<Vec<(OrbRecord, u64)>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {ORB_COLS}, created_ms FROM orbs o WHERE retired_ms IS NULL
+           AND NOT EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
+         ORDER BY created_ms"
+    ))?;
+    Ok(st
+        .query_map([], |r| Ok((orb_row(r)?, u(r, 9)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }

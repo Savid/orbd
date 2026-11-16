@@ -154,6 +154,24 @@ checkpoint) after the headroom of the orbs already running and the agent's reser
 `ORBD_CAPACITY_DISK_GIB` optionally limits what orbd allocates on the host (default: the
 whole filesystem). A refusal names each host's limiting resource with its numbers.
 
+To see what needs attention, run on the coordinator (e.g. `docker exec orbd orbd status`):
+
+- `orbd status`: every agent's booked memory and usable disk, then problems worst first,
+  each with a command to look further: disconnected agents, agents whose disk or memory
+  keeps orbs from waking, orbs that fail to wake and why, faulted orbs, commands stuck in
+  flight, orbs running for days (Amp does not pause the orb of a deleted thread) and orbs
+  asleep for days. `--check` exits 6 when a problem is an error.
+- `orbd orb list`: each orb's state, agent, type and what it holds on disk (its memory
+  checkpoint too), with a note when it fails or would not fit on its agent now; filter
+  with `--agent`, `--state`, `--asleep-days` and `--problems`.
+- `orbd orb show <orb>`: one orb (by Amp id, a unique prefix of one, or its thread id
+  `T-<uuid>`): whether it would wake now, its failures since its last success, its latest
+  commands and Amp requests, and next steps.
+
+Each takes `--json` for one JSON object on stdout, for scripts and coding agents (fields
+are only added; errors go to stderr as JSON), and exits 2 for bad arguments, 3 for an
+unknown orb, 4 when refused and 5 when the coordinator or the orb's host is unreachable.
+
 Amp pauses an orb when its thread goes idle or is archived and deletes it when it is no
 longer needed, e.g. when the thread is deleted; archiving sends no delete, so orbs of
 archived threads would stay asleep on disk forever. The
@@ -164,8 +182,9 @@ without its files, uncommitted work or processes, and Amp runs setup again. Set 
 longer than any thread you might come back to.
 
 To delete the orbs of archived threads sooner, run a job that checks each orb's thread
-in Amp: `orbd orb list` prints every orb's Amp id (`amp-<thread id>`), state and agent,
-and `orbd orb delete <amp orb id>` deletes one the same way. It refuses an orb unless
+in Amp: `orbd orb list --json` lists every orb's Amp id (`amp-<thread id>`), state,
+agent and what it holds on disk (`--asleep-days 7` narrows it to orbs asleep a week or
+more), and `orbd orb delete <amp orb id>` deletes one the same way. It refuses an orb unless
 it was last seen asleep or stopped at least `--min-asleep-mins` ago (default 60), with
 no job from Amp open or started since (finished jobs are kept for about an hour), so an
 orb in use is never deleted.

@@ -67,6 +67,8 @@ pub(crate) struct Shared {
     pub liveness_queued: Mutex<std::collections::HashSet<OrbId>>,
     /// Last measurement of the bytes allocated under the state directory.
     pub disk_allocated: AtomicU64,
+    /// The same measurement per orb directory.
+    pub orb_disk: Mutex<Vec<pb::OrbDiskUsage>>,
     /// Free disk to keep (see [`crate::model::disk_reserve`]).
     pub disk_reserve: u64,
     /// Host memory to keep available (see `executor::admit`).
@@ -153,20 +155,32 @@ pub(crate) fn disk_stats(config: &AgentConfig) -> (u64, u64) {
         .unwrap_or((0, 0))
 }
 
+/// What [`measure`] found under the state directory.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DiskUse {
+    total: u64,
+    /// Per `orbs/<orb id>` directory, sorted by orb id: (orb id, bytes, checkpoint bytes).
+    orbs: Vec<(String, u64, u64)>,
+}
+
 /// Bytes allocated under `dir`: every file's blocks (sparse disks and checkpoints count
-/// only what they hold), each inode once, without crossing into other filesystems.
-fn allocated_bytes(dir: &std::path::Path) -> u64 {
+/// only what they hold), each inode once, without crossing into other filesystems; also
+/// per orb directory (`orbs/<id>`), and the part of it under `checkpoints`.
+fn measure(dir: &std::path::Path) -> DiskUse {
     use std::os::unix::fs::MetadataExt;
     let Ok(root) = std::fs::symlink_metadata(dir) else {
-        return 0;
+        return DiskUse::default();
     };
     let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![dir.to_path_buf()];
+    let mut per_orb: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    // (directory, its orb, inside the orb's checkpoints)
+    let mut stack = vec![(dir.to_path_buf(), None::<String>, false)];
     let mut total = 0u64;
-    while let Some(d) = stack.pop() {
+    while let Some((d, orb, in_ckpt)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
+        let orbs_root = orb.is_none() && d == dir.join("orbs");
         for e in entries.flatten() {
             // Does not follow symlinks.
             let Ok(m) = e.metadata() else { continue };
@@ -174,23 +188,54 @@ fn allocated_bytes(dir: &std::path::Path) -> u64 {
                 continue;
             }
             if m.is_dir() {
-                stack.push(e.path());
+                let name = e.file_name().to_string_lossy().into_owned();
+                let (orb, in_ckpt) = match &orb {
+                    None if orbs_root => (Some(name), false),
+                    None => (None, false),
+                    Some(o) => (Some(o.clone()), in_ckpt || name == "checkpoints"),
+                };
+                stack.push((e.path(), orb, in_ckpt));
             } else if m.nlink() <= 1 || seen.insert(m.ino()) {
-                total = total.saturating_add(m.blocks().saturating_mul(512));
+                let bytes = m.blocks().saturating_mul(512);
+                total = total.saturating_add(bytes);
+                if let Some(o) = &orb {
+                    let u = per_orb.entry(o.clone()).or_default();
+                    u.0 = u.0.saturating_add(bytes);
+                    if in_ckpt {
+                        u.1 = u.1.saturating_add(bytes);
+                    }
+                }
             }
         }
     }
-    total
+    DiskUse {
+        total,
+        orbs: per_orb
+            .into_iter()
+            .filter(|(_, (b, _))| *b > 0)
+            .map(|(o, (b, c))| (o, b, c))
+            .collect(),
+    }
 }
 
-/// Measures [`allocated_bytes`] of the state directory now and then every minute, for
-/// heartbeats.
+/// Measures the state directory now and then every minute, for heartbeats.
 async fn measure_disk(sh: &Arc<Shared>) {
     let dir = sh.config.agent.state_dir.clone();
-    let bytes = tokio::task::spawn_blocking(move || allocated_bytes(&dir))
+    let used = tokio::task::spawn_blocking(move || measure(&dir))
         .await
-        .unwrap_or(0);
-    sh.disk_allocated.store(bytes, Ordering::Relaxed);
+        .unwrap_or_default();
+    sh.disk_allocated.store(used.total, Ordering::Relaxed);
+    *sh.orb_disk.lock().unwrap() = used
+        .orbs
+        .into_iter()
+        .map(
+            |(orb_id, allocated_bytes, checkpoint_bytes)| pb::OrbDiskUsage {
+                orb_id,
+                allocated_bytes,
+                checkpoint_bytes,
+            },
+        )
+        .collect();
 }
 
 fn acquire_lock(path: &std::path::Path) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
@@ -318,6 +363,7 @@ pub async fn run(
         reserved: Mutex::default(),
         liveness_queued: Mutex::default(),
         disk_allocated: AtomicU64::new(0),
+        orb_disk: Mutex::default(),
         disk_reserve,
         memory_reserve,
         recent_admits: Mutex::default(),
@@ -371,4 +417,38 @@ pub async fn run(
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measure_splits_orbs_and_their_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = |p: &str, len: usize| {
+            let p = dir.path().join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![1u8; len]).unwrap();
+        };
+        w("orbs/a/disk.raw", 64 << 10);
+        w("orbs/a/checkpoints/3/memory", 128 << 10);
+        w("orbs/b/logs/console.log", 16 << 10);
+        w("images/x/rootfs", 32 << 10);
+        std::fs::create_dir_all(dir.path().join("orbs/empty")).unwrap();
+        let used = measure(dir.path());
+        let orbs: HashMap<&str, (u64, u64)> = used
+            .orbs
+            .iter()
+            .map(|(o, b, c)| (o.as_str(), (*b, *c)))
+            .collect();
+        assert_eq!(orbs.len(), 2, "{orbs:?}");
+        let (a, a_ckpt) = orbs["a"];
+        assert!(
+            a >= 192 << 10 && a_ckpt >= 128 << 10 && a_ckpt < a,
+            "{a} {a_ckpt}"
+        );
+        assert!(orbs["b"].0 >= 16 << 10 && orbs["b"].1 == 0);
+        assert!(used.total >= a + orbs["b"].0 + (32 << 10));
+    }
 }
