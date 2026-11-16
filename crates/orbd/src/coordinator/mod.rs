@@ -205,6 +205,12 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
         backends: backends_for_admin,
         policy,
     });
+    // The admin socket first: once the dispatch socket exists, both accept.
+    let admin = serve_unix(
+        &config.admin_socket(),
+        tonic::service::Routes::new(admin.into_server()).add_service(orbs),
+        shutdown.clone(),
+    )?;
     let dispatch = serve_unix(
         &socket,
         tonic::service::Routes::new(
@@ -223,11 +229,6 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
                 },
             ),
         ),
-        shutdown.clone(),
-    )?;
-    let admin = serve_unix(
-        &config.admin_socket(),
-        tonic::service::Routes::new(admin.into_server()).add_service(orbs),
         shutdown.clone(),
     )?;
     tracing::info!(socket = %socket.display(), "dispatch socket ready");
