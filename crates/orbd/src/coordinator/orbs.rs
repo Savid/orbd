@@ -8,11 +8,13 @@ use super::core::{
 };
 use super::db::Db;
 use super::store::{self, CmdHistory};
-use super::types::{ReqStatus, Status as ReqResult};
-use crate::backend::{Availability, ComputeBackend, OrbDiskUse, PlacementRequest};
+use super::types::{Req, ReqStatus, Status as ReqResult};
+use crate::backend::{
+    Availability, ComputeBackend, OrbDiskUse, PlacementCandidate, PlacementRequest,
+};
 use crate::model::{
-    ActionResult, AmpOrbId, BackendId, ExecutionTarget, Location, OrbId, OrbRecord, OrbState,
-    StableOrbState, unix_ms_now,
+    ActionResult, AmpOrbId, BackendId, CommandFailure, ExecutionTarget, FailureCode, Location,
+    OrbId, OrbRecord, OrbState, Resources, StableOrbState,
 };
 use orbd_proto::control::v1 as pb;
 use orbd_proto::control::v1::dispatch_event::Event;
@@ -30,8 +32,8 @@ pub struct OrbsService {
     pub(super) policy: Policy,
 }
 
-/// Commands older than this are not read for `ListOrbs` (failures, last activity).
-const RECENT: Duration = Duration::from_secs(7 * 86_400);
+/// Commands read per orb for its failures and its open command.
+const RECENT_COMMANDS: u32 = 50;
 const MAX_FAILURES: usize = 5;
 
 fn internal(e: anyhow::Error) -> Status {
@@ -46,12 +48,18 @@ fn snake<T: serde::Serialize>(v: &T) -> String {
     }
 }
 
-/// Everything `ListOrbs` and `GetOrb` read from the database in one go.
+/// A live orb: its record, when it was created, and whether a delete of it started.
+type Live = (OrbRecord, u64, bool);
+
+/// What `ListOrbs` and `GetOrb` read from the database for some orbs.
 struct Snapshot {
-    orbs: Vec<(OrbRecord, u64)>,
-    commands: Vec<CmdHistory>,
-    requests: Vec<super::types::Req>,
+    /// Per orb: its latest commands (latest first) and when it last spawned or paused.
+    activity: HashMap<OrbId, (Vec<CmdHistory>, Option<u64>)>,
+    requests: Vec<Req>,
     pools: HashMap<(String, String), store::PoolUse>,
+    /// What each orb's own running reservation holds, left out of its wake check as
+    /// admission leaves it out.
+    own: HashMap<OrbId, Resources>,
 }
 
 #[tonic::async_trait]
@@ -60,8 +68,9 @@ impl Orbs for OrbsService {
         &self,
         _: Request<pb::ListOrbsRequest>,
     ) -> Result<Response<pb::ListOrbsResponse>, Status> {
-        let snap = self.snapshot().await?;
-        let orbs = self.infos(&snap, &snap.orbs).await;
+        let orbs = self.live().await?;
+        let snap = self.snapshot(&orbs, RECENT_COMMANDS).await?;
+        let orbs = self.infos(&snap, &orbs).await;
         Ok(Response::new(pb::ListOrbsResponse { orbs }))
     }
 
@@ -70,26 +79,26 @@ impl Orbs for OrbsService {
         request: Request<pb::GetOrbRequest>,
     ) -> Result<Response<pb::GetOrbResponse>, Status> {
         let r = request.into_inner();
-        let snap = self.snapshot().await?;
-        let (orb, created) = resolve(&snap.orbs, &r.orb)?.clone();
-        let info = self
-            .infos(&snap, std::slice::from_ref(&(orb.clone(), created)))
-            .await
-            .pop()
-            .expect("one orb");
+        let live = self.live().await?;
+        let one = resolve(&live, &r.orb)?.clone();
         let history = match r.history {
             0 => 20,
             n => n.min(500),
         };
-        let id = orb.id;
-        let commands = self
-            .db
-            .call(move |c| store::orb_commands(c, id, history))
+        let snap = self
+            .snapshot(std::slice::from_ref(&one), history.max(RECENT_COMMANDS))
+            .await?;
+        let info = self
+            .infos(&snap, std::slice::from_ref(&one))
             .await
-            .map_err(internal)?
-            .iter()
-            .map(command_pb)
-            .collect();
+            .pop()
+            .expect("one orb");
+        let orb = one.0;
+        let commands = snap
+            .activity
+            .get(&orb.id)
+            .map(|(c, _)| c.iter().take(history as usize).map(command_pb).collect())
+            .unwrap_or_default();
         let requests = snap
             .requests
             .iter()
@@ -149,54 +158,64 @@ impl Orbs for OrbsService {
     }
 }
 
-/// Finds the one live orb `query` names: an Amp orb id or a unique prefix of one, a
-/// thread id (`T-<uuid>`, or the bare uuid) or an internal orb id.
-fn resolve<'a>(orbs: &'a [(OrbRecord, u64)], query: &str) -> Result<&'a (OrbRecord, u64), Status> {
+/// `query` as an Amp orb id: `T-<uuid>` and a bare uuid become `amp-<uuid>`. None when
+/// nothing follows the prefix.
+fn amp_id(query: &str) -> Option<String> {
     let q = query.trim();
-    if q.is_empty() {
-        return Err(Status::invalid_argument("no orb given"));
-    }
-    if let Some(o) = orbs.iter().find(|(o, _)| o.id.to_string() == q) {
+    let rest = q
+        .strip_prefix("T-")
+        .or_else(|| q.strip_prefix("amp-"))
+        .unwrap_or(q);
+    (!rest.is_empty()).then(|| format!("amp-{rest}"))
+}
+
+/// The live orb `query` names exactly: its internal id, Amp id or thread id.
+fn resolve_exact<'a>(orbs: &'a [Live], query: &str) -> Option<&'a Live> {
+    let q = query.trim();
+    orbs.iter()
+        .find(|(o, _, _)| o.id.to_string() == q)
+        .or_else(|| {
+            let id = amp_id(q)?;
+            orbs.iter().find(|(o, _, _)| o.identity.amp_orb_id.0 == id)
+        })
+}
+
+/// Finds the one live orb `query` names: exactly (see [`resolve_exact`]), or by a
+/// unique prefix of its Amp id.
+fn resolve<'a>(orbs: &'a [Live], query: &str) -> Result<&'a Live, Status> {
+    if let Some(o) = resolve_exact(orbs, query) {
         return Ok(o);
     }
-    let q = match q.strip_prefix("T-") {
-        Some(rest) => format!("amp-{rest}"),
-        None if q.starts_with("amp-") => q.to_owned(),
-        None => format!("amp-{q}"),
+    let Some(prefix) = amp_id(query) else {
+        return Err(Status::invalid_argument(format!(
+            "{query:?} names no orb: give an Amp orb id, a prefix of one, or a thread id"
+        )));
     };
-    if let Some(o) = orbs.iter().find(|(o, _)| o.identity.amp_orb_id.0 == q) {
-        return Ok(o);
-    }
     let matches: Vec<_> = orbs
         .iter()
-        .filter(|(o, _)| o.identity.amp_orb_id.0.starts_with(&q))
+        .filter(|(o, _, _)| o.identity.amp_orb_id.0.starts_with(&prefix))
         .collect();
     match matches.as_slice() {
         [one] => Ok(one),
         [] => Err(Status::not_found(format!(
-            "no orb matches {query:?} (`orbd orb list` lists them; deleted orbs are not kept)"
+            "no orb matches {query:?} (deleted orbs are not kept)"
         ))),
         many => Err(Status::invalid_argument(format!(
-            "{query:?} matches {} orbs: {}",
+            "{query:?} matches {} orbs, give more of the id: {}",
             many.len(),
             many.iter()
                 .take(10)
-                .map(|(o, _)| o.identity.amp_orb_id.0.as_str())
+                .map(|(o, _, _)| o.identity.amp_orb_id.0.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         ))),
     }
 }
 
-fn failure_pb(
-    action: &str,
-    f: &crate::model::CommandFailure,
-    at: u64,
-    op: String,
-) -> pb::OrbFailure {
+fn failure_pb(action: &str, f: &CommandFailure, at: u64, op: String) -> pb::OrbFailure {
     pb::OrbFailure {
         action: action.into(),
-        code: snake(&f.code),
+        code: pb::FailureCode::from(f.code) as i32,
         message: f.message.clone(),
         unix_ms: at,
         operation_id: op,
@@ -238,15 +257,19 @@ fn command_pb(c: &CmdHistory) -> pb::OrbCommand {
     }
 }
 
+/// An outcome: (time, action, failure or None for a success).
+type Outcome = (u64, &'static str, Option<pb::OrbFailure>);
+
 /// Outcomes of one orb's commands and of its Amp requests that never became a command,
-/// latest first, as (time, action, failure or None for a success).
+/// latest first. A request is dated when it started (finished ones are kept for about
+/// an hour, and the coordinator does not record when one finished).
 fn outcomes(
     orb: &OrbRecord,
     created: u64,
-    commands: &[&CmdHistory],
-    requests: &[super::types::Req],
-) -> Vec<(u64, &'static str, Option<pb::OrbFailure>)> {
-    let mut out: Vec<(u64, &'static str, Option<pb::OrbFailure>)> = commands
+    commands: &[CmdHistory],
+    requests: &[Req],
+) -> Vec<Outcome> {
+    let mut out: Vec<Outcome> = commands
         .iter()
         .filter(|c| c.status == "terminal")
         .map(|c| {
@@ -267,43 +290,71 @@ fn outcomes(
             continue;
         }
         let Some(r) = &q.result else { continue };
-        let at = q.dispatch_deadline_ms.min(unix_ms_now()).max(q.start_ms);
         let failure = (r.status != ReqResult::Succeeded).then(|| {
             match r.outcome.as_ref().map(|o| &o.result) {
                 Some(Err(f)) => failure_pb(q.action.name(), f, q.start_ms, String::new()),
-                _ => pb::OrbFailure {
-                    action: q.action.name().into(),
-                    code: r.status.label().into(),
-                    message: r.message.clone(),
-                    unix_ms: q.start_ms,
-                    operation_id: String::new(),
-                },
+                _ => {
+                    let code = match r.status {
+                        ReqResult::Unavailable => FailureCode::BackendUnavailable,
+                        ReqResult::Invalid => FailureCode::InvalidRequest,
+                        ReqResult::DeadlineExceeded => FailureCode::DeadlineExceeded,
+                        _ => FailureCode::BackendFailure,
+                    };
+                    let f = CommandFailure {
+                        code,
+                        message: r.message.clone(),
+                    };
+                    failure_pb(q.action.name(), &f, q.start_ms, String::new())
+                }
             }
         });
-        let t = if failure.is_some() { q.start_ms } else { at };
-        out.push((t, q.action.name(), failure));
+        out.push((q.start_ms, q.action.name(), failure));
     }
     out.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
     out
 }
 
-/// The failures of the action that failed last, latest first, back to that action's
-/// last success: a pause that succeeds (e.g. Amp giving up on a wake) does not make
-/// failed wakes go away, only a wake does.
-fn failing(outcomes: &[(u64, &'static str, Option<pb::OrbFailure>)]) -> Vec<pb::OrbFailure> {
-    let Some(action) = outcomes.iter().find_map(|(_, a, f)| f.as_ref().map(|_| *a)) else {
-        return Vec::new();
+/// Failures of one action back to that action's last success, latest first: failed
+/// spawns if there are any (a pause that succeeds, e.g. Amp giving up on a wake, or one
+/// that fails, does not hide them), else those of the action that failed last.
+fn failing(outcomes: &[Outcome]) -> Vec<pb::OrbFailure> {
+    let streak = |action: &str| -> Vec<pb::OrbFailure> {
+        outcomes
+            .iter()
+            .filter(|(_, a, _)| *a == action)
+            .map_while(|(_, _, f)| f.clone())
+            .collect()
     };
+    let spawns = streak("spawn");
+    if !spawns.is_empty() {
+        return spawns;
+    }
     outcomes
         .iter()
-        .filter(|(_, a, _)| *a == action)
-        .map_while(|(_, _, f)| f.clone())
-        .collect()
+        .filter(|(_, a, f)| f.is_some() && *a != "spawn")
+        .map(|(_, a, _)| streak(a))
+        .find(|s| !s.is_empty())
+        .unwrap_or_default()
+}
+
+fn blocker(code: FailureCode, message: String) -> pb::CommandFailure {
+    pb::CommandFailure {
+        code: pb::FailureCode::from(code) as i32,
+        message,
+    }
 }
 
 impl OrbsService {
-    async fn snapshot(&self) -> Result<Snapshot, Status> {
-        let since = unix_ms_now().saturating_sub(RECENT.as_millis() as u64);
+    async fn live(&self) -> Result<Vec<Live>, Status> {
+        self.db
+            .call(|c| store::live_orbs_created(c))
+            .await
+            .map_err(internal)
+    }
+
+    /// Reads what `infos` needs for `orbs`: per orb, with its indexes.
+    async fn snapshot(&self, orbs: &[Live], commands: u32) -> Result<Snapshot, Status> {
+        let ids: Vec<OrbId> = orbs.iter().map(|(o, _, _)| o.id).collect();
         let backends: Vec<String> = self.backends.keys().map(|b| b.to_string()).collect();
         self.db
             .call(move |c| {
@@ -313,29 +364,30 @@ impl OrbsService {
                         pools.insert((b.clone(), pool), used);
                     }
                 }
+                let mut activity = HashMap::new();
+                for id in ids {
+                    let cmds = store::orb_commands(c, id, commands)?;
+                    activity.insert(id, (cmds, store::last_active(c, id)?));
+                }
                 Ok(Snapshot {
-                    orbs: store::live_orbs_created(c)?,
-                    commands: store::recent_commands(c, since)?,
+                    activity,
                     requests: store::all_requests(c)?,
                     pools,
+                    own: store::running_reservations(c)?,
                 })
             })
             .await
             .map_err(internal)
     }
 
-    /// `OrbInfo` of each of `orbs`, with a capacity check against its host now for
-    /// each orb that does not run.
-    async fn infos(&self, snap: &Snapshot, orbs: &[(OrbRecord, u64)]) -> Vec<pb::OrbInfo> {
+    /// `OrbInfo` of each of `orbs`, with a check against its host now, as admission
+    /// would make it, for each orb that does not run.
+    async fn infos(&self, snap: &Snapshot, orbs: &[Live]) -> Vec<pb::OrbInfo> {
         let mut disk: HashMap<Location, HashMap<OrbId, OrbDiskUse>> = HashMap::new();
-        let mut hosts: HashMap<Location, Result<crate::backend::PlacementCandidate, String>> =
+        let mut hosts: HashMap<Location, Result<PlacementCandidate, pb::CommandFailure>> =
             HashMap::new();
-        let mut by_orb: HashMap<OrbId, Vec<&CmdHistory>> = HashMap::new();
-        for c in &snap.commands {
-            by_orb.entry(c.orb_id).or_default().push(c);
-        }
         let mut out = Vec::with_capacity(orbs.len());
-        for (orb, created) in orbs {
+        for (orb, created, tombstoned) in orbs {
             let backend = self.backends.get(orb.location.backend_id());
             if !disk.contains_key(&orb.location) {
                 let d = backend
@@ -343,10 +395,6 @@ impl OrbsService {
                     .unwrap_or_default();
                 disk.insert(orb.location.clone(), d);
             }
-            let commands = by_orb.get(&orb.id).map(Vec::as_slice).unwrap_or_default();
-            let state = &orb.observation.state;
-            let running = matches!(state.last_known(), StableOrbState::Running);
-            let deleted = matches!(state.last_known(), StableOrbState::Deleted);
             if let Some(backend) = backend
                 && !hosts.contains_key(&orb.location)
             {
@@ -354,41 +402,57 @@ impl OrbsService {
                 hosts.insert(orb.location.clone(), h);
             }
             let host = hosts.get(&orb.location);
+            let (commands, last_success) = snap
+                .activity
+                .get(&orb.id)
+                .map(|(c, l)| (c.as_slice(), *l))
+                .unwrap_or_default();
+            let open_command = commands
+                .iter()
+                .find(|c| c.status != "terminal")
+                .map(command_pb);
+            let state = &orb.observation.state;
+            let stable = state.last_known();
+            let starting = open_command.as_ref().is_some_and(|c| c.action == "spawn");
             let mut wake_blockers = Vec::new();
-            if !running && !deleted {
-                match host {
-                    None => {}
-                    Some(Err(reason)) => wake_blockers.push(reason.clone()),
-                    Some(Ok(cand)) => {
+            if !matches!(stable, StableOrbState::Running | StableOrbState::Deleted)
+                && !tombstoned
+                && !starting
+            {
+                match (backend, host) {
+                    (None, _) => wake_blockers.push(blocker(
+                        FailureCode::BackendUnavailable,
+                        format!("backend {} is not configured", orb.location.backend_id()),
+                    )),
+                    (_, None) => {}
+                    (_, Some(Err(e))) => wake_blockers.push(e.clone()),
+                    (_, Some(Ok(cand))) => {
                         let key = (
                             cand.location.backend_id().to_string(),
                             cand.capacity_pool.clone(),
                         );
-                        let used = snap.pools.get(&key).copied().unwrap_or_default();
+                        let mut used = snap.pools.get(&key).copied().unwrap_or_default();
+                        // As admission does: the orb's own reservation is not in its way.
+                        if let Some(own) = snap.own.get(&orb.id) {
+                            used.held.vcpus = used.held.vcpus.saturating_sub(own.vcpus);
+                            used.held.memory_bytes =
+                                used.held.memory_bytes.saturating_sub(own.memory_bytes);
+                            used.held.disk_bytes =
+                                used.held.disk_bytes.saturating_sub(own.disk_bytes);
+                            used.running = used.running.saturating_sub(1);
+                        }
                         let need = demand(&self.policy, &orb.spec.template);
-                        wake_blockers
-                            .extend(shortfalls(cand, &used, need).into_iter().map(|(_, s)| s));
+                        wake_blockers.extend(
+                            shortfalls(cand, &used, need)
+                                .into_iter()
+                                .map(|(code, msg)| blocker(code, msg)),
+                        );
                     }
                 }
             }
             let mut failures = failing(&outcomes(orb, *created, commands, &snap.requests));
             let failures_since_success = failures.len() as u32;
             failures.truncate(MAX_FAILURES);
-            let last_active = commands
-                .iter()
-                .filter_map(|c| match c.outcome.as_ref().map(|o| &o.result) {
-                    Some(Ok(ActionResult::Spawned { .. } | ActionResult::Paused { .. })) => {
-                        c.terminal_ms
-                    }
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(*created);
-            let open_command = commands
-                .iter()
-                .rev()
-                .find(|c| c.status != "terminal")
-                .map(|c| command_pb(c));
             let queued_requests = snap
                 .requests
                 .iter()
@@ -406,12 +470,12 @@ impl OrbsService {
             out.push(pb::OrbInfo {
                 amp_orb_id: orb.identity.amp_orb_id.to_string(),
                 offering_id: orb.offering_id.to_string(),
-                agent_id: if agent_id.is_empty() {
-                    backend_id.clone()
+                agent_id,
+                state: if *tombstoned {
+                    "deleting".into()
                 } else {
-                    agent_id
+                    state_label(state)
                 },
-                state: state_label(state),
                 observed_unix_ms: orb.observation.observed_at_unix_ms,
                 orb_id: orb.id.to_string(),
                 arch: tmpl.requirements.arch.as_str().into(),
@@ -421,8 +485,7 @@ impl OrbsService {
                 },
                 resources: Some(tmpl.resources.into()),
                 created_unix_ms: *created,
-                disk: disk[&orb.location].get(&orb.id).map(|d| pb::OrbDiskUsage {
-                    orb_id: orb.id.to_string(),
+                disk: disk[&orb.location].get(&orb.id).map(|d| pb::DiskUse {
                     allocated_bytes: d.allocated_bytes,
                     checkpoint_bytes: d.checkpoint_bytes,
                 }),
@@ -431,7 +494,7 @@ impl OrbsService {
                 failures_since_success,
                 open_command,
                 queued_requests,
-                last_active_unix_ms: last_active,
+                last_active_unix_ms: last_success.unwrap_or(*created),
                 fault: match state {
                     OrbState::Faulted { reason, .. } => reason.clone(),
                     OrbState::Known { .. } => String::new(),
@@ -448,7 +511,8 @@ impl OrbsService {
         &self,
         backend: &Arc<dyn ComputeBackend>,
         orb: &OrbRecord,
-    ) -> Result<crate::backend::PlacementCandidate, String> {
+    ) -> Result<PlacementCandidate, pb::CommandFailure> {
+        let unavailable = |m: String| blocker(FailureCode::BackendUnavailable, m);
         let tmpl = &orb.spec.template;
         let req = PlacementRequest {
             target: tmpl.target.clone(),
@@ -459,29 +523,43 @@ impl OrbsService {
         let cands = match tokio::time::timeout(BACKEND_CALL_TIMEOUT, backend.candidates(req)).await
         {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return Err(format!("its host could not be checked: {e}")),
-            Err(_) => return Err("its host could not be checked: timed out".into()),
+            Ok(Err(e)) => return Err(unavailable(format!("its host could not be checked: {e}"))),
+            Err(_) => {
+                return Err(unavailable(
+                    "its host could not be checked: timed out".into(),
+                ));
+            }
         };
         let host = match &orb.location {
             Location::Fleet { agent_id, .. } => agent_id.to_string(),
             Location::External { backend_id, .. } => backend_id.to_string(),
         };
         match cands.into_iter().find(|c| c.location == orb.location) {
-            None => Err(format!("{host} is not a known host")),
+            None => Err(unavailable(format!("{host} is not a known host"))),
             Some(c) => match &c.availability {
                 Availability::Available => Ok(c),
-                Availability::Draining => Err(format!("{host} is shutting down")),
+                Availability::Draining => Err(unavailable(format!("{host} is shutting down"))),
                 Availability::Unavailable { reason } => {
-                    Err(format!("{host} is unavailable: {reason}"))
+                    Err(unavailable(format!("{host} is unavailable: {reason}")))
                 }
             },
         }
     }
 
-    /// Runs `job` on the orb through the coordinator and waits for its result message.
-    async fn job(&self, amp_orb_id: &str, job: OperatorJob) -> Result<String, Status> {
-        let amp_orb_id =
-            AmpOrbId::parse(amp_orb_id).map_err(|_| Status::invalid_argument("invalid orb id"))?;
+    /// Runs `job` on the orb named exactly by `query` (see [`resolve_exact`]) through
+    /// the coordinator and waits for its result message.
+    async fn job(&self, query: &str, job: OperatorJob) -> Result<String, Status> {
+        let live = self.live().await?;
+        let id = match resolve_exact(&live, query) {
+            Some((o, _, _)) => o.identity.amp_orb_id.0.clone(),
+            None => amp_id(query).ok_or_else(|| {
+                Status::invalid_argument(format!(
+                    "{query:?} names no orb: give its Amp orb id or thread id"
+                ))
+            })?,
+        };
+        let amp_orb_id = AmpOrbId::parse(&id)
+            .map_err(|_| Status::invalid_argument(format!("{query:?} is not an orb id")))?;
         let (tx, mut rx) = mpsc::channel(64);
         self.core
             .send(Msg::OperatorJob {
@@ -493,10 +571,16 @@ impl OrbsService {
             .map_err(|_| Status::unavailable("coordinator is shutting down"))?;
         while let Some(ev) = rx.recv().await {
             if let Some(Event::Result(res)) = ev?.event {
-                return match pb::DispatchStatus::try_from(res.status) {
-                    Ok(pb::DispatchStatus::Succeeded) => Ok(res.message),
-                    Ok(pb::DispatchStatus::Unavailable) => Err(Status::unavailable(res.message)),
-                    _ => Err(Status::aborted(res.message)),
+                use pb::DispatchStatus as D;
+                return match D::try_from(res.status) {
+                    Ok(D::Succeeded) => Ok(res.message),
+                    Ok(D::Unavailable) => Err(Status::unavailable(res.message)),
+                    Ok(D::Invalid) => Err(Status::invalid_argument(res.message)),
+                    Ok(D::Failed) => Err(Status::aborted(res.message)),
+                    _ => Err(Status::unknown(format!(
+                        "{} (the outcome is not known: it may have happened)",
+                        res.message
+                    ))),
                 };
             }
         }
@@ -518,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_success_of_the_failing_action_ends_its_failures() {
+    fn failed_spawns_end_only_with_a_spawn() {
         // Latest first: a pause succeeded after two failed wakes, before them a wake.
         let o = vec![
             (5, "pause", None),
@@ -528,8 +612,39 @@ mod tests {
             (1, "spawn", f("spawn")),
         ];
         assert_eq!(failing(&o).len(), 2);
-        let woke = [vec![(6, "spawn", None)], o].concat();
+        let woke = [vec![(6, "spawn", None)], o.clone()].concat();
         assert!(failing(&woke).is_empty());
+        // A failed pause after them does not hide them either.
+        let paused = [vec![(6, "pause", f("pause"))], o].concat();
+        let got = failing(&paused);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|f| f.action == "spawn"));
+        // With no failed spawn: the action that failed last.
+        let pauses = [
+            (3, "pause", f("pause")),
+            (2, "delete", f("delete")),
+            (1, "pause", None),
+        ];
+        assert_eq!(failing(&pauses)[0].action, "pause");
         assert!(failing(&[(1, "pause", None)]).is_empty());
+    }
+
+    #[test]
+    fn ids_resolve_exactly_or_by_unique_prefix() {
+        assert_eq!(amp_id("T-01a1-x").as_deref(), Some("amp-01a1-x"));
+        assert_eq!(amp_id(" 01a1-x ").as_deref(), Some("amp-01a1-x"));
+        assert_eq!(amp_id("amp-01a1").as_deref(), Some("amp-01a1"));
+        for empty in ["T-", "amp-", "", "  "] {
+            assert_eq!(amp_id(empty), None, "{empty:?}");
+        }
+        let none: Vec<Live> = vec![];
+        assert_eq!(
+            resolve(&none, "T-").unwrap_err().code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            resolve(&none, "amp-1").unwrap_err().code(),
+            tonic::Code::NotFound
+        );
     }
 }

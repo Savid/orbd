@@ -92,24 +92,10 @@ fn orb_delete_takes_only_orbs_asleep_long_enough() {
     assert_ok(&c.dispatch("spawn", "amp-2", &[]), "spawn 2");
     assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2");
 
-    let list = c.admin(&["orb", "list"]);
-    assert_ok(&list, "orb list");
-    let rows: Vec<Vec<&str>> = list
-        .stdout
-        .lines()
-        .skip(1)
-        .map(|l| l.split_whitespace().collect())
-        .collect();
+    let row = |id: &str, state: &str| (id.into(), state.into(), "agent-a".into(), OFFERING.into());
     assert_eq!(
-        rows.iter()
-            .map(|r| (r[0], r[1], r[3], r[4]))
-            .collect::<Vec<_>>(),
-        [
-            ("amp-1", "running", "agent-a", OFFERING),
-            ("amp-2", "asleep", "agent-a", OFFERING)
-        ],
-        "{}",
-        list.stdout
+        c.orb_rows(),
+        [row("amp-1", "running"), row("amp-2", "asleep")]
     );
 
     let running = c.admin(&["orb", "delete", "amp-1", "--min-asleep-mins", "0"]);

@@ -18,7 +18,8 @@ use tonic::transport::Channel;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Exit {
-    /// 1: anything else.
+    /// 1: anything else, including a pause or delete that ran and failed, or whose
+    /// outcome is not known (`orbd orb show` says what happened).
     Failed = 1,
     /// 2: bad arguments, e.g. an orb prefix matching several orbs.
     Usage = 2,
@@ -33,10 +34,12 @@ pub enum Exit {
 }
 
 pub const EXIT_CODES_HELP: &str = "\
-Exit codes: 0 ok; 1 failed; 2 bad arguments (e.g. an ambiguous orb prefix); 3 no such
-orb or agent; 4 refused, nothing done (e.g. deleting an orb that is in use); 5 the
-coordinator or the orb's host is unreachable, retry later; 6 `status --check` found
-errors.";
+Exit codes: 0 ok; 1 failed (a pause or delete that ran and failed, or whose outcome is
+unknown: `orbd orb show` says what happened); 2 bad arguments (e.g. an ambiguous orb
+prefix); 3 no such orb or agent; 4 refused, nothing done (e.g. deleting an orb in use);
+5 the coordinator or the orb's host is unreachable, retry later; 6 `status --check`
+found errors. With --json, errors are one JSON object on stderr:
+{\"error\": {\"exit_code\", \"kind\", \"message\", \"hint\", \"retryable\"}}.";
 
 /// An error with its exit code and, where there is one, what to do next.
 #[derive(Debug)]
@@ -74,8 +77,10 @@ impl CliError {
         let exit = match s.code() {
             Code::NotFound => Exit::NotFound,
             Code::InvalidArgument => Exit::Usage,
-            Code::FailedPrecondition | Code::Aborted | Code::AlreadyExists => Exit::Refused,
+            // Refused before anything was done.
+            Code::FailedPrecondition | Code::AlreadyExists => Exit::Refused,
             Code::Unavailable | Code::DeadlineExceeded => Exit::Unavailable,
+            // Aborted: it ran and failed. Unknown: it may have happened.
             _ => Exit::Failed,
         };
         let message = match what {
@@ -84,7 +89,6 @@ impl CliError {
         };
         let hint = match exit {
             Exit::NotFound => Some("`orbd orb list` lists the orbs that exist".to_owned()),
-            Exit::Usage => Some("give more of the orb id".to_owned()),
             _ => None,
         };
         Self {
@@ -103,6 +107,8 @@ impl CliError {
                 "kind": self.exit,
                 "message": self.message,
                 "hint": self.hint,
+                // Trying again later may succeed (the coordinator or a host was away).
+                "retryable": self.exit == Exit::Unavailable,
             }});
             eprintln!("{v}");
         } else {
@@ -111,14 +117,6 @@ impl CliError {
                 eprintln!("hint: {h}");
             }
         }
-    }
-}
-
-/// An error from a CLI command as a [`CliError`] (exit 1 unless it is one).
-pub fn classify(e: anyhow::Error) -> CliError {
-    match e.downcast::<CliError>() {
-        Ok(c) => c,
-        Err(e) => CliError::new(Exit::Failed, format!("{e:#}")),
     }
 }
 
@@ -249,6 +247,13 @@ mod tests {
         assert_eq!(e.exit, Exit::NotFound);
         let e = CliError::from_status(&tonic::Status::failed_precondition("in use"), Some("x"));
         assert_eq!((e.exit, e.message.as_str()), (Exit::Refused, "x: in use"));
+        // A command that ran and failed, or may have happened, did not "do nothing".
+        for s in [
+            tonic::Status::aborted("failed"),
+            tonic::Status::unknown("?"),
+        ] {
+            assert_eq!(CliError::from_status(&s, None).exit, Exit::Failed);
+        }
         let e = CliError::from_status(&tonic::Status::unavailable("down"), None);
         assert_eq!(e.exit, Exit::Unavailable);
     }

@@ -11,9 +11,10 @@ Operating the fleet (on the coordinator, e.g. `docker exec orbd orbd status`):
   orbd orb show <orb>         one orb: state, disk, wake check, failures, commands, next steps
   orbd agent list             agents and their capacity
 
-An <orb> is an Amp orb id (amp-<uuid>), a unique prefix of one, or its thread id
-(T-<uuid>). Add --json to any of these for one JSON object on stdout (fields are only
-ever added; times are *_unix_ms, sizes *_bytes); errors then go to stderr as JSON too.";
+An <orb> is an Amp orb id (amp-<uuid>) or its thread id (T-<uuid>); `orb show` also
+takes a unique prefix. Add --json to any of these (and to `orb pause|delete`) for one
+JSON object on stdout (fields are only ever added; times are *_unix_ms, sizes *_bytes);
+errors then go to stderr as JSON too.";
 
 #[derive(Parser)]
 #[command(
@@ -26,10 +27,6 @@ struct Cli {
     /// Log as JSON lines.
     #[arg(long, global = true, env = "ORBD_LOG_JSON")]
     log_json: bool,
-    /// Print results as one JSON object (status, orb, agent list), and errors as JSON
-    /// on stderr.
-    #[arg(long, global = true)]
-    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -39,6 +36,17 @@ struct CoordinatorArgs {
     /// Coordinator configuration.
     #[arg(long, short, env = "ORBD_CONFIG", default_value = DEFAULT_CONFIG)]
     config: PathBuf,
+}
+
+/// Arguments of the operator commands on the coordinator's admin socket.
+#[derive(Args)]
+struct OperatorArgs {
+    /// Print the result as one JSON object on stdout, and errors as one JSON object on
+    /// stderr.
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    coordinator: CoordinatorArgs,
 }
 
 #[derive(Subcommand)]
@@ -67,16 +75,21 @@ enum Command {
         coordinator: CoordinatorArgs,
     },
     /// Agents, orbs and what needs attention, worst first (run on the coordinator).
-    #[command(after_help = orbd::cli::EXIT_CODES_HELP)]
+    #[command(after_help = format!(
+        "{}\n\n{}",
+        orbd::cli::status::PROBLEM_KINDS_HELP,
+        orbd::cli::EXIT_CODES_HELP
+    ))]
     Status {
         /// Exit 6 when a problem has severity error (after printing).
         #[arg(long)]
         check: bool,
-        /// Report orbs asleep at least this many days as cleanup candidates.
+        /// Orbs asleep at least this many days are cleanup candidates, and asleep orbs
+        /// not active for as long do not count towards an agent being full.
         #[arg(long, default_value_t = 3)]
         idle_days: u64,
         #[command(flatten)]
-        coordinator: CoordinatorArgs,
+        op: OperatorArgs,
     },
     /// Inspect, pause or delete orbs (run on the coordinator).
     #[command(subcommand)]
@@ -98,7 +111,8 @@ enum Command {
 #[derive(Subcommand)]
 enum AgentCommand {
     /// List enrolled agents (run on the coordinator).
-    List(CoordinatorArgs),
+    #[command(after_help = orbd::cli::EXIT_CODES_HELP)]
+    List(OperatorArgs),
     /// Revoke an agent for good; its orbs stay recorded on it, unavailable.
     Remove {
         agent_id: String,
@@ -118,17 +132,16 @@ enum OrbCommand {
         #[arg(long)]
         agent: Option<String>,
         /// Only orbs in this state.
-        #[arg(long, value_parser = ["running", "asleep", "stopped", "faulted", "uncreated"])]
+        #[arg(long, value_parser = ["running", "asleep", "stopped", "deleting", "faulted", "uncreated"])]
         state: Option<String>,
         /// Only orbs asleep (or stopped) for at least this many days.
         #[arg(long)]
         asleep_days: Option<u64>,
-        /// Only orbs with a problem: faulted, failing since their last success, or with
-        /// a command in flight for over 10 minutes.
+        /// Only orbs named by a warning or error of `orbd status`.
         #[arg(long)]
         problems: bool,
         #[command(flatten)]
-        coordinator: CoordinatorArgs,
+        op: OperatorArgs,
     },
     /// Show one orb: state, agent, disk use, whether it would wake now and why not,
     /// failures since its last success, its latest commands and Amp requests, and next
@@ -142,26 +155,28 @@ enum OrbCommand {
         #[arg(long, default_value_t = 20)]
         history: u32,
         #[command(flatten)]
-        coordinator: CoordinatorArgs,
+        op: OperatorArgs,
     },
     /// Pause an orb as if Amp had sent `pause` (a memory checkpoint where the runtime
     /// keeps one), after any job Amp has queued for it. For an orb Amp no longer
     /// pauses, e.g. one whose provider token is no longer served; its thread's next
     /// spawn wakes it.
+    #[command(after_help = orbd::cli::EXIT_CODES_HELP)]
     Pause {
-        /// Amp orb id (Amp's ORB_ID, `amp-<thread id>`), as `orbd orb list` shows it.
-        amp_orb_id: String,
+        /// Amp orb id (`amp-<thread id>`) or thread id (`T-<uuid>`), exactly.
+        orb: String,
         #[command(flatten)]
-        coordinator: CoordinatorArgs,
+        op: OperatorArgs,
     },
     /// Delete an orb whose thread is gone (Amp sends no delete for an archived thread),
     /// as if Amp had sent `delete`. Refused unless the orb was last seen asleep or
     /// stopped at least `--min-asleep-mins` ago, with no job from Amp open or started
     /// since (the coordinator keeps finished jobs for about an hour), or `--force`. A
     /// later spawn starts a fresh orb.
+    #[command(after_help = orbd::cli::EXIT_CODES_HELP)]
     Delete {
-        /// Amp orb id (Amp's ORB_ID, `amp-<thread id>`), as `orbd orb list` shows it.
-        amp_orb_id: String,
+        /// Amp orb id (`amp-<thread id>`) or thread id (`T-<uuid>`), exactly.
+        orb: String,
         /// How long ago the orb must have been last seen asleep or stopped.
         #[arg(long, default_value_t = 60)]
         min_asleep_mins: u64,
@@ -174,7 +189,7 @@ enum OrbCommand {
         #[arg(long, conflicts_with = "min_asleep_mins")]
         force: bool,
         #[command(flatten)]
-        coordinator: CoordinatorArgs,
+        op: OperatorArgs,
     },
 }
 
@@ -256,8 +271,29 @@ fn run_cli(
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let json = cli.json;
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            use clap::error::ErrorKind as K;
+            let shown = matches!(
+                e.kind(),
+                K::DisplayHelp | K::DisplayVersion | K::DisplayHelpOnMissingArgumentOrSubcommand
+            );
+            if !shown && std::env::args().any(|a| a == "--json") {
+                let message = e.kind().to_string();
+                let detail = e.to_string();
+                let detail = detail.lines().next().unwrap_or(&message);
+                orbd::cli::CliError::new(
+                    orbd::cli::Exit::Usage,
+                    detail.trim_start_matches("error: ").to_owned(),
+                )
+                .hint("`orbd <command> --help`")
+                .print(true);
+                std::process::exit(orbd::cli::Exit::Usage as i32);
+            }
+            e.exit()
+        }
+    };
     orbd::configure_failpoints();
     let rt = tokio::runtime::Runtime::new()?;
     use orbd::backend::fleet::admin;
@@ -291,21 +327,11 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Agent {
-            manage: Some(AgentCommand::List(coordinator)),
+            manage: Some(AgentCommand::List(op)),
             ..
-        } if cli.json => run_cli(&rt, json, async {
-            orbd::cli::status::agent_list_json(&socket(&coordinator)?).await
+        } => run_cli(&rt, op.json, async {
+            orbd::cli::status::agent_list(&socket(&op.coordinator)?, op.json).await
         }),
-        Command::Agent {
-            manage: Some(AgentCommand::List(coordinator)),
-            ..
-        } => {
-            print!(
-                "{}",
-                rt.block_on(admin::cli_list(&admin_socket(&coordinator)?))?
-            );
-            Ok(())
-        }
         Command::Agent {
             manage:
                 Some(AgentCommand::Remove {
@@ -317,15 +343,15 @@ fn main() -> anyhow::Result<()> {
         Command::Status {
             check,
             idle_days,
-            coordinator,
+            op,
         } => {
             let t = orbd::cli::status::Thresholds {
-                idle: std::time::Duration::from_secs(idle_days.saturating_mul(86_400)),
+                idle: std::time::Duration::from_secs(idle_days.max(1).saturating_mul(86_400)),
                 ..Default::default()
             };
-            run_cli(&rt, json, async {
+            run_cli(&rt, op.json, async {
                 let (out, healthy) =
-                    orbd::cli::status::status(&socket(&coordinator)?, t, json).await?;
+                    orbd::cli::status::status(&socket(&op.coordinator)?, t, op.json).await?;
                 if check && !healthy {
                     print!("{out}");
                     return Err(orbd::cli::status::unhealthy());
@@ -338,7 +364,7 @@ fn main() -> anyhow::Result<()> {
             state,
             asleep_days,
             problems,
-            coordinator,
+            op,
         }) => {
             let f = orbd::cli::orbs::ListFilter {
                 agent,
@@ -347,33 +373,26 @@ fn main() -> anyhow::Result<()> {
                     .map(|d| std::time::Duration::from_secs(d.saturating_mul(86_400))),
                 problems,
             };
-            run_cli(&rt, json, async {
-                orbd::cli::orbs::list(&socket(&coordinator)?, &f, json).await
+            run_cli(&rt, op.json, async {
+                orbd::cli::orbs::list(&socket(&op.coordinator)?, &f, op.json).await
             })
         }
-        Command::Orb(OrbCommand::Show {
-            orb,
-            history,
-            coordinator,
-        }) => run_cli(&rt, json, async {
-            orbd::cli::orbs::show(&socket(&coordinator)?, &orb, history, json).await
+        Command::Orb(OrbCommand::Show { orb, history, op }) => run_cli(&rt, op.json, async {
+            orbd::cli::orbs::show(&socket(&op.coordinator)?, &orb, history, op.json).await
         }),
-        Command::Orb(OrbCommand::Pause {
-            amp_orb_id,
-            coordinator,
-        }) => run_cli(&rt, json, async {
-            orbd::cli::orbs::pause(&socket(&coordinator)?, &amp_orb_id, json).await
+        Command::Orb(OrbCommand::Pause { orb, op }) => run_cli(&rt, op.json, async {
+            orbd::cli::orbs::pause(&socket(&op.coordinator)?, &orb, op.json).await
         }),
         Command::Orb(OrbCommand::Delete {
-            amp_orb_id,
+            orb,
             min_asleep_mins,
             force,
-            coordinator,
+            op,
         }) => {
             let min_asleep = (!force)
                 .then(|| std::time::Duration::from_secs(min_asleep_mins.saturating_mul(60)));
-            run_cli(&rt, json, async {
-                orbd::cli::orbs::delete(&socket(&coordinator)?, &amp_orb_id, min_asleep, json).await
+            run_cli(&rt, op.json, async {
+                orbd::cli::orbs::delete(&socket(&op.coordinator)?, &orb, min_asleep, op.json).await
             })
         }
         Command::Coordinator(args) => {

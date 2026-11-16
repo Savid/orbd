@@ -15,12 +15,18 @@ pub struct OrbJson {
     pub thread_id: String,
     /// Internal id: the orb's directory on its agent (`<state_dir>/orbs/<orb_id>`).
     pub orb_id: String,
-    /// running, asleep, stopped, uncreated, or faulted (<last known state>).
+    /// running, asleep, stopped, uncreated, deleting (a delete started and has not
+    /// finished), or faulted (<last known state>).
     pub state: String,
+    /// The last known state without the fault: running, asleep, stopped, ...
+    pub stable_state: String,
+    pub faulted: bool,
     pub state_since_unix_ms: u64,
     pub state_for_secs: u64,
-    /// Agent (or other backend) the orb lives on; orbs never move.
-    pub agent: String,
+    /// Agent the orb lives on (orbs never move); null outside the agent fleet.
+    pub agent_id: Option<String>,
+    /// Backend of an orb outside the agent fleet (e.g. boat).
+    pub backend_id: Option<String>,
     pub overflow_agent: bool,
     pub orb_type: String,
     pub arch: String,
@@ -29,20 +35,34 @@ pub struct OrbJson {
     pub memory_bytes: u64,
     /// Disk size (sparse; see `disk_allocated_bytes`).
     pub disk_size_bytes: u64,
-    /// On the agent's disk: all of the orb's files, and the memory checkpoint among them.
-    /// Null when the agent does not report it (orbd < 0.1.3).
+    /// On the agent's disk: all of the orb's files, and the memory checkpoint among them
+    /// (blocks shared with a cloned image count in full). Null when the agent does not
+    /// report it.
     pub disk_allocated_bytes: Option<u64>,
     pub checkpoint_bytes: Option<u64>,
     pub created_unix_ms: u64,
+    /// When Amp last spawned or paused it successfully (its creation if never).
     pub last_active_unix_ms: u64,
     pub fault: Option<String>,
-    /// Why it could not start on its agent right now; empty when it would (or it runs).
-    pub wake_blockers: Vec<String>,
+    /// Why it could not start on its agent right now, as admission would refuse it;
+    /// empty when it would, when it runs, or while it is starting.
+    pub wake_blockers: Vec<Blocker>,
+    /// Failures of one action since that action's last success: failed spawns if any,
+    /// else the action that failed last.
     pub failures_since_success: u32,
     /// Latest first, at most 5.
     pub failures: Vec<FailureJson>,
     pub open_command: Option<CommandJson>,
     pub queued_requests: u32,
+}
+
+/// Why something was or would be refused. `code` is a failure code in snake_case:
+/// insufficient_memory, insufficient_disk, quota_exceeded (vCPUs), backend_unavailable
+/// (its agent is down), ...
+#[derive(Clone, Debug, Serialize)]
+pub struct Blocker {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -72,13 +92,36 @@ fn nz(v: u64) -> Option<u64> {
     (v > 0).then_some(v)
 }
 
+fn some(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_owned())
+}
+
+/// `insufficient_memory` for `FAILURE_CODE_INSUFFICIENT_MEMORY`.
+pub fn code_name(code: i32) -> String {
+    match pb::FailureCode::try_from(code) {
+        Ok(c) => c
+            .as_str_name()
+            .trim_start_matches("FAILURE_CODE_")
+            .to_lowercase(),
+        Err(_) => format!("code_{code}"),
+    }
+}
+
+/// A refusal for room (memory, vCPUs or disk) rather than a fault.
+pub fn is_capacity(code: &str) -> bool {
+    matches!(
+        code,
+        "insufficient_memory" | "insufficient_disk" | "quota_exceeded"
+    )
+}
+
 fn failure(f: &pb::OrbFailure) -> FailureJson {
     FailureJson {
         action: f.action.clone(),
-        code: f.code.clone(),
+        code: code_name(f.code),
         message: f.message.clone(),
         unix_ms: f.unix_ms,
-        operation_id: (!f.operation_id.is_empty()).then(|| f.operation_id.clone()),
+        operation_id: some(&f.operation_id),
     }
 }
 
@@ -106,14 +149,21 @@ pub fn thread_id(amp_orb_id: &str) -> String {
 impl OrbJson {
     pub fn from_pb(o: &pb::OrbInfo, now: u64) -> Self {
         let r = o.resources.unwrap_or_default();
+        let stable = match o.state.strip_prefix("faulted (") {
+            Some(rest) => rest.trim_end_matches(')').to_owned(),
+            None => o.state.clone(),
+        };
         Self {
             amp_orb_id: o.amp_orb_id.clone(),
             thread_id: thread_id(&o.amp_orb_id),
             orb_id: o.orb_id.clone(),
             state: o.state.clone(),
+            stable_state: stable,
+            faulted: !o.fault.is_empty(),
             state_since_unix_ms: o.observed_unix_ms,
             state_for_secs: now.saturating_sub(o.observed_unix_ms) / 1000,
-            agent: o.agent_id.clone(),
+            agent_id: some(&o.agent_id),
+            backend_id: some(&o.backend_id),
             overflow_agent: o.overflow_agent,
             orb_type: o.offering_id.clone(),
             arch: o.arch.clone(),
@@ -125,8 +175,15 @@ impl OrbJson {
             checkpoint_bytes: o.disk.as_ref().map(|d| d.checkpoint_bytes),
             created_unix_ms: o.created_unix_ms,
             last_active_unix_ms: o.last_active_unix_ms,
-            fault: (!o.fault.is_empty()).then(|| o.fault.clone()),
-            wake_blockers: o.wake_blockers.clone(),
+            fault: some(&o.fault),
+            wake_blockers: o
+                .wake_blockers
+                .iter()
+                .map(|b| Blocker {
+                    code: code_name(b.code),
+                    message: b.message.clone(),
+                })
+                .collect(),
             failures_since_success: o.failures_since_success,
             failures: o.failures.iter().map(failure).collect(),
             open_command: o.open_command.as_ref().map(command),
@@ -134,18 +191,29 @@ impl OrbJson {
         }
     }
 
+    /// Its agent, or its backend outside the agent fleet.
+    pub fn host(&self) -> &str {
+        self.agent_id
+            .as_deref()
+            .or(self.backend_id.as_deref())
+            .unwrap_or("")
+    }
+
     pub fn running(&self) -> bool {
-        self.state == "running"
+        self.stable_state == "running" && self.state != "deleting"
     }
 
     pub fn asleep(&self) -> bool {
-        self.state == "asleep" || self.state == "stopped"
+        matches!(self.state.as_str(), "asleep" | "stopped")
     }
 
-    /// Something is wrong with it: a fault, failures since its last success, or a
-    /// command in flight for over 10 minutes.
-    pub fn has_problem(&self, now: u64) -> bool {
-        self.fault.is_some() || self.failures_since_success > 0 || self.stuck_for(now).is_some()
+    pub fn blocked_by(&self, code: &str) -> bool {
+        self.wake_blockers.iter().any(|b| b.code == code)
+    }
+
+    /// Its agent lacks room for it (memory or vCPUs).
+    pub fn blocked_by_room(&self) -> bool {
+        self.blocked_by("insufficient_memory") || self.blocked_by("quota_exceeded")
     }
 
     /// How long a running orb has gone without Amp starting or pausing it, if a day or
@@ -163,14 +231,30 @@ impl OrbJson {
         (t > 10 * 60_000).then_some(t)
     }
 
-    /// The resources a blocker names: `memory`, `disk`, `vCPUs`, or the whole text.
+    /// Its delete started and nothing is running it any more: it failed.
+    pub fn delete_failed(&self) -> bool {
+        self.state == "deleting" && self.open_command.is_none() && self.queued_requests == 0
+    }
+
+    /// Its last spawn was refused for room it has now: it wakes on its thread's next
+    /// message.
+    pub fn refused_but_fits_now(&self) -> bool {
+        self.failures.first().is_some_and(|f| {
+            f.action == "spawn" && is_capacity(&f.code) && self.wake_blockers.is_empty()
+        }) && !self.running()
+    }
+
+    /// The resources its blockers name: `memory`, `vCPUs`, `disk`, `agent down`.
     fn blocker_short(&self) -> String {
         let mut v: Vec<&str> = self
             .wake_blockers
             .iter()
-            .map(|b| match b.split_once(':') {
-                Some((k, _)) if !k.contains(' ') => k,
-                _ => b.as_str(),
+            .map(|b| match b.code.as_str() {
+                "insufficient_memory" => "memory",
+                "quota_exceeded" => "vCPUs",
+                "insufficient_disk" => "disk",
+                "backend_unavailable" => "agent down",
+                other => other,
             })
             .collect();
         v.dedup();
@@ -183,6 +267,9 @@ impl OrbJson {
         if let Some(f) = &self.fault {
             n.push(format!("fault: {f}"));
         }
+        if self.delete_failed() {
+            n.push("delete failed".into());
+        }
         if self.failures_since_success > 0 {
             let last = &self.failures[0];
             let times = match self.failures_since_success {
@@ -191,6 +278,8 @@ impl OrbJson {
             };
             if !self.wake_blockers.is_empty() {
                 n.push(format!("can't wake: {}{times}", self.blocker_short()));
+            } else if self.refused_but_fits_now() {
+                n.push(format!("spawn refused{times}, fits now"));
             } else {
                 n.push(format!("{} failed: {}{times}", last.action, last.code));
             }
@@ -218,6 +307,7 @@ pub struct ListFilter {
     pub state: Option<String>,
     /// Asleep or stopped for at least this long.
     pub asleep_for: Option<Duration>,
+    /// Only orbs named by a problem of `orbd status` of severity warning or error.
     pub problems: bool,
 }
 
@@ -233,21 +323,38 @@ pub async fn fetch(socket: &Path) -> Result<Vec<pb::OrbInfo>, CliError> {
 
 pub async fn list(socket: &Path, f: &ListFilter, json: bool) -> Result<String, CliError> {
     let now = unix_ms_now();
-    let orbs: Vec<OrbJson> = fetch(socket)
+    let all: Vec<OrbJson> = fetch(socket)
         .await?
         .iter()
         .map(|o| OrbJson::from_pb(o, now))
-        .filter(|o| f.agent.as_ref().is_none_or(|a| &o.agent == a))
+        .collect();
+    let named: Option<std::collections::HashSet<String>> = if f.problems {
+        let agents = super::status::agents(socket).await?;
+        let problems =
+            super::status::problems(&agents, &all, super::status::Thresholds::default(), now);
+        Some(
+            problems
+                .into_iter()
+                .filter(|p| p.severity != super::status::Severity::Info)
+                .flat_map(|p| p.amp_orb_ids)
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let orbs: Vec<OrbJson> = all
+        .into_iter()
+        .filter(|o| f.agent.as_ref().is_none_or(|a| o.host() == a))
         .filter(|o| {
             f.state
                 .as_ref()
-                .is_none_or(|s| o.state == *s || o.state.starts_with(&format!("{s} ")))
+                .is_none_or(|s| o.state == *s || (s == "faulted" && o.faulted))
         })
         .filter(|o| {
             f.asleep_for
                 .is_none_or(|d| o.asleep() && o.state_for_secs >= d.as_secs())
         })
-        .filter(|o| !f.problems || o.has_problem(now))
+        .filter(|o| named.as_ref().is_none_or(|n| n.contains(&o.amp_orb_id)))
         .collect();
     if json {
         #[derive(Serialize)]
@@ -270,7 +377,7 @@ pub async fn list(socket: &Path, f: &ListFilter, json: bool) -> Result<String, C
                 o.amp_orb_id.clone(),
                 o.state.clone(),
                 age(o.state_for_secs * 1000),
-                o.agent.clone(),
+                o.host().to_owned(),
                 o.orb_type.clone(),
                 o.arch.clone(),
                 size(o.disk_allocated_bytes),
@@ -336,9 +443,9 @@ pub async fn show(socket: &Path, orb: &str, history: u32, json: bool) -> Result<
             action: q.action.clone(),
             status: q.status.clone(),
             start_unix_ms: q.start_unix_ms,
-            result: (!q.result.is_empty()).then(|| q.result.clone()),
-            message: (!q.message.is_empty()).then(|| q.message.clone()),
-            operation_id: (!q.operation_id.is_empty()).then(|| q.operation_id.clone()),
+            result: some(&q.result),
+            message: some(&q.message),
+            operation_id: some(&q.operation_id),
         })
         .collect();
     if json {
@@ -380,7 +487,7 @@ pub async fn show(socket: &Path, orb: &str, history: u32, json: bool) -> Result<
         "agent",
         format!(
             "{}{}",
-            o.agent,
+            o.host(),
             if o.overflow_agent { " (overflow)" } else { "" }
         ),
     );
@@ -412,14 +519,27 @@ pub async fn show(socket: &Path, orb: &str, history: u32, json: bool) -> Result<
             ago(o.created_unix_ms)
         ),
     );
-    kv("last active", format!("{} ago", ago(o.last_active_unix_ms)));
-    if !o.running() && o.state != "deleted" {
+    kv(
+        "last active",
+        format!("{} ago (last spawn or pause)", ago(o.last_active_unix_ms)),
+    );
+    if o.asleep() || o.state == "uncreated" {
+        let starting = o.open_command.as_ref().is_some_and(|c| c.action == "spawn");
         kv(
             "wake check",
-            if o.wake_blockers.is_empty() {
+            if starting {
+                "starting now".into()
+            } else if o.wake_blockers.is_empty() {
                 "fits on its agent now".into()
             } else {
-                format!("would be refused: {}", o.wake_blockers.join("; "))
+                format!(
+                    "would be refused: {}",
+                    o.wake_blockers
+                        .iter()
+                        .map(|b| b.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
             },
         );
     }
@@ -439,11 +559,12 @@ pub async fn show(socket: &Path, orb: &str, history: u32, json: bool) -> Result<
         None => {}
     }
     if o.failures_since_success > 0 {
+        let a = &o.failures[0].action;
         kv(
             "failing",
             format!(
-                "{} {} failures since its last successful {}:",
-                o.failures_since_success, o.failures[0].action, o.failures[0].action
+                "{} {a} failures since its last successful {a}:",
+                o.failures_since_success
             ),
         );
         for f in &o.failures {
@@ -516,60 +637,60 @@ pub async fn show(socket: &Path, orb: &str, history: u32, json: bool) -> Result<
 pub fn hints(o: &OrbJson, now: u64) -> Vec<String> {
     let mut h = Vec::new();
     let id = &o.amp_orb_id;
-    let blocked = |what: &str| o.wake_blockers.iter().any(|b| b.starts_with(what));
-    if o.wake_blockers
-        .iter()
-        .any(|b| b.contains("unavailable") || b.contains("shutting down"))
-    {
+    let host = o.host();
+    if o.blocked_by("backend_unavailable") {
         h.push(format!(
-            "its agent {} is down; orbs never move, so it wakes once the agent is back (`orbd agent list`)",
-            o.agent
+            "its agent {host} is down; orbs never move, so it wakes once the agent is back (`orbd agent list`)"
         ));
     }
-    if blocked("memory") || blocked("vCPUs") {
+    if o.blocked_by_room() {
         h.push(format!(
-            "it needs {} on {}, which is full; orbs never move to another agent. Free room by pausing an orb there (`orbd orb list --agent {} --state running`, then `orbd orb pause <id>`), or let Amp pause idle ones",
-            gib(o.memory_bytes),
-            o.agent,
-            o.agent
+            "it needs {} on {host}, which is full; orbs never move to another agent. Make room there: delete orbs whose threads are gone (`orbd orb delete --force <id>`, no checkpoint written) or pause idle ones (`orbd orb list --agent {host} --state running`)",
+            gib(o.memory_bytes)
         ));
     }
-    if blocked("disk") {
+    if o.blocked_by("insufficient_disk") {
         h.push(format!(
-            "{} is short of disk: delete orbs of archived threads there (`orbd orb list --agent {} --asleep-days 3`, then `orbd orb delete <id>`)",
-            o.agent, o.agent
+            "{host} is short of disk: delete orbs of archived threads there (`orbd orb list --agent {host} --asleep-days 3`, then `orbd orb delete <id>`)"
         ));
     }
     if o.fault.is_some() {
         h.push(format!(
-            "faulted: read the agent's log on {} for orb {} (and `<state_dir>/orbs/{}/logs/`)",
-            o.agent, o.orb_id, o.orb_id
+            "faulted: read the agent's log on {host} for orb {} (and `<state_dir>/orbs/{}/logs/`)",
+            o.orb_id, o.orb_id
+        ));
+    }
+    if o.delete_failed() {
+        h.push(format!(
+            "its delete did not finish: `orbd orb delete --force {id}` retries it"
         ));
     }
     if let Some(t) = o.stuck_for(now) {
         h.push(format!(
-            "a command has been in flight for {}; the agent's log on {} says what it is doing",
-            age(t),
-            o.agent
+            "a command has been in flight for {}; the agent's log on {host} says what it is doing",
+            age(t)
         ));
     }
-    if o.failures_since_success > 0 && o.wake_blockers.is_empty() && o.fault.is_none() {
-        let f = &o.failures[0];
-        if f.code.starts_with("insufficient_") || f.code == "quota_exceeded" {
+    if let Some(f) = o.failures.first()
+        && o.wake_blockers.is_empty()
+        && o.fault.is_none()
+    {
+        if o.refused_but_fits_now() {
+            h.push("its last spawn was refused for room it has now: its thread's next message wakes it".into());
+        } else if f.action == "pause" && f.code == "insufficient_disk" {
             h.push(format!(
-                "its last {} was refused for room it has now: its thread's next message wakes it",
-                f.action
+                "it could not be paused: no disk on {host} for its memory checkpoint, so it keeps running and holding its memory. Free disk there (`orbd orb list --agent {host} --asleep-days 3`)"
             ));
         } else {
             h.push(format!(
-                "the last {} failed ({}); the agent's log on {} has the details",
-                f.action, f.code, o.agent
+                "the last {} failed ({}); the agent's log on {host} has the details",
+                f.action, f.code
             ));
         }
     }
     if let Some(t) = o.undriven_for(now) {
         h.push(format!(
-            "running with no spawn or pause from Amp for {}: if its thread is gone, Amp will not pause it; `orbd orb pause {id}`",
+            "running with no spawn or pause from Amp for {}: Amp never pauses the orb of a deleted thread. If its thread is gone, `orbd orb delete --force {id}` (frees its memory without writing a checkpoint); otherwise `orbd orb pause {id}`",
             age(t)
         ));
     }
@@ -583,50 +704,53 @@ pub fn hints(o: &OrbJson, now: u64) -> Vec<String> {
     h
 }
 
+fn job_error(s: &tonic::Status, what: &str) -> CliError {
+    let e = CliError::from_status(s, Some(what));
+    match e.exit {
+        Exit::Refused => e.hint(
+            "nothing was done; `orbd orb show <orb>` says what it is doing: wait, or `orbd orb pause` it first",
+        ),
+        Exit::Failed => e.hint("`orbd orb show <orb>` shows whether it happened and why it failed"),
+        _ => e,
+    }
+}
+
 pub async fn delete(
     socket: &Path,
-    amp_orb_id: &str,
+    orb: &str,
     min_asleep: Option<Duration>,
     json: bool,
 ) -> Result<String, CliError> {
     let r = orbs_client(socket)
         .await?
         .delete_orb(pb::DeleteOrbRequest {
-            amp_orb_id: amp_orb_id.to_owned(),
+            amp_orb_id: orb.to_owned(),
             min_asleep_secs: min_asleep.unwrap_or_default().as_secs(),
             force: min_asleep.is_none(),
         })
         .await
-        .map_err(|s| {
-            let e = CliError::from_status(&s, Some(&format!("{amp_orb_id} not deleted")));
-            match e.exit {
-                Exit::Refused => e.hint(
-                    "`orbd orb show` says what it is doing; `orbd orb pause` it, or wait, then delete again",
-                ),
-                _ => e,
-            }
-        })?;
-    done(amp_orb_id, "deleted", r.into_inner().message, json)
+        .map_err(|s| job_error(&s, &format!("{orb} not deleted")))?;
+    done(orb, "deleted", r.into_inner().message, json)
 }
 
-pub async fn pause(socket: &Path, amp_orb_id: &str, json: bool) -> Result<String, CliError> {
+pub async fn pause(socket: &Path, orb: &str, json: bool) -> Result<String, CliError> {
     let r = orbs_client(socket)
         .await?
         .pause_orb(pb::PauseOrbRequest {
-            amp_orb_id: amp_orb_id.to_owned(),
+            amp_orb_id: orb.to_owned(),
         })
         .await
-        .map_err(|s| CliError::from_status(&s, Some(&format!("{amp_orb_id} not paused"))))?;
-    done(amp_orb_id, "paused", r.into_inner().message, json)
+        .map_err(|s| job_error(&s, &format!("{orb} not paused")))?;
+    done(orb, "paused", r.into_inner().message, json)
 }
 
-fn done(amp_orb_id: &str, what: &str, message: String, json: bool) -> Result<String, CliError> {
+fn done(orb: &str, what: &str, message: String, json: bool) -> Result<String, CliError> {
     if json {
         return Ok(to_json(&serde_json::json!({
-            "amp_orb_id": amp_orb_id,
+            "orb": orb,
             "result": what,
             "message": message,
         })));
     }
-    Ok(format!("{amp_orb_id} {what}: {message}\n"))
+    Ok(format!("{orb} {what}: {message}\n"))
 }

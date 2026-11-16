@@ -209,7 +209,7 @@ offerings:
 
     /// `orbd orb list --json` as (Amp orb id, state, agent, orb type) rows.
     pub fn orb_rows(&self) -> Vec<(String, String, String, String)> {
-        let list = self.admin(&["--json", "orb", "list"]);
+        let list = self.admin(&["orb", "list", "--json"]);
         assert_ok(&list, "orb list --json");
         let v: serde_json::Value = serde_json::from_str(&list.stdout).unwrap();
         v["orbs"]
@@ -218,7 +218,7 @@ offerings:
             .iter()
             .map(|o| {
                 let f = |k: &str| o[k].as_str().unwrap().to_owned();
-                (f("amp_orb_id"), f("state"), f("agent"), f("orb_type"))
+                (f("amp_orb_id"), f("state"), f("agent_id"), f("orb_type"))
             })
             .collect()
     }

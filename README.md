@@ -158,19 +158,25 @@ To see what needs attention, run on the coordinator (e.g. `docker exec orbd orbd
 
 - `orbd status`: every agent's booked memory and usable disk, then problems worst first,
   each with a command to look further: disconnected agents, agents whose disk or memory
-  keeps orbs from waking, orbs that fail to wake and why, faulted orbs, commands stuck in
-  flight, orbs running with no spawn or pause from Amp for a day (Amp never pauses the orb
-  of a deleted thread) and orbs asleep for days. `--check` exits 6 when a problem is an error.
+  keeps orbs active lately from waking, orbs that fail to wake and why, faulted orbs,
+  deletes that did not finish, commands stuck in flight, orbs running with no spawn or
+  pause from Amp for a day (Amp never pauses the orb of a deleted thread) and orbs asleep
+  for days. `orbd status --help` lists the kinds; `--check` exits 6 when one is an error.
 - `orbd orb list`: each orb's state, agent, type and what it holds on disk (its memory
   checkpoint too), with a note when it fails or would not fit on its agent now; filter
-  with `--agent`, `--state`, `--asleep-days` and `--problems`.
+  with `--agent`, `--state`, `--asleep-days` and `--problems` (the orbs `status` warns
+  about).
 - `orbd orb show <orb>`: one orb (by Amp id, a unique prefix of one, or its thread id
   `T-<uuid>`): whether it would wake now, its failures since its last success, its latest
   commands and Amp requests, and next steps.
 
-Each takes `--json` for one JSON object on stdout, for scripts and coding agents (fields
-are only added; errors go to stderr as JSON), and exits 2 for bad arguments, 3 for an
-unknown orb, 4 when refused and 5 when the coordinator or the orb's host is unreachable.
+These, `orbd agent list` and `orbd orb pause|delete` (which take an Amp id or thread id,
+never a prefix) take `--json` for one JSON object on stdout, for scripts and coding
+agents: fields are only added, and errors go to stderr as one JSON object. They exit 1
+when a pause or delete ran and failed or its outcome is unknown, 2 for bad arguments, 3
+for an unknown orb, 4 when refused (nothing was done) and 5 when the coordinator or the
+orb's host is unreachable. `orbd orb list` without `--json` is a table now; scripts
+should use `--json`.
 
 Amp pauses an orb when its thread goes idle or is archived and deletes it when it is no
 longer needed, e.g. when the thread is deleted; archiving sends no delete, so orbs of

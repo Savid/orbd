@@ -33,12 +33,12 @@ fn a_stuck_orb_is_visible_and_explained() {
     let refused = c.dispatch("spawn", "amp-1", &[]);
     assert_eq!(refused.code, 1, "agent-a is full: {}", refused.stderr);
 
-    let list = json(&c.admin(&["--json", "orb", "list"]), "orb list --json");
+    let list = json(&c.admin(&["orb", "list", "--json"]), "orb list --json");
     assert_eq!(list["orbs"].as_array().unwrap().len(), 3);
     let one = orb(&list, "amp-1");
     assert_eq!(one["state"], "asleep");
     assert_eq!(one["thread_id"], "T-1");
-    assert_eq!(one["agent"], "agent-a");
+    assert_eq!(one["agent_id"], "agent-a");
     assert_eq!(one["orb_type"], OFFERING);
     assert_eq!(
         (one["arch"].as_str(), one["runtime"].as_str()),
@@ -49,10 +49,12 @@ fn a_stuck_orb_is_visible_and_explained() {
     assert_eq!(one["failures"][0]["action"], "spawn");
     assert_eq!(one["failures"][0]["code"], "insufficient_memory");
     assert!(one["failures"][0]["operation_id"].is_null(), "{one}");
-    let blocker = one["wake_blockers"][0].as_str().unwrap();
+    let blocker = &one["wake_blockers"][0];
+    assert_eq!(blocker["code"], "insufficient_memory");
+    let msg = blocker["message"].as_str().unwrap();
     assert!(
-        blocker.starts_with("memory: needs 2.0 GiB, 0.0 GiB free of 4.0 GiB"),
-        "{blocker}"
+        msg.starts_with("memory: needs 2.0 GiB, 0.0 GiB free of 4.0 GiB"),
+        "{msg}"
     );
     let two = orb(&list, "amp-2");
     assert_eq!(two["state"], "running");
@@ -71,7 +73,7 @@ fn a_stuck_orb_is_visible_and_explained() {
     );
 
     let problems = json(
-        &c.admin(&["--json", "orb", "list", "--problems"]),
+        &c.admin(&["orb", "list", "--problems", "--json"]),
         "--problems",
     );
     let ids: Vec<&str> = problems["orbs"]
@@ -83,7 +85,7 @@ fn a_stuck_orb_is_visible_and_explained() {
     assert_eq!(ids, ["amp-1"]);
     let running = json(
         &c.admin(&[
-            "--json", "orb", "list", "--state", "running", "--agent", "agent-a",
+            "orb", "list", "--state", "running", "--agent", "agent-a", "--json",
         ]),
         "--state running",
     );
@@ -108,7 +110,7 @@ fn a_stuck_orb_is_visible_and_explained() {
         );
     }
     // By thread id, as JSON.
-    let one = json(&c.admin(&["--json", "orb", "show", "T-1"]), "orb show T-1");
+    let one = json(&c.admin(&["orb", "show", "T-1", "--json"]), "orb show T-1");
     assert_eq!(one["amp_orb_id"], "amp-1");
     let actions: Vec<&str> = one["commands"]
         .as_array()
@@ -125,15 +127,26 @@ fn a_stuck_orb_is_visible_and_explained() {
     let ambiguous = c.admin(&["orb", "show", "amp-"]);
     assert_eq!(ambiguous.code, 2, "{}", ambiguous.stderr);
     assert!(
-        ambiguous.stderr.contains("matches 3 orbs"),
+        ambiguous.stderr.contains("names no orb"),
         "{}",
         ambiguous.stderr
     );
-    let missing = c.admin(&["--json", "orb", "show", "amp-9"]);
+    let missing = c.admin(&["orb", "show", "amp-9", "--json"]);
     assert_eq!(missing.code, 3, "{}", missing.stderr);
     let err: Value = serde_json::from_str(missing.stderr.trim()).unwrap();
     assert_eq!(err["error"]["kind"], "not_found");
     assert_eq!(err["error"]["exit_code"], 3);
+    let empty = c.admin(&["orb", "show", "T-"]);
+    assert_eq!(
+        empty.code, 2,
+        "a bare prefix names no orb: {}",
+        empty.stderr
+    );
+    // --json goes after the command; elsewhere it is a usage error, as JSON.
+    let misplaced = c.admin(&["--json", "status"]);
+    assert_eq!(misplaced.code, 2, "{}", misplaced.stderr);
+    let err: Value = serde_json::from_str(misplaced.stderr.trim()).unwrap();
+    assert_eq!(err["error"]["kind"], "usage");
     let in_use = c.admin(&["orb", "delete", "amp-2", "--min-asleep-mins", "0"]);
     assert_eq!(
         in_use.code, 4,
@@ -142,23 +155,25 @@ fn a_stuck_orb_is_visible_and_explained() {
     );
     assert!(in_use.stderr.contains("hint: "), "{}", in_use.stderr);
 
-    let status = json(&c.admin(&["--json", "status"]), "status --json");
+    let status = json(&c.admin(&["status", "--json"]), "status --json");
     assert_eq!(status["healthy"], false);
-    assert_eq!(status["orbs"]["running"], 2);
-    assert_eq!(status["orbs"]["asleep"], 1);
+    assert_eq!(status["orb_counts"]["running"], 2);
+    assert_eq!(status["orb_counts"]["asleep"], 1);
     let agent = &status["agents"][0];
     assert_eq!(
         (agent["agent_id"].as_str(), agent["state"].as_str()),
         (Some("agent-a"), Some("connected"))
     );
     assert_eq!(agent["memory_booked_bytes"], 4u64 << 30);
-    let kinds: Vec<(&str, &str)> = status["problems"]
+    let kinds: Vec<(&str, &Value)> = status["problems"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|p| (p["kind"].as_str().unwrap(), p["subject"].as_str().unwrap()))
+        .map(|p| (p["kind"].as_str().unwrap(), &p["amp_orb_ids"]))
         .collect();
-    assert_eq!(kinds[0], ("orb_cannot_wake", "amp-1"), "{kinds:?}");
+    assert_eq!(kinds[0].0, "orb_cannot_wake", "{kinds:?}");
+    assert_eq!(kinds[0].1, &serde_json::json!(["amp-1"]));
+    assert_eq!(status["problems"][0]["agent_id"], "agent-a");
     let check = c.admin(&["status", "--check"]);
     assert_eq!(check.code, 6, "{}", check.stderr);
     assert!(
@@ -166,15 +181,20 @@ fn a_stuck_orb_is_visible_and_explained() {
         "{}",
         check.stdout
     );
-    let agents = json(&c.admin(&["--json", "agent", "list"]), "agent list --json");
+    let agents = json(&c.admin(&["agent", "list", "--json"]), "agent list --json");
     assert_eq!(agents["agents"][0]["running_orbs"], 2);
 
-    // Room made: it wakes, and nothing is wrong any more.
-    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2");
+    // Room made (pausing by thread id, as an operator would): it wakes, and nothing is
+    // wrong any more.
+    let paused = json(
+        &c.admin(&["orb", "pause", "T-2", "--json"]),
+        "orb pause T-2",
+    );
+    assert_eq!(paused["result"], "paused");
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake 1");
-    let status = json(&c.admin(&["--json", "status"]), "status after wake");
+    let status = json(&c.admin(&["status", "--json"]), "status after wake");
     assert_eq!(status["healthy"], true, "{status}");
-    let list = json(&c.admin(&["--json", "orb", "list"]), "orb list after wake");
+    let list = json(&c.admin(&["orb", "list", "--json"]), "orb list after wake");
     assert_eq!(orb(&list, "amp-1")["failures_since_success"], 0);
     assert_ok(&c.admin(&["status", "--check"]), "status --check");
 }
@@ -191,11 +211,13 @@ fn a_disconnected_agent_is_reported() {
         std::time::Duration::from_secs(10),
         "agent marked disconnected",
         || {
-            let s = c.admin(&["--json", "status"]);
+            let s = c.admin(&["status", "--json"]);
             s.stdout.contains("agent_disconnected")
         },
     );
-    let one = json(&c.admin(&["--json", "orb", "show", "amp-1"]), "orb show");
-    let blocker = one["wake_blockers"][0].as_str().unwrap();
-    assert!(blocker.starts_with("agent-a is unavailable"), "{blocker}");
+    let one = json(&c.admin(&["orb", "show", "amp-1", "--json"]), "orb show");
+    let blocker = &one["wake_blockers"][0];
+    assert_eq!(blocker["code"], "backend_unavailable");
+    let msg = blocker["message"].as_str().unwrap();
+    assert!(msg.starts_with("agent-a is unavailable"), "{msg}");
 }

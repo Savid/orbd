@@ -160,6 +160,7 @@ pub(crate) fn disk_stats(config: &AgentConfig) -> (u64, u64) {
 struct DiskUse {
     total: u64,
     /// Per `orbs/<orb id>` directory, sorted by orb id: (orb id, bytes, checkpoint bytes).
+    /// Blocks shared with another file (a reflinked disk) count in full.
     orbs: Vec<(String, u64, u64)>,
 }
 
@@ -173,6 +174,7 @@ fn measure(dir: &std::path::Path) -> DiskUse {
     };
     let mut seen = std::collections::HashSet::new();
     let mut per_orb: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    let orbs_dir = dir.join("orbs");
     // (directory, its orb, inside the orb's checkpoints)
     let mut stack = vec![(dir.to_path_buf(), None::<String>, false)];
     let mut total = 0u64;
@@ -180,7 +182,7 @@ fn measure(dir: &std::path::Path) -> DiskUse {
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
-        let orbs_root = orb.is_none() && d == dir.join("orbs");
+        let orbs_root = orb.is_none() && d == orbs_dir;
         for e in entries.flatten() {
             // Does not follow symlinks.
             let Ok(m) = e.metadata() else { continue };
@@ -190,7 +192,10 @@ fn measure(dir: &std::path::Path) -> DiskUse {
             if m.is_dir() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 let (orb, in_ckpt) = match &orb {
-                    None if orbs_root => (Some(name), false),
+                    None if orbs_root => {
+                        per_orb.entry(name.clone()).or_default();
+                        (Some(name), false)
+                    }
                     None => (None, false),
                     Some(o) => (Some(o.clone()), in_ckpt || name == "checkpoints"),
                 };
@@ -210,11 +215,7 @@ fn measure(dir: &std::path::Path) -> DiskUse {
     }
     DiskUse {
         total,
-        orbs: per_orb
-            .into_iter()
-            .filter(|(_, (b, _))| *b > 0)
-            .map(|(o, (b, c))| (o, b, c))
-            .collect(),
+        orbs: per_orb.into_iter().map(|(o, (b, c))| (o, b, c)).collect(),
     }
 }
 
@@ -442,7 +443,12 @@ mod tests {
             .iter()
             .map(|(o, b, c)| (o.as_str(), (*b, *c)))
             .collect();
-        assert_eq!(orbs.len(), 2, "{orbs:?}");
+        assert_eq!(orbs.len(), 3, "{orbs:?}");
+        assert_eq!(
+            orbs["empty"],
+            (0, 0),
+            "an orb directory with nothing in it is 0"
+        );
         let (a, a_ckpt) = orbs["a"];
         assert!(
             a >= 192 << 10 && a_ckpt >= 128 << 10 && a_ckpt < a,
