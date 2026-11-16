@@ -159,8 +159,8 @@ To see what needs attention, run on the coordinator (e.g. `docker exec orbd orbd
 - `orbd status`: every agent's booked memory and usable disk, then problems worst first,
   each with a command to look further: disconnected agents, agents whose disk or memory
   keeps orbs from waking, orbs that fail to wake and why, faulted orbs, commands stuck in
-  flight, orbs running for days (Amp does not pause the orb of a deleted thread) and orbs
-  asleep for days. `--check` exits 6 when a problem is an error.
+  flight, orbs running with no spawn or pause from Amp for a day (Amp never pauses the orb
+  of a deleted thread) and orbs asleep for days. `--check` exits 6 when a problem is an error.
 - `orbd orb list`: each orb's state, agent, type and what it holds on disk (its memory
   checkpoint too), with a note when it fails or would not fit on its agent now; filter
   with `--agent`, `--state`, `--asleep-days` and `--problems`.

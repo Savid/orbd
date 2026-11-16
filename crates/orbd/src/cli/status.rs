@@ -320,16 +320,16 @@ pub fn problems(agents: &[AgentJson], orbs: &[OrbJson], t: Thresholds, now: u64)
                 hint: show.clone(),
             });
         }
-        if o.running() && o.state_for_secs >= 86_400 {
+        if let Some(t) = o.undriven_for(now) {
             out.push(Problem {
                 severity: Severity::Info,
                 kind: "orb_running_long",
                 subject: id.clone(),
                 message: format!(
-                    "{id} on {} has run for {}, holding {} (Amp does not pause the orb of a deleted thread)",
+                    "{id} on {} runs, holding {}, with no spawn or pause from Amp for {} (Amp never pauses the orb of a deleted thread)",
                     o.agent,
-                    age(o.state_for_secs * 1000),
-                    gib(o.memory_bytes)
+                    gib(o.memory_bytes),
+                    age(t)
                 ),
                 hint: Some(format!("if its thread is gone: `orbd orb pause {id}`")),
             });
@@ -497,4 +497,100 @@ pub async fn status(socket: &Path, t: Thresholds, json: bool) -> Result<(String,
 
 pub fn unhealthy() -> CliError {
     CliError::new(Exit::Unhealthy, "problems of severity error (see above)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY: u64 = 86_400_000;
+    const NOW: u64 = 100 * DAY;
+    const G: u64 = super::super::GIB;
+
+    fn orb(id: &str, agent: &str, state: &str, since: u64, active: u64) -> OrbJson {
+        OrbJson {
+            amp_orb_id: id.into(),
+            thread_id: String::new(),
+            orb_id: String::new(),
+            state: state.into(),
+            state_since_unix_ms: since,
+            state_for_secs: (NOW - since) / 1000,
+            agent: agent.into(),
+            overflow_agent: false,
+            orb_type: "4vcpu-8gb".into(),
+            arch: "amd64".into(),
+            runtime: "firecracker".into(),
+            vcpus: 4,
+            memory_bytes: 8 * G,
+            disk_size_bytes: 50 * G,
+            disk_allocated_bytes: Some(12 * G),
+            checkpoint_bytes: Some(8 * G),
+            created_unix_ms: 0,
+            last_active_unix_ms: active,
+            fault: None,
+            wake_blockers: vec![],
+            failures_since_success: 0,
+            failures: vec![],
+            open_command: None,
+            queued_requests: 0,
+        }
+    }
+
+    fn agent(id: &str, state: &str, free: u64, reserve: u64) -> AgentJson {
+        AgentJson {
+            agent_id: id.into(),
+            state: state.into(),
+            overflow: false,
+            orbs: 2,
+            running_orbs: 1,
+            vcpus: 32,
+            vcpus_booked: 4,
+            memory_bytes: 54 * G,
+            memory_booked_bytes: 8 * G,
+            memory_unbooked_bytes: 46 * G,
+            host_memory_available_bytes: None,
+            host_memory_reserve_bytes: None,
+            disk_total_bytes: Some(900 * G),
+            disk_free_bytes: Some(free),
+            disk_reserve_bytes: Some(reserve),
+            disk_held_bytes: 18 * G,
+            disk_usable_bytes: Some(free.saturating_sub(reserve + 18 * G)),
+            disk_allocated_bytes: Some(100 * G),
+            disk_limit_bytes: 900 * G,
+            enrolled_unix_ms: 0,
+            certificate_expires_unix_ms: 0,
+        }
+    }
+
+    #[test]
+    fn problems_worst_first() {
+        let agents = [
+            agent("a", "connected", 50 * G, 44 * G),
+            agent("b", "disconnected", 500 * G, 44 * G),
+            agent("c", "connected", 40 * G, 44 * G),
+        ];
+        let orbs = [
+            // Restored by an agent restart lately, but Amp has not driven it for 2 days.
+            orb("amp-orphan", "a", "running", NOW - 60_000, NOW - 2 * DAY),
+            orb("amp-busy", "a", "running", NOW - 3 * DAY, NOW - 60_000),
+            orb("amp-old", "a", "asleep", NOW - 4 * DAY, NOW - 4 * DAY),
+            orb("amp-new", "c", "asleep", NOW - DAY, NOW - DAY),
+        ];
+        let p = problems(&agents, &orbs, Thresholds::default(), NOW);
+        let got: Vec<(Severity, &str, &str)> = p
+            .iter()
+            .map(|p| (p.severity, p.kind, p.subject.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Severity::Error, "agent_disconnected", "b"),
+                (Severity::Error, "agent_disk_full", "c"),
+                (Severity::Warning, "agent_disk_low", "a"),
+                (Severity::Info, "orb_running_long", "amp-orphan"),
+                (Severity::Info, "orbs_idle", "1 orbs"),
+            ]
+        );
+        assert!(p[3].message.contains("for 2d"), "{}", p[3].message);
+    }
 }

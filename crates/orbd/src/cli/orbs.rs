@@ -148,6 +148,14 @@ impl OrbJson {
         self.fault.is_some() || self.failures_since_success > 0 || self.stuck_for(now).is_some()
     }
 
+    /// How long a running orb has gone without Amp starting or pausing it, if a day or
+    /// more: Amp never touches the orb of a deleted thread again. (Not how long it has
+    /// run: an agent restart restores it, which renews its state.)
+    pub fn undriven_for(&self, now: u64) -> Option<u64> {
+        let t = now.saturating_sub(self.last_active_unix_ms);
+        (self.running() && self.open_command.is_none() && t >= 86_400_000).then_some(t)
+    }
+
     /// How long its open command has been in flight, if over 10 minutes.
     pub fn stuck_for(&self, now: u64) -> Option<u64> {
         let c = self.open_command.as_ref()?;
@@ -551,10 +559,10 @@ pub fn hints(o: &OrbJson, now: u64) -> Vec<String> {
             o.failures[0].action, o.failures[0].code, o.agent
         ));
     }
-    if o.running() && o.state_for_secs >= 86_400 {
+    if let Some(t) = o.undriven_for(now) {
         h.push(format!(
-            "running for {}: if its thread is gone or archived, Amp will not pause it; `orbd orb pause {id}`",
-            age(o.state_for_secs * 1000)
+            "running with no spawn or pause from Amp for {}: if its thread is gone, Amp will not pause it; `orbd orb pause {id}`",
+            age(t)
         ));
     }
     if o.asleep() && o.state_for_secs >= 3 * 86_400 {
