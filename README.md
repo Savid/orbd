@@ -134,7 +134,19 @@ Agents detect their runtime and capacity (override with `ORBD_CAPACITY_VCPUS`,
 (`ORBD_DNS`). Each VM orb has its own private network, `10.0.2.0/24` (the orb is `.15`,
 its gateway `.2`); if workloads in orbs use that subnet, e.g. Docker Compose networks,
 set another with `ORBD_GUEST_NETWORK` (e.g. `10.200.0.0/24`). It applies to orbs created
-afterwards; existing orbs keep theirs. `orbd agent list` and `orbd agent remove <id>`
+afterwards; existing orbs keep theirs.
+
+Orbs reach the internet, not the host's LAN: traffic from Firecracker orbs to private
+addresses (`10/8`, `172.16/12`, `192.168/16`, a tailnet's `100.64/10`, loopback, multicast
+and reserved ranges) is dropped, as is link-local (cloud metadata) and IPv6. Allow what
+orbs need with `ORBD_EGRESS_ALLOW`, comma-separated `<tcp|udp|any>:<address, CIDR or
+*>[:<port or range>]` entries, e.g. `udp:192.168.2.201:41641` (direct Tailscale to a LAN
+host) or `tcp:10.0.0.0/8:8000-8100`; the orbs' DNS servers are allowed on port 53.
+`ORBD_ALLOW_PRIVATE_EGRESS=true` lifts the block. The agent's own traffic is not affected.
+QEMU orbs use QEMU's user-mode network and need host firewall rules instead (see macOS
+below).
+
+`orbd agent list` and `orbd agent remove <id>`
 manage agents; a removed agent's orbs stay on it, unavailable. `orbd agent list` shows
 each agent's orbs, its reservations against its capacity, and its disk: free, allocated
 by orbd, reserved and limit (also exported as `orbd_agent_disk_*_bytes` and

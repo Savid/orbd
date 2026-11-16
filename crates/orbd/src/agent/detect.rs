@@ -112,6 +112,7 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
     if let Some(f) = &mut r.firecracker {
         f.dns_servers = config.agent.dns_servers.clone();
         f.guest_network = config.agent.guest_network;
+        f.egress = config.agent.egress.clone();
     }
     Ok(())
 }
