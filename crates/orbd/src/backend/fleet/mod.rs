@@ -745,6 +745,30 @@ impl ComputeBackend for FleetBackend {
             },
         )
     }
+
+    fn orb_disk(
+        &self,
+        location: &Location,
+    ) -> Option<HashMap<crate::model::OrbId, super::OrbDiskUse>> {
+        let agent = self.inner.agent_of(location).ok()?;
+        let st = self.inner.lock();
+        let (hb, _) = st.agents.get(&agent)?.heartbeat.as_ref()?;
+        Some(
+            hb.orb_disk
+                .iter()
+                .filter_map(|u| {
+                    let id = crate::model::OrbId::parse(&u.orb_id).ok()?;
+                    Some((
+                        id,
+                        super::OrbDiskUse {
+                            allocated_bytes: u.allocated_bytes,
+                            checkpoint_bytes: u.checkpoint_bytes,
+                        },
+                    ))
+                })
+                .collect(),
+        )
+    }
 }
 
 fn page_from_wire(resp: pb::ReconcileResponse) -> Result<ReconcilePage, wire::WireError> {

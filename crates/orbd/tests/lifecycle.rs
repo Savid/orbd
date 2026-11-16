@@ -92,13 +92,10 @@ fn orb_delete_takes_only_orbs_asleep_long_enough() {
     assert_ok(&c.dispatch("spawn", "amp-2", &[]), "spawn 2");
     assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2");
 
-    let list = c.admin(&["orb", "list"]);
-    assert_ok(&list, "orb list");
+    let row = |id: &str, state: &str| (id.into(), state.into(), "agent-a".into(), OFFERING.into());
     assert_eq!(
-        list.stdout,
-        format!(
-            "amp-1\trunning for 0m\tagent-a\t{OFFERING}\namp-2\tasleep for 0m\tagent-a\t{OFFERING}"
-        )
+        c.orb_rows(),
+        [row("amp-1", "running"), row("amp-2", "asleep")]
     );
 
     let running = c.admin(&["orb", "delete", "amp-1", "--min-asleep-mins", "0"]);
@@ -163,8 +160,11 @@ fn orb_pause_pauses_as_amp_would() {
     let s = c.only_orb("agent-a");
     assert!(!s.running && s.disk);
     assert_eq!(s.counters.checkpoints, 1, "paused with a memory checkpoint");
-    let list = c.admin(&["orb", "list"]).stdout;
-    assert!(list.starts_with("amp-1\tasleep for 0m"), "{list}");
+    let rows = c.orb_rows();
+    assert_eq!(
+        (rows[0].0.as_str(), rows[0].1.as_str()),
+        ("amp-1", "asleep")
+    );
     let again = c.admin(&["orb", "pause", "amp-1"]);
     assert_ok(&again, "repeated orb pause");
     assert!(again.stdout.contains("already stopped"), "{}", again.stdout);
@@ -213,7 +213,7 @@ fn orb_delete_force_takes_a_running_orb() {
     assert_eq!(forced.stdout, "amp-1 deleted: delete succeeded");
     let s = c.only_orb("agent-a");
     assert!(!s.running && !s.disk);
-    assert_eq!(c.admin(&["orb", "list"]).stdout, "");
+    assert!(c.orb_rows().is_empty());
 
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn after delete");
     let orbs = c.fake_orbs("agent-a");
@@ -254,13 +254,13 @@ fn provider_orb_types_choose_the_offering() {
         &c.dispatch("spawn", "amp-default", &[]),
         "spawn, no ORB_TYPE",
     );
-    let list = c.admin(&["orb", "list"]);
+    let row = |id: &str, ty: &str| (id.into(), "running".into(), "agent-a".into(), ty.into());
     assert_eq!(
-        list.stdout,
-        format!(
-            "amp-big\trunning for 0m\tagent-a\tfake-4vcpu-4gb\n\
-             amp-default\trunning for 0m\tagent-a\t{OFFERING}"
-        )
+        c.orb_rows(),
+        [
+            row("amp-big", "fake-4vcpu-4gb"),
+            row("amp-default", OFFERING)
+        ]
     );
 
     // The default orb type is the other offering; the orb's own must be found. An orb
@@ -271,10 +271,9 @@ fn provider_orb_types_choose_the_offering() {
         &c.dispatch("spawn", "amp-big", &[]),
         "wake big, no ORB_TYPE",
     );
-    assert!(
-        c.admin(&["orb", "list"])
-            .stdout
-            .starts_with("amp-big\trunning for 0m\tagent-a\tfake-4vcpu-4gb\n"),
+    assert_eq!(
+        c.orb_rows()[0],
+        row("amp-big", "fake-4vcpu-4gb"),
         "big keeps its offering"
     );
     assert_ok(&c.dispatch("pause", "amp-big", &[]), "pause big again");
@@ -310,7 +309,9 @@ fn orbs_whose_vm_died_with_the_host_are_stopped_when_it_returns() {
     c.wait_connected(1);
 
     wait_until(Duration::from_secs(20), "amp-1 recorded as stopped", || {
-        c.admin(&["orb", "list"]).stdout.contains("amp-1\tstopped")
+        c.orb_rows()
+            .iter()
+            .any(|r| r.0 == "amp-1" && r.1 == "stopped")
     });
     // Its compute is free again: the agent has room for only one running orb.
     assert_ok(
@@ -339,7 +340,9 @@ fn orbs_whose_vm_dies_while_the_agent_runs_are_stopped() {
 
     c.kill_vm("agent-a");
     wait_until(Duration::from_secs(20), "amp-1 recorded as stopped", || {
-        c.admin(&["orb", "list"]).stdout.contains("amp-1\tstopped")
+        c.orb_rows()
+            .iter()
+            .any(|r| r.0 == "amp-1" && r.1 == "stopped")
     });
     // Its compute is free again, on the agent too: it has room for one running orb.
     assert_ok(

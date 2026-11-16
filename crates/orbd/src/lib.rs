@@ -12,6 +12,7 @@ compile_error!("orbd runs on macOS only on Apple Silicon (Hypervisor.framework, 
 pub mod agent;
 pub mod amp;
 pub mod backend;
+pub mod cli;
 pub mod config;
 pub mod coordinator;
 pub mod doctor;

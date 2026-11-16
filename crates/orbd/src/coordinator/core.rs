@@ -30,7 +30,7 @@ type EventTx = mpsc::Sender<Result<pb::DispatchEvent, GrpcStatus>>;
 const RESUBMIT_EVERY: Duration = Duration::from_secs(5);
 const CANCEL_EVERY: Duration = Duration::from_secs(5);
 const RECONCILE_EVERY: Duration = Duration::from_secs(10);
-const BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const BACKEND_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A validated dispatch request (see `service`).
 pub struct ValidatedRequest {
@@ -761,18 +761,7 @@ impl Core {
     /// size: room to grow (at most to its size) plus, for memory-preserving sleep, its
     /// next memory checkpoint. What it has already written is in the host's free space.
     fn demand(&self, spec: &SpecTemplate) -> Resources {
-        let r = spec.resources;
-        let checkpoint = match spec.pause_policy {
-            PausePolicy::MemoryPreserving { .. } => r.memory_bytes,
-            PausePolicy::DiskOnly => 0,
-        };
-        Resources {
-            disk_bytes: r
-                .disk_bytes
-                .min(self.policy.running_orb_disk_headroom)
-                .saturating_add(checkpoint),
-            ..r
-        }
+        demand(&self.policy, spec)
     }
 
     /// Admission: choose/verify the location and build the atomic creation plan.
@@ -1926,12 +1915,28 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
+/// What a running orb of `spec` reserves on its host (see `Core::demand`).
+pub(super) fn demand(policy: &Policy, spec: &SpecTemplate) -> Resources {
+    let r = spec.resources;
+    let checkpoint = match spec.pause_policy {
+        PausePolicy::MemoryPreserving { .. } => r.memory_bytes,
+        PausePolicy::DiskOnly => 0,
+    };
+    Resources {
+        disk_bytes: r
+            .disk_bytes
+            .min(policy.running_orb_disk_headroom)
+            .saturating_add(checkpoint),
+        ..r
+    }
+}
+
 /// Every resource `cand` lacks for `demand` after the reservations in `used`, with the
 /// numbers. Memory must also fit what the host really has available, less its reserve:
 /// a host's capacity may overcommit memory, and its agent rechecks this at admission. Disk is judged by what the host reports, not by orb disk sizes (sparse): the
 /// filesystem's free space less its reserve, and the agent's disk limit less what orbd
 /// has allocated, must each still hold the headroom of every running orb plus this one.
-fn shortfalls(
+pub(super) fn shortfalls(
     cand: &PlacementCandidate,
     used: &store::PoolUse,
     demand: Resources,

@@ -179,6 +179,7 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
         );
     }
     let db_for_admin = db.clone();
+    let backends_for_admin = backends.clone();
     let mut core = core::Core::new(
         db,
         key.clone(),
@@ -201,7 +202,15 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
     let orbs = orbd_proto::control::v1::orbs_server::OrbsServer::new(orbs::OrbsService {
         core: core_tx.clone(),
         db: db_for_admin,
+        backends: backends_for_admin,
+        policy,
     });
+    // The admin socket first: once the dispatch socket exists, both accept.
+    let admin = serve_unix(
+        &config.admin_socket(),
+        tonic::service::Routes::new(admin.into_server()).add_service(orbs),
+        shutdown.clone(),
+    )?;
     let dispatch = serve_unix(
         &socket,
         tonic::service::Routes::new(
@@ -220,11 +229,6 @@ pub async fn run(config: CoordinatorConfig, shutdown: CancellationToken) -> Resu
                 },
             ),
         ),
-        shutdown.clone(),
-    )?;
-    let admin = serve_unix(
-        &config.admin_socket(),
-        tonic::service::Routes::new(admin.into_server()).add_service(orbs),
         shutdown.clone(),
     )?;
     tracing::info!(socket = %socket.display(), "dispatch socket ready");

@@ -440,6 +440,16 @@ message Heartbeat {
   // orbs are refused unless what is left holds them. 0 = not reported.
   uint64 memory_available_bytes = 9;
   uint64 memory_reserve_bytes = 10;
+  // Bytes allocated per orb directory (its disk, checkpoints and logs), measured with
+  // disk_allocated_bytes (blocks a cloned disk shares with its image count in full).
+  repeated OrbDiskUsage orb_disk = 11;
+}
+
+message OrbDiskUsage {
+  string orb_id = 1;
+  uint64 allocated_bytes = 2;
+  // The part held by memory checkpoints.
+  uint64 checkpoint_bytes = 3;
 }
 
 message CommandAccepted {
@@ -644,7 +654,15 @@ service Orbs {
   // Pauses one orb through the ordinary pause path, as if Amp had sent `pause`, and
   // returns its result: for an orb Amp no longer pauses, e.g. one whose provider token
   // is no longer served. Its thread's next spawn wakes it.
+  //
+  // PauseOrb and DeleteOrb take the orb's Amp id, its thread id (`T-<uuid>` or the
+  // bare uuid) or its internal id, never a prefix. Refusals (nothing was done) are
+  // FAILED_PRECONDITION; a command that ran and failed is ABORTED; a result that is
+  // not known (it may have happened) is UNKNOWN; an unreachable host is UNAVAILABLE.
   rpc PauseOrb(PauseOrbRequest) returns (PauseOrbResponse);
+  // One orb in detail: its recent commands and Amp requests. NOT_FOUND for no match,
+  // INVALID_ARGUMENT for a prefix that matches several orbs.
+  rpc GetOrb(GetOrbRequest) returns (GetOrbResponse);
 }
 
 message ListOrbsRequest {}
@@ -652,17 +670,113 @@ message ListOrbsRequest {}
 message OrbInfo {
   string amp_orb_id = 1;
   string offering_id = 2;
-  // Empty for orbs outside the agent fleet.
+  // Empty for orbs outside the agent fleet (see backend_id).
   string agent_id = 3;
-  // running, asleep, stopped, uncreated, or faulted (<last known state>).
+  // running, asleep, stopped, uncreated, deleting (a delete was started and has not
+  // finished), or faulted (<last known state>).
   string state = 4;
   // When the coordinator last learned the state (for an asleep orb, when it went to
-  // sleep).
+  // sleep). An agent restart that restores a running orb renews it.
   uint64 observed_unix_ms = 5;
+  // Internal orb id: the orb's directory on its agent.
+  string orb_id = 6;
+  string arch = 7;     // amd64 or arm64
+  string runtime = 8;  // firecracker, qemu, docker, ... or a provider profile
+  // vCPUs and memory of the orb, and its disk size (sparse: see `disk`).
+  Resources resources = 9;
+  uint64 created_unix_ms = 10;
+  // What the orb holds on its agent's disk, as the agent last measured it (every
+  // minute). Unset when the agent does not report it.
+  optional DiskUse disk = 11;
+  // Why the orb could not start on its host right now, as admission would refuse it:
+  // e.g. INSUFFICIENT_MEMORY "memory: needs 32.0 GiB, 6.6 GiB free of 54.6 GiB
+  // (running orbs: 6)", or BACKEND_UNAVAILABLE for a host that is down. Empty when it
+  // would start, when it runs, or while a spawn of it is in flight.
+  repeated CommandFailure wake_blockers = 12;
+  // Failures of one action since that action's last success, latest first (at most
+  // 5): failed spawns if there are any (a pause that succeeds does not end them), else
+  // the action that failed last. Refusals that never became a command are kept for
+  // about an hour.
+  repeated OrbFailure failures = 13;
+  uint32 failures_since_success = 14;
+  // The command in flight, if any.
+  optional OrbCommand open_command = 15;
+  // Amp requests waiting behind it.
+  uint32 queued_requests = 16;
+  // When Amp (or an operator) last spawned or paused the orb successfully; its
+  // creation if never.
+  uint64 last_active_unix_ms = 17;
+  // Set for a faulted orb.
+  string fault = 18;
+  // The orb's backend when it is not the agent fleet (e.g. boat).
+  string backend_id = 19;
+  // The orb's agent is an overflow agent.
+  bool overflow_agent = 20;
+}
+
+message DiskUse {
+  uint64 allocated_bytes = 1;
+  // The part held by memory checkpoints.
+  uint64 checkpoint_bytes = 2;
+}
+
+message OrbFailure {
+  string action = 1;   // spawn, pause or delete
+  FailureCode code = 2;
+  string message = 3;
+  uint64 unix_ms = 4;
+  // Empty for a request refused before any command was created (e.g. no capacity).
+  string operation_id = 5;
+}
+
+message OrbCommand {
+  string operation_id = 1;
+  string action = 2;
+  uint64 generation = 3;
+  // pending, accepted, terminal or unknown.
+  string status = 4;
+  uint64 created_unix_ms = 5;
+  uint64 accepted_unix_ms = 6;   // 0 = not yet
+  uint64 finished_unix_ms = 7;   // 0 = not yet
+  // For a finished command: e.g. "spawned (memory_restore)", "paused", "deleted".
+  string result = 8;
+  optional OrbFailure failure = 9;
+}
+
+message OrbRequest {
+  string action = 1;
+  // queued, active or finished.
+  string status = 2;
+  uint64 start_unix_ms = 3;
+  // For a finished request: succeeded, failed, invalid, unavailable, outcome_unknown or
+  // deadline_exceeded, and the message Amp got.
+  string result = 4;
+  string message = 5;
+  string operation_id = 6;
 }
 
 message ListOrbsResponse {
   repeated OrbInfo orbs = 1;
+}
+
+message GetOrbRequest {
+  // An Amp orb id, a unique prefix of one (`amp-01a1e1f8`), its thread id (`T-<uuid>`
+  // or the bare uuid), or an internal orb id.
+  string orb = 1;
+  // Commands to return, latest first; 0 = 20.
+  uint32 history = 2;
+}
+
+message GetOrbResponse {
+  OrbInfo orb = 1;
+  string amp_endpoint = 2;
+  string spec_digest = 3;
+  string image_ref = 4;
+  uint64 generation = 5;
+  repeated OrbCommand commands = 6;
+  // Amp requests the coordinator still holds (finished ones for about an hour), latest
+  // first.
+  repeated OrbRequest requests = 7;
 }
 
 message DeleteOrbRequest {

@@ -2,7 +2,7 @@
 
 use super::{Inner, registry};
 use crate::coordinator::store::{self, PoolUse};
-use crate::model::{AgentId, GIB, unix_ms_now};
+use crate::model::{AgentId, unix_ms_now};
 use crate::pki::{self, JoinToken};
 use orbd_proto::control::v1 as pb;
 use orbd_proto::control::v1::admin_server::Admin;
@@ -164,74 +164,6 @@ pub async fn cli_join_token(
         .await
         .map_err(status)?;
     Ok(r.into_inner().token)
-}
-
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / GIB as f64)
-}
-
-/// One line per agent: id, state, orbs, reserved/capacity, disk, certificate expiry.
-pub async fn cli_list(socket: &std::path::Path) -> anyhow::Result<String> {
-    let r = client(socket)
-        .await?
-        .list_agents(pb::ListAgentsRequest {})
-        .await
-        .map_err(status)?;
-    let now = unix_ms_now();
-    let mut out = String::new();
-    for a in r.into_inner().agents {
-        let state = match (a.removed, a.connected) {
-            (true, _) => "removed",
-            (false, true) => "connected",
-            (false, false) => "disconnected",
-        };
-        let state = if a.overflow {
-            format!("{state} (overflow)")
-        } else {
-            state.to_owned()
-        };
-        let days = a.certificate_expires_unix_ms.saturating_sub(now) / 86_400_000;
-        let cap = a.capacity.unwrap_or_default();
-        let held = a.reserved.unwrap_or_default();
-        let disk = if a.disk_reported {
-            let of = if a.disk_total_bytes > 0 {
-                format!(" of {}", gib(a.disk_total_bytes))
-            } else {
-                String::new()
-            };
-            format!(
-                "disk {} free{of} ({} kept free), {} allocated, {} reserved, limit {}",
-                gib(a.disk_free_bytes),
-                gib(a.disk_reserve_bytes),
-                gib(a.disk_allocated_bytes),
-                gib(held.disk_bytes),
-                gib(cap.disk_bytes)
-            )
-        } else {
-            "disk not reported".into()
-        };
-        let host_mem = if a.memory_available_bytes > 0 {
-            format!(
-                " ({} available on the host, {} kept)",
-                gib(a.memory_available_bytes),
-                gib(a.memory_reserve_bytes)
-            )
-        } else {
-            String::new()
-        };
-        out.push_str(&format!(
-            "{}\t{state}\t{} orbs ({} running)\tvCPUs {}/{}\tmemory {}/{}{host_mem}\t{disk}\t\
-             certificate expires in {days}d\n",
-            a.agent_id,
-            a.orbs,
-            a.running_orbs,
-            held.vcpus,
-            cap.vcpus,
-            gib(held.memory_bytes),
-            gib(cap.memory_bytes),
-        ));
-    }
-    Ok(out)
 }
 
 pub async fn cli_remove(socket: &std::path::Path, agent_id: &str) -> anyhow::Result<()> {

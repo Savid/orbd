@@ -298,18 +298,6 @@ pub fn idle_orbs(c: &Connection, cutoff_ms: u64) -> Result<Vec<OrbRecord>> {
         .collect())
 }
 
-/// Orbs that are not deleted (or being deleted), oldest first.
-pub fn live_orbs(c: &Connection) -> Result<Vec<OrbRecord>> {
-    let mut st = c.prepare(&format!(
-        "SELECT {ORB_COLS} FROM orbs o WHERE retired_ms IS NULL
-           AND NOT EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
-         ORDER BY created_ms"
-    ))?;
-    Ok(st
-        .query_map([], orb_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
 /// Retires a deleted orb so a new incarnation can take its Amp id.
 pub fn retire_orb(c: &Connection, orb: OrbId) -> Result<()> {
     c.execute(
@@ -786,4 +774,108 @@ pub fn gc(c: &Connection, older_than_ms: u64) -> Result<()> {
         params![older_than_ms as i64],
     )?;
     Ok(())
+}
+
+// --- operator views (`orbd orb`, `orbd status`) --------------------------------------
+
+/// A command as operators see it.
+#[derive(Clone, Debug)]
+pub struct CmdHistory {
+    pub operation_id: OperationId,
+    pub generation: u64,
+    pub action: Action,
+    pub status: String,
+    pub outcome: Option<CommandOutcome>,
+    pub created_ms: u64,
+    pub accepted_ms: Option<u64>,
+    pub terminal_ms: Option<u64>,
+}
+
+const HIST_COLS: &str = "operation_id, generation, action_json, status, outcome_json, \
+                         created_ms, accepted_ms, terminal_ms";
+
+fn hist_row(row: &Row) -> rusqlite::Result<CmdHistory> {
+    Ok(CmdHistory {
+        operation_id: uuid_col(row, 0, OperationId::parse)?,
+        generation: u(row, 1)?,
+        action: de(row, 2)?,
+        status: row.get(3)?,
+        outcome: de_opt(row, 4)?,
+        created_ms: u(row, 5)?,
+        accepted_ms: u_opt(row, 6)?,
+        terminal_ms: u_opt(row, 7)?,
+    })
+}
+
+/// The latest `limit` commands of one orb, latest first (served by its
+/// `(orb_id, generation)` index).
+pub fn orb_commands(c: &Connection, orb: OrbId, limit: u32) -> Result<Vec<CmdHistory>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {HIST_COLS} FROM commands WHERE orb_id = ?1 ORDER BY generation DESC LIMIT ?2"
+    ))?;
+    Ok(st
+        .query_map(params![orb.to_string(), limit], hist_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Every request the coordinator holds (finished ones are kept for about an hour),
+/// oldest first.
+pub fn all_requests(c: &Connection) -> Result<Vec<Req>> {
+    let mut st = c.prepare(&format!("SELECT {REQ_COLS} FROM requests ORDER BY seq"))?;
+    Ok(st
+        .query_map([], req_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Orbs that exist, oldest first, with when each was created and whether a delete of
+/// it has started (tombstoned): those not deleted yet are listed too, so a delete that
+/// fails or hangs stays visible.
+pub fn live_orbs_created(c: &Connection) -> Result<Vec<(OrbRecord, u64, bool)>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {ORB_COLS}, created_ms,
+                EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
+         FROM orbs o WHERE retired_ms IS NULL ORDER BY created_ms"
+    ))?;
+    let rows = st
+        .query_map([], |r| Ok((orb_row(r)?, u(r, 9)?, r.get::<_, bool>(10)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(o, _, tomb)| {
+            !*tomb || !matches!(o.observation.state.last_known(), StableOrbState::Deleted)
+        })
+        .collect())
+}
+
+/// When the orb last spawned or paused successfully (indexed by orb).
+pub fn last_active(c: &Connection, orb: OrbId) -> Result<Option<u64>> {
+    Ok(c.query_row(
+        "SELECT terminal_ms FROM commands
+         WHERE orb_id = ?1 AND status = 'terminal'
+           AND json_extract(action_json, '$.kind') IN ('spawn', 'pause')
+           AND json_type(outcome_json, '$.result.Ok') IS NOT NULL
+         ORDER BY generation DESC LIMIT 1",
+        params![orb.to_string()],
+        |r| u_opt(r, 0),
+    )
+    .optional()?
+    .flatten())
+}
+
+/// What each orb's running reservation holds (an orb admitted to start, or running).
+pub fn running_reservations(c: &Connection) -> Result<std::collections::HashMap<OrbId, Resources>> {
+    let mut st = c.prepare(
+        "SELECT orb_id, vcpus, memory_bytes, disk_bytes FROM reservations WHERE kind = 'running'",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok((
+            uuid_col(r, 0, OrbId::parse)?,
+            Resources {
+                vcpus: u(r, 1)?.min(u32::MAX as u64) as u32,
+                memory_bytes: u(r, 2)?,
+                disk_bytes: u(r, 3)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
