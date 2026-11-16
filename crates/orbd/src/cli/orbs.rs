@@ -554,10 +554,18 @@ pub fn hints(o: &OrbJson, now: u64) -> Vec<String> {
         ));
     }
     if o.failures_since_success > 0 && o.wake_blockers.is_empty() && o.fault.is_none() {
-        h.push(format!(
-            "the last {} failed ({}); the agent's log on {} has the details",
-            o.failures[0].action, o.failures[0].code, o.agent
-        ));
+        let f = &o.failures[0];
+        if f.code.starts_with("insufficient_") || f.code == "quota_exceeded" {
+            h.push(format!(
+                "its last {} was refused for room it has now: its thread's next message wakes it",
+                f.action
+            ));
+        } else {
+            h.push(format!(
+                "the last {} failed ({}); the agent's log on {} has the details",
+                f.action, f.code, o.agent
+            ));
+        }
     }
     if let Some(t) = o.undriven_for(now) {
         h.push(format!(

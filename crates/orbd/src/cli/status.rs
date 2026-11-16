@@ -289,17 +289,24 @@ pub fn problems(agents: &[AgentJson], orbs: &[OrbJson], t: Thresholds, now: u64)
                     hint: show.clone(),
                 });
             } else if o.fault.is_none() {
+                // Refused for room it has now: it wakes on its thread's next message.
+                let fits_now = f.code.starts_with("insufficient_") || f.code == "quota_exceeded";
                 out.push(Problem {
-                    severity: Severity::Warning,
+                    severity: if fits_now {
+                        Severity::Info
+                    } else {
+                        Severity::Warning
+                    },
                     kind: "orb_failing",
                     subject: id.clone(),
                     message: format!(
-                        "{id} on {}: {} failed {times}, last {} ago: {}: {}",
+                        "{id} on {}: {} failed {times}, last {} ago: {}: {}{}",
                         o.agent,
                         f.action,
                         age(now.saturating_sub(f.unix_ms)),
                         f.code,
-                        f.message
+                        f.message,
+                        if fits_now { " (it fits now)" } else { "" }
                     ),
                     hint: show.clone(),
                 });
