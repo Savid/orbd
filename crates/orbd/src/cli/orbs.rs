@@ -434,15 +434,14 @@ pub async fn show(socket: &Path, orb: &str, history: u32, json: bool) -> Result<
         kv(
             "failing",
             format!(
-                "{} failures since the last success:",
-                o.failures_since_success
+                "{} {} failures since its last successful {}:",
+                o.failures_since_success, o.failures[0].action, o.failures[0].action
             ),
         );
         for f in &o.failures {
             out.push_str(&format!(
-                "                {} ago  {} {}: {}\n",
+                "                {} ago  {}: {}\n",
                 ago(f.unix_ms),
-                f.action,
                 f.code,
                 f.message
             ));

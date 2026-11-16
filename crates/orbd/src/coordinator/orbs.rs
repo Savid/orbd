@@ -239,17 +239,23 @@ fn command_pb(c: &CmdHistory) -> pb::OrbCommand {
 }
 
 /// Outcomes of one orb's commands and of its Amp requests that never became a command,
-/// as (time, failure or None for a success).
+/// latest first, as (time, action, failure or None for a success).
 fn outcomes(
     orb: &OrbRecord,
     created: u64,
     commands: &[&CmdHistory],
     requests: &[super::types::Req],
-) -> Vec<(u64, Option<pb::OrbFailure>)> {
-    let mut out: Vec<(u64, Option<pb::OrbFailure>)> = commands
+) -> Vec<(u64, &'static str, Option<pb::OrbFailure>)> {
+    let mut out: Vec<(u64, &'static str, Option<pb::OrbFailure>)> = commands
         .iter()
         .filter(|c| c.status == "terminal")
-        .map(|c| (c.terminal_ms.unwrap_or(c.created_ms), command_pb(c).failure))
+        .map(|c| {
+            (
+                c.terminal_ms.unwrap_or(c.created_ms),
+                c.action.name(),
+                command_pb(c).failure,
+            )
+        })
         .collect();
     for q in requests {
         if q.amp_endpoint != orb.identity.amp_endpoint
@@ -274,10 +280,25 @@ fn outcomes(
                 },
             }
         });
-        out.push((if failure.is_some() { q.start_ms } else { at }, failure));
+        let t = if failure.is_some() { q.start_ms } else { at };
+        out.push((t, q.action.name(), failure));
     }
-    out.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    out.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
     out
+}
+
+/// The failures of the action that failed last, latest first, back to that action's
+/// last success: a pause that succeeds (e.g. Amp giving up on a wake) does not make
+/// failed wakes go away, only a wake does.
+fn failing(outcomes: &[(u64, &'static str, Option<pb::OrbFailure>)]) -> Vec<pb::OrbFailure> {
+    let Some(action) = outcomes.iter().find_map(|(_, a, f)| f.as_ref().map(|_| *a)) else {
+        return Vec::new();
+    };
+    outcomes
+        .iter()
+        .filter(|(_, a, _)| *a == action)
+        .map_while(|(_, _, f)| f.clone())
+        .collect()
 }
 
 impl OrbsService {
@@ -350,15 +371,9 @@ impl OrbsService {
                     }
                 }
             }
-            let outcomes = outcomes(orb, *created, commands, &snap.requests);
-            let failures_since_success =
-                outcomes.iter().take_while(|(_, f)| f.is_some()).count() as u32;
-            let failures = outcomes
-                .iter()
-                .take_while(|(_, f)| f.is_some())
-                .take(MAX_FAILURES)
-                .filter_map(|(_, f)| f.clone())
-                .collect();
+            let mut failures = failing(&outcomes(orb, *created, commands, &snap.requests));
+            let failures_since_success = failures.len() as u32;
+            failures.truncate(MAX_FAILURES);
             let last_active = commands
                 .iter()
                 .filter_map(|c| match c.outcome.as_ref().map(|o| &o.result) {
@@ -488,5 +503,33 @@ impl OrbsService {
         Err(Status::unavailable(
             "the coordinator stopped before the job finished",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f(action: &str) -> Option<pb::OrbFailure> {
+        Some(pb::OrbFailure {
+            action: action.into(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn only_a_success_of_the_failing_action_ends_its_failures() {
+        // Latest first: a pause succeeded after two failed wakes, before them a wake.
+        let o = vec![
+            (5, "pause", None),
+            (4, "spawn", f("spawn")),
+            (3, "spawn", f("spawn")),
+            (2, "spawn", None),
+            (1, "spawn", f("spawn")),
+        ];
+        assert_eq!(failing(&o).len(), 2);
+        let woke = [vec![(6, "spawn", None)], o].concat();
+        assert!(failing(&woke).is_empty());
+        assert!(failing(&[(1, "pause", None)]).is_empty());
     }
 }

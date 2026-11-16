@@ -685,8 +685,9 @@ message OrbInfo {
   // Why the orb could not start on its host right now, e.g. "memory: needs 32.0 GiB,
   // 6.6 GiB free of 54.6 GiB (running orbs: 6)". Empty when it would start, or it runs.
   repeated string wake_blockers = 12;
-  // Failed commands and Amp requests since the orb's last success, latest first (at
-  // most 5; refusals that never became a command are kept for about an hour).
+  // Failed commands and Amp requests of the action that failed last, since that
+  // action's last success, latest first (at most 5; refusals that never became a
+  // command are kept for about an hour). A successful pause does not end failed spawns.
   repeated OrbFailure failures = 13;
   uint32 failures_since_success = 14;
   // The command in flight, if any.

@@ -94,7 +94,7 @@ fn a_stuck_orb_is_visible_and_explained() {
     for want in [
         "thread      T-1",
         "wake check  would be refused: memory: needs 2.0 GiB",
-        "failing     1 failures since the last success:",
+        "failing     1 spawn failures since its last successful spawn:",
         "COMMANDS (latest first)",
         "AMP REQUESTS",
         "spawn failed: InsufficientMemory",
