@@ -5,7 +5,7 @@ Description=stand-in for Amp's headless bootstrap
 User=user
 EnvironmentFile=/home/user/.config/amp/headless-bootstrap.env
 ExecStart=/usr/local/bin/fake-amp-bootstrap
-StandardOutput=file:/dev/ttyS0
+StandardOutput=file:/dev/console
 Restart=on-failure
 
 [Install]

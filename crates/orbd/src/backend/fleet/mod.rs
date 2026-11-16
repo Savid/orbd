@@ -566,13 +566,14 @@ impl ComputeBackend for FleetBackend {
             if slot.removed && restrict.is_none() {
                 continue;
             }
-            let info = slot
+            let caps = slot
                 .hello
                 .as_ref()
-                .and_then(|h| h.runtimes.iter().find(|r| r.kind == wire_kind));
-            let (capabilities, ceiling) = match (info, slot.hello.as_ref()) {
-                (Some(info), Some(hello)) => (
-                    capabilities::effective(runtime, info),
+                .and_then(|h| h.runtimes.iter().find(|r| r.kind == wire_kind))
+                .and_then(|info| capabilities::effective(runtime, info));
+            let (capabilities, ceiling) = match (caps, slot.hello.as_ref()) {
+                (Some(caps), Some(hello)) => (
+                    caps,
                     hello.capacity.map(Resources::from).unwrap_or_default(),
                 ),
                 // An existing orb's location stays visible (as Unavailable) even if the

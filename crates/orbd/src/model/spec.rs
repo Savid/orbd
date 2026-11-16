@@ -98,6 +98,39 @@ pub struct CapabilityRequirements {
     pub release_compute_when_paused: bool,
     pub nested_kvm: NestedKvmRequirement,
     pub project_snapshots: SnapshotRequirement,
+    /// CPU architecture of the orb (its image and host). Left out of amd64 specs, so
+    /// specs recorded before it existed serialize (and digest) unchanged.
+    #[serde(default, skip_serializing_if = "Arch::is_amd64")]
+    pub arch: Arch,
+}
+
+/// CPU architecture of an orb and of the hosts that can run it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Arch {
+    #[default]
+    Amd64,
+    Arm64,
+}
+
+impl Arch {
+    /// This build's architecture.
+    pub const HOST: Arch = if cfg!(target_arch = "aarch64") {
+        Arch::Arm64
+    } else {
+        Arch::Amd64
+    };
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Arch::Amd64 => "amd64",
+            Arch::Arm64 => "arm64",
+        }
+    }
+
+    pub fn is_amd64(&self) -> bool {
+        *self == Arch::Amd64
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -9,6 +9,10 @@
 //! the host boot id, `/proc/<pid>` start time and the launch marker in its argv match
 //! the launch record (and the VMM's own API then reports the same marker).
 //!
+//! On macOS (no pidfds, no `/proc`) a process is held by pid and start time instead:
+//! every check and signal first confirms the pid still has the start time it had when
+//! it was opened, and exits are polled. Cgroups and network namespaces are Linux-only.
+//!
 //! Production placement: VMMs must not live in the supervisor service's cgroup, or a
 //! service stop kills every VM. Under systemd use `KillMode=process` or pass a
 //! delegated cgroup v2 directory as [`Spawn::cgroup`]; the launcher moves the VMM into
@@ -17,7 +21,7 @@
 use crate::fsutil::{read_json, write_json_atomic};
 use nix::libc;
 use serde::{Deserialize, Serialize};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -39,19 +43,11 @@ pub struct CpuIdentity {
 
 impl CpuIdentity {
     pub fn host() -> Self {
-        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-        let field = |name: &str| {
-            cpuinfo
-                .lines()
-                .find(|l| l.starts_with(name))
-                .and_then(|l| l.split_once(':'))
-                .map(|(_, v)| v.trim().to_owned())
-                .unwrap_or_default()
-        };
+        let (model, flags) = sys::cpu();
         use sha2::{Digest, Sha256};
         Self {
-            model: field("model name"),
-            flags_sha256: hex::encode(Sha256::digest(field("flags").as_bytes())),
+            model,
+            flags_sha256: hex::encode(Sha256::digest(flags.as_bytes())),
         }
     }
 }
@@ -101,37 +97,29 @@ pub fn read_record<C: serde::de::DeserializeOwned>(path: &Path) -> Option<Launch
     read_json(path).ok().flatten()
 }
 
+/// This boot of the host (Linux `boot_id`, macOS `kern.bootsessionuuid`).
 pub fn host_boot_id() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_default()
+    sys::boot_id()
 }
 
-/// Start time (clock ticks since boot) from `/proc/<pid>/stat`.
+/// Start time of `pid` (Linux: clock ticks since boot from `/proc/<pid>/stat`; macOS:
+/// microseconds since the epoch).
 pub fn start_time(pid: i32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = &stat[stat.rfind(')')? + 1..];
-    // Fields after the comm: state is field 3; starttime is field 22.
-    rest.split_whitespace().nth(19)?.parse().ok()
+    sys::start_time(pid)
 }
 
-/// A validated, live VMM process, held through a pidfd (no pid-reuse races).
+/// A validated, live VMM process, held through a pidfd on Linux (no pid-reuse races)
+/// and by pid and start time on macOS.
 pub struct Process {
     pub pid: i32,
-    pidfd: OwnedFd,
+    handle: sys::Handle,
 }
 
 impl Process {
     fn open(pid: i32) -> Option<Self> {
-        // SAFETY: plain syscall; a valid fd is owned below.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            return None;
-        }
         Some(Self {
             pid,
-            // SAFETY: the kernel returned a new fd that nothing else owns.
-            pidfd: unsafe { OwnedFd::from_raw_fd(fd as i32) },
+            handle: sys::Handle::open(pid)?,
         })
     }
 
@@ -168,45 +156,16 @@ impl Process {
     }
 
     pub fn is_alive(&self) -> bool {
-        let mut pfd = libc::pollfd {
-            fd: self.pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd, zero timeout.
-        let r = unsafe { libc::poll(&mut pfd, 1, 0) };
-        r == 0
+        self.handle.is_alive()
     }
 
     /// Waits until the process exits or `deadline` passes; true if it exited.
     pub async fn wait_exit(&self, deadline: Instant) -> bool {
-        let Ok(fd) = self.pidfd.try_clone() else {
-            return !self.is_alive();
-        };
-        // SAFETY: the AsyncFd owns `fd`, which stays open (and the same pidfd) until it drops.
-        let registered = unsafe {
-            tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE)
-        };
-        let Ok(afd) = registered else {
-            return !self.is_alive();
-        };
-        tokio::select! {
-            _ = afd.readable() => true,
-            _ = tokio::time::sleep_until(deadline.into()) => !self.is_alive(),
-        }
+        self.handle.wait_exit(deadline).await
     }
 
     pub fn kill(&self) {
-        // SAFETY: signals exactly the process behind the pidfd.
-        unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                self.pidfd.as_raw_fd(),
-                libc::SIGKILL,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            );
-        }
+        self.handle.kill();
     }
 
     /// SIGKILL and wait (bounded) for the exit.
@@ -217,7 +176,7 @@ impl Process {
 }
 
 fn has_marker(pid: i32, marker: &str) -> bool {
-    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+    sys::cmdline(pid).is_some_and(|cmdline| {
         cmdline
             .split(|b| *b == 0)
             .any(|a| String::from_utf8_lossy(a).contains(marker))
@@ -225,11 +184,7 @@ fn has_marker(pid: i32, marker: &str) -> bool {
 }
 
 fn find_by_marker(marker: &str) -> Option<i32> {
-    std::fs::read_dir("/proc")
-        .ok()?
-        .flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
-        .find(|pid| has_marker(*pid, marker))
+    sys::pids().into_iter().find(|pid| has_marker(*pid, marker))
 }
 
 pub struct Spawn<'a, C> {
@@ -271,6 +226,11 @@ pub fn spawn<C: Serialize>(s: Spawn<'_, C>) -> std::io::Result<(Process, LaunchR
         None => None,
     };
     let netns = s.netns.as_deref().map(std::fs::File::open).transpose()?;
+    if cfg!(not(target_os = "linux")) && (procs.is_some() || netns.is_some()) {
+        return Err(std::io::Error::other(
+            "cgroups and network namespaces need Linux",
+        ));
+    }
     let procs_fd = procs.as_ref().map(|f| f.as_raw_fd());
     let netns_fd = netns.as_ref().map(|f| f.as_raw_fd());
     let mut cmd = std::process::Command::new(s.program);
@@ -289,18 +249,25 @@ pub fn spawn<C: Serialize>(s: Spawn<'_, C>) -> std::io::Result<(Process, LaunchR
             {
                 return Err(std::io::Error::last_os_error());
             }
+            #[cfg(target_os = "linux")]
             if let Some(fd) = netns_fd
                 && libc::setns(fd, libc::CLONE_NEWNET) < 0
             {
                 return Err(std::io::Error::last_os_error());
             }
+            #[cfg(not(target_os = "linux"))]
+            let _ = netns_fd;
             Ok(())
         });
     }
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let pid = child.id() as i32;
     fail::fail_point!("vm::launch::after_exec", |_| std::process::abort());
-    let proc = Process::open(pid).ok_or_else(|| std::io::Error::other("pidfd_open failed"))?;
+    let Some(proc) = Process::open(pid) else {
+        // It already exited (macOS cannot open a zombie): reap it and say how it ended.
+        let status = child.wait()?;
+        return Err(std::io::Error::other(format!("exited at once ({status})")));
+    };
     // Not waited here: a std Child never reaps on drop, so reap it on a detached thread
     // only while this supervisor lives; afterwards init (or the subreaper) does.
     std::thread::spawn(move || {
@@ -311,4 +278,255 @@ pub fn spawn<C: Serialize>(s: Spawn<'_, C>) -> std::io::Result<(Process, LaunchR
     record.start_time = start_time(pid);
     write_json_atomic(s.record_path, &record)?;
     Ok((proc, record))
+}
+
+#[cfg(target_os = "linux")]
+mod sys {
+    use nix::libc;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::Instant;
+
+    pub fn cpu() -> (String, String) {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let field = |name: &str| {
+            cpuinfo
+                .lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().to_owned())
+                .unwrap_or_default()
+        };
+        (field("model name"), field("flags"))
+    }
+
+    pub fn boot_id() -> String {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    pub fn start_time(pid: i32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = &stat[stat.rfind(')')? + 1..];
+        // Fields after the comm: state is field 3; starttime is field 22.
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
+
+    pub fn cmdline(pid: i32) -> Option<Vec<u8>> {
+        std::fs::read(format!("/proc/{pid}/cmdline")).ok()
+    }
+
+    pub fn pids() -> Vec<i32> {
+        std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+            .collect()
+    }
+
+    pub struct Handle {
+        pidfd: OwnedFd,
+    }
+
+    impl Handle {
+        pub fn open(pid: i32) -> Option<Self> {
+            // SAFETY: plain syscall; a valid fd is owned below.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd < 0 {
+                return None;
+            }
+            Some(Self {
+                // SAFETY: the kernel returned a new fd that nothing else owns.
+                pidfd: unsafe { OwnedFd::from_raw_fd(fd as i32) },
+            })
+        }
+
+        pub fn is_alive(&self) -> bool {
+            let mut pfd = libc::pollfd {
+                fd: self.pidfd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, zero timeout.
+            let r = unsafe { libc::poll(&mut pfd, 1, 0) };
+            r == 0
+        }
+
+        pub async fn wait_exit(&self, deadline: Instant) -> bool {
+            let Ok(fd) = self.pidfd.try_clone() else {
+                return !self.is_alive();
+            };
+            // SAFETY: the AsyncFd owns `fd`, which stays open (and the same pidfd) until it drops.
+            let registered = unsafe {
+                tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE)
+            };
+            let Ok(afd) = registered else {
+                return !self.is_alive();
+            };
+            tokio::select! {
+                _ = afd.readable() => true,
+                _ = tokio::time::sleep_until(deadline.into()) => !self.is_alive(),
+            }
+        }
+
+        pub fn kill(&self) {
+            // SAFETY: signals exactly the process behind the pidfd.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod sys {
+    use crate::sysctl;
+    use nix::libc;
+    use std::time::{Duration, Instant};
+
+    /// `proc_bsdinfo.pbi_status` of a zombie (`SZOMB` in `sys/proc.h`).
+    const SZOMB: u32 = 5;
+    const EXIT_POLL: Duration = Duration::from_millis(20);
+
+    pub fn cpu() -> (String, String) {
+        // The guest gets `-cpu host` under Hypervisor.framework: the CPU family pins the
+        // features it sees.
+        let flags = format!(
+            "cpufamily={:?} cpusubfamily={:?}",
+            sysctl::u64("hw.cpufamily"),
+            sysctl::u64("hw.cpusubfamily")
+        );
+        (sysctl::string("machdep.cpu.brand_string"), flags)
+    }
+
+    pub fn boot_id() -> String {
+        sysctl::string("kern.bootsessionuuid")
+    }
+
+    fn bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
+        // SAFETY: proc_bsdinfo is plain data; the kernel fills at most its size.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: `info` is a valid buffer of `size` bytes.
+        let n = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
+        };
+        (n == size).then_some(info)
+    }
+
+    fn started(i: &libc::proc_bsdinfo) -> u64 {
+        i.pbi_start_tvsec * 1_000_000 + i.pbi_start_tvusec
+    }
+
+    pub fn start_time(pid: i32) -> Option<u64> {
+        bsdinfo(pid).map(|i| started(&i))
+    }
+
+    /// The process's argv, NUL-terminated (like Linux's `/proc/<pid>/cmdline`).
+    pub fn cmdline(pid: i32) -> Option<Vec<u8>> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut len: usize = 0;
+        // SAFETY: size query with a null buffer.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        // SAFETY: `buf` holds `len` bytes.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return None;
+        }
+        buf.truncate(len);
+        // KERN_PROCARGS2: argc, exec path, NUL padding, argv, environment.
+        let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+        let rest = &buf[4..];
+        let path_end = rest.iter().position(|b| *b == 0)?;
+        let argv = &rest[path_end + rest[path_end..].iter().position(|b| *b != 0)?..];
+        let mut end = 0;
+        for _ in 0..argc {
+            end += argv.get(end..)?.iter().position(|b| *b == 0)? + 1;
+        }
+        Some(argv[..end].to_vec())
+    }
+
+    pub fn pids() -> Vec<i32> {
+        // SAFETY: size query with a null buffer.
+        let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        let mut pids = vec![0i32; n as usize + 64];
+        let bytes = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+        // SAFETY: `pids` holds `bytes` bytes.
+        let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        pids.truncate(n.max(0) as usize);
+        pids.retain(|p| *p > 0);
+        pids
+    }
+
+    /// A process held by pid and start time: once the start time differs (or the pid is
+    /// gone or a zombie), it has exited.
+    pub struct Handle {
+        pid: i32,
+        start: u64,
+    }
+
+    impl Handle {
+        pub fn open(pid: i32) -> Option<Self> {
+            let start = start_time(pid)?;
+            let h = Self { pid, start };
+            h.is_alive().then_some(h)
+        }
+
+        pub fn is_alive(&self) -> bool {
+            bsdinfo(self.pid).is_some_and(|i| i.pbi_status != SZOMB && started(&i) == self.start)
+        }
+
+        pub async fn wait_exit(&self, deadline: Instant) -> bool {
+            loop {
+                if !self.is_alive() {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(EXIT_POLL.min(deadline - Instant::now())).await;
+            }
+        }
+
+        pub fn kill(&self) {
+            if self.is_alive() {
+                // SAFETY: plain syscall on a pid just confirmed to be this process.
+                unsafe {
+                    libc::kill(self.pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
 }

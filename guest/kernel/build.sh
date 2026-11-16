@@ -3,11 +3,12 @@
 # no initrd), booted with `root=/dev/vda`.
 #
 #   guest/kernel/build.sh [OUT_DIR]        (default: target/guest-kernel)
+#   ARCH=arm64 guest/kernel/build.sh       (default: x86_64; build on a host of that arch)
 #
-# Outputs in OUT_DIR:
-#   bzImage          the kernel (a runtime asset; point the agent's kernel path at it)
+# Outputs in OUT_DIR (IMAGE is bzImage on x86_64, Image on arm64):
+#   IMAGE            the kernel (a runtime asset; point the agent's kernel path at it)
 #   config           the final .config
-#   bzImage.sha256   sha256 of bzImage (the kernel digest pinned in checkpoint manifests)
+#   IMAGE.sha256     sha256 of IMAGE (the kernel digest pinned in checkpoint manifests)
 #   manifest.txt     kernel version, source and fragment digests, final config digest
 #
 # Needs: curl, sha256sum, tar, xz, gcc, make, flex, bison, bc, libelf-dev, libssl-dev.
@@ -22,7 +23,14 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 out="$(realpath -m "${1:-$repo/target/guest-kernel}")"
 cache="${ORBD_KERNEL_CACHE:-$HOME/.cache/orbd-kernel}"
+arch="${ARCH:-x86_64}"
+case "$arch" in
+x86_64) defconfigs=(x86_64_defconfig kvm_guest.config) image=bzImage image_src=arch/x86/boot/bzImage ;;
+arm64) defconfigs=(defconfig) image=Image image_src=arch/arm64/boot/Image ;;
+*) echo "unsupported ARCH=$arch (x86_64 or arm64)" >&2; exit 1 ;;
+esac
 fragment="$here/orbd.config"
+arch_fragment="$here/orbd-$arch.config"
 tarball="$cache/linux-${KERNEL_VERSION}.tar.xz"
 src="$out/build/linux-${KERNEL_VERSION}"
 
@@ -42,9 +50,10 @@ tar -C "$out/build" -xf "$tarball"
 export KBUILD_BUILD_USER=orbd KBUILD_BUILD_HOST=orbd
 export KBUILD_BUILD_TIMESTAMP="1970-01-01 00:00:00 UTC" KBUILD_BUILD_VERSION=1
 
-make -C "$src" -s x86_64_defconfig
-make -C "$src" -s kvm_guest.config
-"$src/scripts/kconfig/merge_config.sh" -m -O "$src" "$src/.config" "$fragment" >/dev/null
+for c in "${defconfigs[@]}"; do
+    make -C "$src" -s "$c"
+done
+"$src/scripts/kconfig/merge_config.sh" -m -O "$src" "$src/.config" "$fragment" "$arch_fragment" >/dev/null
 make -C "$src" -s olddefconfig
 
 # Every option in the fragment must have survived dependency resolution.
@@ -66,23 +75,25 @@ while IFS= read -r line; do
             fi
             ;;
     esac
-done <"$fragment"
+done < <(cat "$fragment" "$arch_fragment")
 [ "$missing" = 0 ] || { echo "config fragment not satisfied" >&2; exit 1; }
 
-make -C "$src" -s -j"$(nproc)" bzImage
+make -C "$src" -s -j"$(nproc)" "$image"
 
-cp "$src/arch/x86/boot/bzImage" "$out/bzImage.tmp"
+cp "$src/$image_src" "$out/$image.tmp"
 cp "$src/.config" "$out/config"
-mv -f "$out/bzImage.tmp" "$out/bzImage"
-kernel_sha="$(sha256sum "$out/bzImage" | cut -d' ' -f1)"
-echo "$kernel_sha  bzImage" >"$out/bzImage.sha256"
+mv -f "$out/$image.tmp" "$out/$image"
+kernel_sha="$(sha256sum "$out/$image" | cut -d' ' -f1)"
+echo "$kernel_sha  $image" >"$out/$image.sha256"
 cat >"$out/manifest.txt" <<EOF
+arch=${arch}
 kernel_version=${KERNEL_VERSION}
 kernel_release=$(make -C "$src" -s kernelrelease)
 source_url=${KERNEL_URL}
 source_sha256=${KERNEL_SHA256}
 fragment_sha256=$(sha256sum "$fragment" | cut -d' ' -f1)
+arch_fragment_sha256=$(sha256sum "$arch_fragment" | cut -d' ' -f1)
 config_sha256=$(sha256sum "$out/config" | cut -d' ' -f1)
-bzImage_sha256=${kernel_sha}
+${image}_sha256=${kernel_sha}
 EOF
 cat "$out/manifest.txt"

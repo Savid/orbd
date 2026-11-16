@@ -50,6 +50,12 @@ const SYMLINKS: &[(&str, &str)] = &[
     // The serial console is a log file on the host; without udev, the getty would hold
     // boot for 90 s waiting for dev-ttyS0.device.
     ("etc/systemd/system/serial-getty@ttyS0.service", "/dev/null"),
+    // The same for arm64's PL011 console (macOS hosts).
+    #[cfg(target_arch = "aarch64")]
+    (
+        "etc/systemd/system/serial-getty@ttyAMA0.service",
+        "/dev/null",
+    ),
 ];
 
 pub const GUEST_HELPER_PATH: &str = "usr/local/sbin/orbd-guest";

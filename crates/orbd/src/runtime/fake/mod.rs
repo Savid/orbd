@@ -108,6 +108,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub struct FakeRuntime {
     state_dir: PathBuf,
     memory_preserving: bool,
+    arch: crate::model::Arch,
     /// Serializes read-modify-write of state files (held only for sync file IO).
     lock: Mutex<()>,
 }
@@ -118,6 +119,7 @@ impl FakeRuntime {
         Self {
             state_dir,
             memory_preserving: config.memory_preserving_sleep,
+            arch: config.arch,
             lock: Mutex::new(()),
         }
     }
@@ -192,6 +194,7 @@ impl Runtime for FakeRuntime {
             nested_kvm: true,
             nested_state_qualified: false,
             project_snapshots: true,
+            arch: self.arch,
         }
     }
 

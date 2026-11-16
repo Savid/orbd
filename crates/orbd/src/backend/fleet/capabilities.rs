@@ -41,6 +41,7 @@ pub fn ceiling(runtime: RuntimeKind) -> BackendCapabilities {
         ),
     };
     BackendCapabilities {
+        arch: None,
         sleep,
         nested_kvm,
         project_snapshots: SnapshotCapability::Supported {
@@ -69,8 +70,10 @@ pub fn for_target(target: &ExecutionTarget) -> Result<BackendCapabilities, Capab
 }
 
 /// Ceiling intersected with the agent's advertised flags. Flags never raise a ceiling.
-pub fn effective(runtime: RuntimeKind, info: &pb::RuntimeInfo) -> BackendCapabilities {
+/// None for a runtime of an architecture this coordinator does not know: it runs nothing.
+pub fn effective(runtime: RuntimeKind, info: &pb::RuntimeInfo) -> Option<BackendCapabilities> {
     let mut caps = ceiling(runtime);
+    caps.arch = Some(crate::model::wire::arch(info.arch).ok()?);
     caps.sleep = match caps.sleep {
         SleepCapability::MemoryPreserving {
             compute,
@@ -99,5 +102,5 @@ pub fn effective(runtime: RuntimeKind, info: &pb::RuntimeInfo) -> BackendCapabil
     if !info.project_snapshots {
         caps.project_snapshots = SnapshotCapability::Unsupported;
     }
-    caps
+    Some(caps)
 }

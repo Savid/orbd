@@ -1,0 +1,39 @@
+;; Seatbelt profile for QEMU on macOS (`sandbox-exec -p`), in place of Linux's seccomp
+;; `-sandbox`. QEMU may run only itself, read its installation, the system and the
+;; kernel and base disk of this orb, and write only the orb's directories. Its user-mode
+;; network reaches TCP and UDP peers but not ICMP or this host (`localhost`).
+;; Paths are resolved (Seatbelt matches real paths); see `launch::spawn`.
+(version 1)
+(deny default)
+
+(allow process-exec (literal (param "QEMU")))
+(allow sysctl-read)
+(allow file-read-metadata)
+(allow file-read*
+  (literal "/")
+  (subpath "/System")
+  (subpath "/usr/lib")
+  (subpath "/opt/homebrew")
+  (subpath "/usr/local")
+  (subpath "/opt/local")
+  (subpath (param "PREFIX"))
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/private/etc/resolv.conf")
+  (literal "/private/var/run/resolv.conf")
+  (subpath "/private/var/db/timezone")
+  (literal (param "KERNEL"))
+  (subpath (param "BASE")))
+(allow file-read* file-write*
+  (literal "/dev/null")
+  (subpath (param "ORB"))
+  (subpath (param "RUN")))
+
+(allow system-socket)
+(allow network-bind network-inbound (local unix-socket (subpath (param "RUN"))))
+(allow network-outbound (remote ip))
+(allow network-inbound (local ip)) ; UDP replies (e.g. DNS)
+(deny network-outbound
+  (remote ip "localhost:*")
+  (socket-protocol 1)  ; ICMP
+  (socket-protocol 58)) ; ICMPv6

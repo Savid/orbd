@@ -2,10 +2,11 @@
 //! orbd's guest integration installed.
 //!
 //! Pipeline (never mounts or executes untrusted guest content on the host):
-//! resolve `ORB_IMAGE` to its linux/amd64 manifest digest → stream blobs into a shared
-//! blob cache (oci-client, one blob at a time into a file) → OCI layout → append the
-//! guest integration layer and unpack as root with a pinned `umoci` → `mkfs.ext4 -d`
-//! into a sparse raw file → publish atomically under `images/<cache key>/`.
+//! resolve `ORB_IMAGE` to its linux/amd64 manifest digest (linux/arm64 on Apple Silicon,
+//! see [`platform_ref`]) → stream blobs into a shared blob cache (oci-client, one blob
+//! at a time into a file) → OCI layout → append the guest integration layer and unpack
+//! as root with a pinned `umoci` → `mkfs.ext4 -d` into a sparse raw file → publish
+//! atomically under `images/<cache key>/`.
 //!
 //! Cache key: platform manifest digest + recipe version + guest integration digest.
 //! A cache miss starts preparation in the background and the caller fails with
@@ -27,6 +28,7 @@ mod registry;
 mod rootfs;
 
 pub use integration::IntegrationLayer;
+pub(crate) use rootfs::DOCKER_RUN;
 pub use rootfs::UMOCI_VERSION;
 
 use crate::config::agent::ImagesConfig;
@@ -52,7 +54,7 @@ pub struct PreparedImage {
     pub key: String,
     /// The image reference as Amp gave it (e.g. `...amp-orb:latest`).
     pub image_ref: String,
-    /// Resolved linux/amd64 manifest digest (`sha256:...`).
+    /// Resolved linux/amd64 (or arm64) manifest digest (`sha256:...`).
     pub manifest_digest: String,
     /// Raw ext4 file with the root filesystem (read-only once published).
     pub rootfs: PathBuf,
@@ -138,6 +140,25 @@ fn idle_for(path: &Path, last: std::io::Result<SystemTime>, idle: Duration) -> b
     }
 }
 
+/// The reference this agent prepares for `image_ref`. Amp publishes its arm64 orb image
+/// as a repository of its own (`amp-orb-arm64`), not as a platform of `amp-orb`'s index,
+/// so on arm64 hosts a tag of `amp-orb` (what Amp sends as `ORB_IMAGE`) becomes the same
+/// tag of `amp-orb-arm64`. Everything else, and every digest reference, is used as given.
+pub fn platform_ref(image_ref: &str) -> std::borrow::Cow<'_, str> {
+    let repo = crate::config::agent::AMP_ORB_IMAGE
+        .rsplit_once(':')
+        .map_or("", |(repo, _)| repo);
+    match image_ref.strip_prefix(repo) {
+        Some(tag)
+            if crate::model::Arch::HOST == crate::model::Arch::Arm64
+                && (tag.is_empty() || tag.starts_with(':') && !tag.contains('@')) =>
+        {
+            format!("{repo}-arm64{tag}").into()
+        }
+        _ => image_ref.into(),
+    }
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
@@ -217,6 +238,7 @@ impl ImageStore {
     /// the progress of) background preparation and returns `NotReady`; after a failed
     /// attempt returns `Failed` until the retry delay has passed.
     pub fn get(&self, image_ref: &str) -> Result<PreparedImage, ImageError> {
+        let image_ref = &*platform_ref(image_ref);
         let record = self.read_ref(image_ref);
         let ready = record
             .as_ref()
@@ -241,6 +263,7 @@ impl ImageStore {
     ///
     /// [`get`]: Self::get
     pub async fn prepare(&self, image_ref: &str) -> Result<PreparedImage, ImageError> {
+        let image_ref = &*platform_ref(image_ref);
         let status = Arc::new(Mutex::new(String::new()));
         self.prepare_inner(image_ref, &status)
             .await
@@ -321,7 +344,7 @@ impl ImageStore {
             .config
             .prewarm
             .iter()
-            .filter_map(|r| self.read_ref(r))
+            .filter_map(|r| self.read_ref(&platform_ref(r)))
             .map(|r| self.cache_key(&r.manifest_digest))
             .collect();
         let mut trashed = Vec::new();
@@ -453,8 +476,9 @@ impl ImageStore {
         let tools = rootfs::Tools {
             umoci: self.inner.config.umoci.clone(),
             mkfs_ext4: self.inner.config.mkfs_ext4.clone(),
+            builder: self.inner.config.builder.clone(),
         };
-        rootfs::umoci_version(&tools.umoci).await?;
+        rootfs::umoci_version(&tools).await?;
         let total = resolved.compressed_bytes();
         self.check_space(total)?;
 
@@ -475,6 +499,8 @@ impl ImageStore {
                 )),
             }
         }
+
+        check_arch(&self.inner.blobs, resolved)?;
 
         let work = self
             .inner
@@ -546,6 +572,25 @@ impl ImageStore {
         }
         Ok(())
     }
+}
+
+/// The image's config must name this host's architecture: a single-platform manifest
+/// carries no platform until its config is read, and a foreign one would not boot.
+fn check_arch(blobs: &registry::BlobCache, resolved: &registry::Resolved) -> Result<(), String> {
+    let path = blobs.path(&resolved.manifest.config.digest)?;
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?,
+    )
+    .map_err(|e| format!("image config: {e}"))?;
+    let arch = config["architecture"].as_str().unwrap_or("unknown");
+    if arch != registry::IMAGE_ARCH {
+        return Err(format!(
+            "{} is a linux/{arch} image; this agent runs linux/{} orbs",
+            resolved.reference.whole(),
+            registry::IMAGE_ARCH
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

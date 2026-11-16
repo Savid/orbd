@@ -108,6 +108,8 @@ pub struct IdleCost {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendCapabilities {
+    /// Architecture of the host's orbs; None for any (a ceiling, before a host reports).
+    pub arch: Option<super::Arch>,
     pub sleep: SleepCapability,
     pub nested_kvm: Support,
     pub project_snapshots: SnapshotCapability,
@@ -131,6 +133,8 @@ pub enum CapabilityMismatch {
     ProjectSnapshots(SnapshotScope),
     #[error("execution profile cannot pause orbs")]
     NoSleep,
+    #[error("offering runs {0} orbs; this host runs {1}")]
+    Arch(&'static str, &'static str),
 }
 
 impl BackendCapabilities {
@@ -142,7 +146,13 @@ impl BackendCapabilities {
             release_compute_when_paused,
             nested_kvm,
             project_snapshots,
+            arch,
         } = spec.requirements;
+        if let Some(host) = self.arch
+            && host != arch
+        {
+            out.push(CapabilityMismatch::Arch(arch.as_str(), host.as_str()));
+        }
 
         let (compute, nested_state) = match (self.sleep, spec.pause_policy) {
             (SleepCapability::Unsupported, _) => {

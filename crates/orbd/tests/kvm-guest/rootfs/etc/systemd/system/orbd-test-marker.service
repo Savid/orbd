@@ -3,7 +3,7 @@ Description=orbd test: disk identity marker
 
 [Service]
 ExecStart=/usr/local/bin/orbd-test-marker
-StandardOutput=file:/dev/ttyS0
+StandardOutput=file:/dev/console
 
 [Install]
 WantedBy=multi-user.target

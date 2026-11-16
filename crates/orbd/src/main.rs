@@ -51,13 +51,13 @@ enum Command {
     Orb(OrbCommand),
     /// Handle one Amp dispatch job from the environment (run by `amp orb provider`).
     Dispatch,
-    /// Check host prerequisites (QEMU, /dev/kvm, guest kernel, umoci, mkfs.ext4).
+    /// Check host prerequisites (QEMU, KVM or Hypervisor.framework, guest kernel, image tools).
     Doctor {
         /// Agent config to take tool and asset paths from.
         #[arg(long, short, env = "ORBD_AGENT_CONFIG")]
         config: Option<PathBuf>,
-        /// Guest kernel (bzImage) to check [default: runtime.qemu.kernel, else
-        /// /usr/share/orbd/bzImage].
+        /// Guest kernel (bzImage, or arm64 Image) to check [default: runtime.qemu.kernel,
+        /// else /usr/share/orbd/bzImage; on macOS /usr/local/share/orbd/Image].
         #[arg(long)]
         kernel: Option<PathBuf>,
     },

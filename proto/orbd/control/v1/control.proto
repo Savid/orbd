@@ -129,6 +129,14 @@ message OrbSpec {
   InitialDiskSource initial_disk = 6;
   bool release_compute_when_paused = 7;
   SnapshotScope required_snapshot_scope = 8;  // UNSPECIFIED = not required
+  Arch arch = 9;
+}
+
+// CPU architecture of an orb or a host. UNSPECIFIED (older peers) is amd64.
+enum Arch {
+  ARCH_UNSPECIFIED = 0;
+  ARCH_AMD64 = 1;
+  ARCH_ARM64 = 2;
 }
 
 enum SnapshotScope {
@@ -392,6 +400,7 @@ message RuntimeInfo {
   bool nested_kvm = 4;
   bool nested_state_qualified = 5;
   bool project_snapshots = 6;
+  Arch arch = 7;                    // of the host's orbs
 }
 
 message Hello {

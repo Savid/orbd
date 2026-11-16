@@ -29,15 +29,25 @@ jobs:
         with:
           pattern: orbd-*
           path: artifacts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: guest-kernel-arm64
+          path: artifacts/guest-kernel-arm64
       - name: Package
         run: |
           mkdir dist
           for dir in artifacts/orbd-*; do
             name=$(basename "$dir")
-            bin=orbd; case "$name" in orbd-guest-*) bin=orbd-guest ;; esac
+            case "$name" in
+              orbd-guest-*) bin=orbd-guest ;;
+              orbd-netgroup-*) bin=orbd-netgroup ;;
+              *) bin=orbd ;;
+            esac
             target=${name#"$bin"-}
             install -m 0755 "$dir/$bin" "dist/$bin-$GITHUB_REF_NAME-$target"
           done
+          # The arm64 guest kernel, for macOS agents (the x86_64 one ships in the image).
+          install -m 0644 artifacts/guest-kernel-arm64/Image "dist/orbd-kernel-$GITHUB_REF_NAME-arm64.Image"
           cd dist && sha256sum orbd-* > SHA256SUMS && cat SHA256SUMS
       - name: Publish
         env:

@@ -6,6 +6,9 @@
 //!   (agents dialling the coordinator over gRPC).
 //! * [`agent`] executes commands on a host with a [`runtime::Runtime`].
 
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+compile_error!("orbd runs on macOS only on Apple Silicon (Hypervisor.framework, arm64 guests)");
+
 pub mod agent;
 pub mod amp;
 pub mod backend;

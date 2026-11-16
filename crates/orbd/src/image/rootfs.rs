@@ -2,6 +2,11 @@
 //! as root (ownership, modes, xattrs and device nodes preserved), `mkfs.ext4 -d` into a
 //! sparse file. Guest content is only ever read by these tools: nothing is mounted or
 //! executed on the host.
+//!
+//! With a builder image (macOS, which has neither umoci nor a filesystem that keeps
+//! Linux ownership and device nodes) the same steps run in one `docker run` of that
+//! image: the rootfs is unpacked inside the container and only the work directory
+//! (layout, integration layer, output file) is shared with the host.
 
 use super::integration::IntegrationLayer;
 use super::registry::{BlobCache, Resolved};
@@ -20,6 +25,60 @@ const MIB: u64 = 1 << 20;
 pub struct Tools {
     pub umoci: PathBuf,
     pub mkfs_ext4: PathBuf,
+    /// Docker image with umoci, e2fsprogs and GNU coreutils; set, every step runs in it.
+    pub builder: Option<String>,
+}
+
+/// The pipeline inside a builder container: `$1` work dir, `$2` OCI layout, `$3` output.
+/// Sizing is [`sizing`]'s (a test checks they agree). The last stdout line is
+/// `size <bytes>`.
+const BUILDER_SCRIPT: &str = r#"set -euo pipefail
+work=$1 layout=$2 out=$3
+umoci raw add-layer --image "$layout:base" --tag orbd --no-history "$work/integration.tar"
+umoci raw unpack --image "$layout:orbd" /rootfs
+used=$(du -s -x --block-size=1 /rootfs | cut -f1)
+files=$(du -s -x --inodes /rootfs | cut -f1)
+inodes=$(( files * 2 > used / 16384 ? files * 2 : used / 16384 ))
+mib=$((1 << 20))
+size=$(( (used + used / 5 + inodes * 256 + 512 * mib + 64 * mib - 1) / (64 * mib) * 64 * mib ))
+truncate -s "$size" "$out"
+mkfs.ext4 -q -F -t ext4 -L orbd-root -N "$inodes" -E nodiscard -d /rootfs "$out" "$((size / 1024))k"
+echo "size $size"
+"#;
+
+/// `docker run` of the local builder image (never pulled), without network.
+pub(crate) const DOCKER_RUN: [&str; 5] = ["run", "--rm", "--pull=never", "--network", "none"];
+
+/// Inodes and size in bytes of the ext4 image for `used` bytes in `files` files: room for
+/// metadata, the journal and first-boot writes before the guest grows the filesystem to
+/// the orb's disk size. Inode density follows the image, with the default 16 KiB/inode
+/// ratio as a floor so a grown disk keeps enough inodes.
+fn sizing(used: u64, files: u64) -> (u64, u64) {
+    let inodes = (files * 2).max(used / 16384);
+    let size = (used + used / 5 + inodes * 256 + 512 * MIB).div_ceil(64 * MIB) * 64 * MIB;
+    (inodes, size)
+}
+
+/// Removes the named builder container when dropped before [`Self::done`]: killing
+/// `docker run` (a cancelled or timed-out build) leaves its container running.
+struct Container(Option<String>);
+
+impl Container {
+    fn done(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Container {
+    fn drop(&mut self) {
+        if let Some(name) = &self.0 {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 
 /// Runs a tool, as root via `sudo -n` when orbd itself is not root (development hosts;
@@ -65,9 +124,26 @@ async fn run(privileged: bool, program: &Path, args: &[&OsStr]) -> Result<String
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// The pinned umoci version, or why the configured binary is not usable.
-pub async fn umoci_version(umoci: &Path) -> Result<String, String> {
-    let out = run(false, umoci, &[OsStr::new("--version")]).await?;
+/// The pinned umoci version, or why the configured binary (or the builder's) is not
+/// usable.
+pub async fn umoci_version(tools: &Tools) -> Result<String, String> {
+    let (out, umoci) = match &tools.builder {
+        Some(builder) => {
+            let args: Vec<&OsStr> = DOCKER_RUN
+                .into_iter()
+                .chain([builder.as_str(), "umoci", "--version"])
+                .map(OsStr::new)
+                .collect();
+            (
+                run(false, Path::new("docker"), &args).await?,
+                builder.clone(),
+            )
+        }
+        None => (
+            run(false, &tools.umoci, &[OsStr::new("--version")]).await?,
+            tools.umoci.display().to_string(),
+        ),
+    };
     let version = out
         .lines()
         .next()
@@ -77,8 +153,7 @@ pub async fn umoci_version(umoci: &Path) -> Result<String, String> {
         .to_owned();
     if version != UMOCI_VERSION {
         return Err(format!(
-            "{} is umoci {version:?}; orbd needs umoci {UMOCI_VERSION}",
-            umoci.display()
+            "{umoci} is umoci {version:?}; orbd needs umoci {UMOCI_VERSION}"
         ));
     }
     Ok(version)
@@ -123,6 +198,30 @@ pub async fn build(
 ) -> Result<u64, String> {
     let layer = work.join("integration.tar");
     std::fs::write(&layer, &integration.tar).map_err(|e| e.to_string())?;
+    if let Some(builder) = &tools.builder {
+        status(&format!("unpacking layers and building ext4 in {builder}"));
+        // The work dir is unique per build; it is shared at the same path.
+        let name = format!(
+            "orbd-build-{}",
+            work.file_name().unwrap_or_default().display()
+        );
+        let mut volume = work.as_os_str().to_owned();
+        volume.push(":");
+        volume.push(work.as_os_str());
+        let mut args: Vec<std::ffi::OsString> = DOCKER_RUN.iter().map(Into::into).collect();
+        args.extend(["--name".into(), name.clone().into(), "-v".into(), volume]);
+        args.extend([builder, "bash", "-c", BUILDER_SCRIPT, "build"].map(Into::into));
+        args.extend([work, layout, out].map(|p| p.as_os_str().to_owned()));
+        let args: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+        let container = Container(Some(name));
+        let stdout = run(false, Path::new("docker"), &args).await?;
+        container.done();
+        return stdout
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("size ")?.trim().parse().ok())
+            .ok_or_else(|| format!("builder printed no size: {stdout:?}"));
+    }
     let base = format!("{}:{BASE_TAG}", layout.display());
     status("adding guest integration layer");
     run(
@@ -180,11 +279,7 @@ pub async fn build(
     };
     let used = du("--block-size=1").await?;
     let files = du("--inodes").await?;
-    // Room for metadata, the journal and first-boot writes before the guest grows the
-    // filesystem to the orb's disk size. Inode density follows the image, with the
-    // default 16 KiB/inode ratio as a floor so a grown disk keeps enough inodes.
-    let inodes = (files * 2).max(used / 16384);
-    let size = (used + used / 5 + inodes * 256 + 512 * MIB).div_ceil(64 * MIB) * 64 * MIB;
+    let (inodes, size) = sizing(used, files);
 
     status(&format!(
         "building ext4 ({} MiB of files, {files} inodes, {} MiB image)",
@@ -226,6 +321,10 @@ pub async fn remove_tree(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
+    // Nothing root-owned lands on macOS hosts (rootfs unpacking runs in the builder).
+    if cfg!(not(target_os = "linux")) {
+        return std::fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()));
+    }
     run(
         true,
         Path::new("rm"),
@@ -237,4 +336,38 @@ pub async fn remove_tree(path: &Path) -> Result<(), String> {
     )
     .await
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The builder container sizes images with `BUILDER_SCRIPT`'s shell arithmetic, which
+    /// must stay [`sizing`].
+    #[test]
+    fn builder_script_sizes_like_sizing() {
+        let arith: Vec<&str> = BUILDER_SCRIPT
+            .lines()
+            .filter(|l| {
+                ["inodes=", "mib=", "size="]
+                    .iter()
+                    .any(|p| l.starts_with(p))
+            })
+            .collect();
+        for (used, files) in [(4_700_000_000, 160_000), (300 << 20, 9_000)] {
+            let script = format!(
+                "used={used} files={files}\n{}\necho $inodes $size",
+                arith.join("\n")
+            );
+            let out = std::process::Command::new("bash")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            let (inodes, size) = sizing(used, files);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).trim(),
+                format!("{inodes} {size}")
+            );
+        }
+    }
 }

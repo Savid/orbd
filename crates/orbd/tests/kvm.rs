@@ -14,6 +14,11 @@
 //! console. A memory restore must continue both sequences: a counter that restarts means
 //! processes were lost, one that repeats or goes back means stale RAM was replayed.
 //! Firecracker orbs have no `/dev/kvm`, so there the nested guest must not run at all.
+//!
+//! On an Apple Silicon Mac (QEMU with Hypervisor.framework; arm64 orbs, no `/dev/kvm`)
+//! run as your user with `ORBD_KVM_NESTED=0 TMPDIR=/tmp` (the default temp dir makes
+//! socket paths too long), an arm64 `Image` and a rootfs from `ARCH=arm64
+//! build-rootfs.sh` (built in a privileged linux/arm64 container).
 #![cfg(feature = "failpoints")]
 
 mod common;
@@ -75,6 +80,7 @@ fn state(c: &Cluster) -> PathBuf {
 }
 
 /// VMM processes (QEMU, Firecracker) whose arguments point into `root`.
+#[cfg(target_os = "linux")]
 fn vmm_pids(root: &std::path::Path) -> Vec<i32> {
     let needle = root.display().to_string();
     let mut pids = Vec::new();
@@ -93,6 +99,24 @@ fn vmm_pids(root: &std::path::Path) -> Vec<i32> {
         }
     }
     pids
+}
+
+/// VMM processes (QEMU) whose arguments point into `root`.
+#[cfg(not(target_os = "linux"))]
+fn vmm_pids(root: &std::path::Path) -> Vec<i32> {
+    let needle = root.display().to_string();
+    let out = std::process::Command::new("ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let (pid, cmd) = l.trim().split_once(' ')?;
+            let vmm = cmd.split(' ').next()?.ends_with("qemu-system-aarch64");
+            (vmm && cmd.contains(&needle)).then(|| pid.parse().ok())?
+        })
+        .collect()
 }
 
 /// The cluster's orb directories, oldest orb first (orb ids are time-ordered).
@@ -518,10 +542,11 @@ fn graceful_agent_restart_keeps_running_orbs() {
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn after restore");
     assert_continuous(&orbs[0]);
 
-    // Drain cut short: the first save is slowed down, the agent is killed mid-save and
-    // every VMM dies with it.
+    // Drain cut short: the first save is slowed down (1 MiB/s, so it is still running
+    // after 5 s however little memory the guest touched), the agent is killed mid-save
+    // and every VMM dies with it.
     c.terminate_agent("agent-a", Duration::from_secs(300));
-    start_again(&mut c, &point("save::throttle=return(8)"));
+    start_again(&mut c, &point("save::throttle=return(1)"));
     assert_eq!(vmm_pids(c.root()).len(), 2);
     c.signal_agent("agent-a", "TERM");
     std::thread::sleep(Duration::from_secs(5));

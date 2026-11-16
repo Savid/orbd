@@ -4,7 +4,7 @@ ConditionKernelCommandLine=orbd.blob
 
 [Service]
 ExecStart=/usr/local/bin/orbd-test-blob
-StandardOutput=file:/dev/ttyS0
+StandardOutput=file:/dev/console
 
 [Install]
 WantedBy=multi-user.target

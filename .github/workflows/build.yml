@@ -1,4 +1,5 @@
-# Static musl release binaries and the guest kernel, shared by ci.yml and release.yml.
+# Release binaries (static musl, and macOS) and the guest kernels, shared by ci.yml and
+# release.yml.
 name: build
 
 on:
@@ -45,43 +46,76 @@ jobs:
       - run: cargo zigbuild --locked --release -p orbd --target ${{ matrix.target }} $PR_PROFILE
         env:
           PR_PROFILE: ${{ github.event_name == 'pull_request' && '--config profile.release.package.orbd.codegen-units=16 --config profile.release.package.orbd-proto.codegen-units=16' || '' }}
-      - name: Check binary is static and runs
+      # The guest helper runs inside orb VMs: x86_64 ones, and arm64 ones on macOS agents.
+      - name: Build orbd-guest
+        run: cargo zigbuild --locked --release -p orbd-guest --target ${{ matrix.target }}
+      - name: Check binaries are static and run
         run: |
-          bin=target/${{ matrix.target }}/release/orbd
-          file "$bin"
-          file "$bin" | grep -Eq 'statically linked|static-pie linked'
           if [ "${{ matrix.target }}" = aarch64-unknown-linux-musl ]; then
             sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
-            qemu-aarch64-static "$bin" --version
-          else
-            "$bin" --version
+            run=qemu-aarch64-static
           fi
+          for bin in orbd orbd-guest; do
+            bin=target/${{ matrix.target }}/release/$bin
+            file "$bin"
+            file "$bin" | grep -Eq 'statically linked|static-pie linked'
+            $run "$bin" --version
+          done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: orbd-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/orbd
           if-no-files-found: error
           retention-days: 14
-      # The guest helper runs inside x86_64 orb VMs only.
-      - if: matrix.target == 'x86_64-unknown-linux-musl'
-        name: Build orbd-guest
-        run: |
-          cargo zigbuild --locked --release -p orbd-guest --target ${{ matrix.target }}
-          bin=target/${{ matrix.target }}/release/orbd-guest
-          file "$bin" | grep -Eq 'statically linked|static-pie linked'
-          "$bin" --version
-      - if: matrix.target == 'x86_64-unknown-linux-musl'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: orbd-guest-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/orbd-guest
           if-no-files-found: error
           retention-days: 14
 
-  # QEMU guest kernel for the container image; ~10 min to build, so cached on its inputs.
-  guest-kernel:
-    runs-on: ubuntu-24.04
+  # macOS agents (Apple Silicon): orbd, and orbd-netgroup for runtime.qemu.network_group.
+  darwin:
+    runs-on: macos-15
     timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --locked --release -p orbd $PR_PROFILE
+        env:
+          PR_PROFILE: ${{ github.event_name == 'pull_request' && '--config profile.release.package.orbd.codegen-units=16 --config profile.release.package.orbd-proto.codegen-units=16' || '' }}
+      - run: target/release/orbd --version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: orbd-aarch64-apple-darwin
+          path: target/release/orbd
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: orbd-netgroup-aarch64-apple-darwin
+          path: target/release/orbd-netgroup
+          if-no-files-found: error
+          retention-days: 14
+
+  # QEMU guest kernels: bzImage for the container image, Image for macOS agents. ~10 min
+  # to build, so cached on their inputs.
+  guest-kernel:
+    name: guest-kernel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, image: bzImage, artifact: guest-kernel }
+          - { arch: arm64, runner: ubuntu-24.04-arm, image: Image, artifact: guest-kernel-arm64 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,17 +124,17 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            target/guest-kernel/bzImage
+            target/guest-kernel/${{ matrix.image }}
             target/guest-kernel/manifest.txt
-          key: guest-kernel-${{ hashFiles('guest/kernel/build.sh', 'guest/kernel/orbd.config') }}
+          key: guest-kernel-${{ matrix.arch }}-${{ hashFiles('guest/kernel/build.sh', 'guest/kernel/orbd.config', format('guest/kernel/orbd-{0}.config', matrix.arch)) }}
       - if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq flex bison bc libelf-dev libssl-dev
-          guest/kernel/build.sh
+          ARCH=${{ matrix.arch }} guest/kernel/build.sh
       - run: cat target/guest-kernel/manifest.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: guest-kernel
-          path: target/guest-kernel/bzImage
+          name: ${{ matrix.artifact }}
+          path: target/guest-kernel/${{ matrix.image }}
           if-no-files-found: error
           retention-days: 14

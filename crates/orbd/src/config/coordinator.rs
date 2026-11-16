@@ -22,9 +22,9 @@
 
 use super::{ConfigError, ResourcesConfig, load_yaml};
 use crate::model::{
-    AmpEndpointId, BackendId, BackendProfileId, CapabilityRequirements, CheckpointFailurePolicy,
-    ExecutionTarget, NestedKvmRequirement, Offering, OfferingId, PausePolicy, RuntimeKind,
-    SnapshotRequirement, SpecTemplate,
+    AmpEndpointId, Arch, BackendId, BackendProfileId, CapabilityRequirements,
+    CheckpointFailurePolicy, ExecutionTarget, NestedKvmRequirement, Offering, OfferingId,
+    PausePolicy, RuntimeKind, SnapshotRequirement, SpecTemplate,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -152,6 +152,30 @@ pub struct OrbTypeConfig {
     /// `/dev/kvm` in the orb: runs only in QEMU on the agents.
     #[serde(default)]
     pub kvm: bool,
+    /// CPU architectures a new orb may get, in order: `amd64` (the default), `arm64`,
+    /// or a list such as `[amd64, arm64]`. An orb keeps the one it was placed with for
+    /// life. arm64 orbs run on arm64 agents (Apple Silicon Macs) in QEMU, without kvm;
+    /// Amp's amp-orb image becomes amp-orb-arm64 there.
+    #[serde(default = "default_archs", deserialize_with = "one_or_many")]
+    pub arch: Vec<Arch>,
+}
+
+fn default_archs() -> Vec<Arch> {
+    vec![Arch::Amd64]
+}
+
+/// `arch: arm64` or `arch: [amd64, arm64]`.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Arch>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(Arch),
+        Many(Vec<Arch>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(a) => vec![a],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 /// One Amp orb provider with orb types. Each orb type in Amp is named after the
@@ -306,15 +330,21 @@ pub struct OfferingConfig {
     pub resources: ResourcesConfig,
     /// Offerings that take a new orb, in order, when no host of this one can. Each must
     /// be like-for-like: `/dev/kvm` in the orb on both or neither, and at least these
-    /// vCPUs and memory. Spill targets' own spill_to lists are not followed.
+    /// vCPUs and memory. The architecture may differ: the orb gets the one it is placed
+    /// with. Spill targets' own spill_to lists are not followed.
     #[serde(default)]
     pub spill_to: Vec<OfferingId>,
+    /// CPU architecture of the orbs (default amd64); only agents of that architecture
+    /// take them. arm64 orbs run in QEMU, without `/dev/kvm`.
+    #[serde(default)]
+    pub arch: Arch,
 }
 
 impl OfferingConfig {
     /// Pause policy and requirements are what the runtime is for: VM runtimes keep
-    /// memory across sleep (falling back to a cold stop) and QEMU gives orbs `/dev/kvm`;
-    /// Docker and Boat sleep to disk. Every runtime releases compute while paused.
+    /// memory across sleep (falling back to a cold stop) and QEMU gives amd64 orbs
+    /// `/dev/kvm`; Docker and Boat sleep to disk. Every runtime releases compute while
+    /// paused.
     pub fn to_offering(&self) -> Result<Offering, ConfigError> {
         let pause_policy = match self.runtime {
             OfferingRuntime::Docker | OfferingRuntime::Boat => PausePolicy::DiskOnly,
@@ -324,8 +354,16 @@ impl OfferingConfig {
                 }
             }
         };
+        let arm64 = self.arch == Arch::Arm64;
+        if arm64 && !matches!(self.runtime, OfferingRuntime::Qemu | OfferingRuntime::Fake) {
+            return Err(ConfigError::Invalid(format!(
+                "offering {}: arm64 orbs run in QEMU (runtime: qemu)",
+                self.id
+            )));
+        }
+        // Hypervisor.framework does not nest: arm64 orbs get no /dev/kvm.
         let nested_kvm = match self.runtime {
-            OfferingRuntime::Qemu => NestedKvmRequirement::GuestDevice,
+            OfferingRuntime::Qemu if !arm64 => NestedKvmRequirement::GuestDevice,
             _ => NestedKvmRequirement::NotRequired,
         };
         let (backend, target) = match self.runtime.fleet() {
@@ -362,6 +400,7 @@ impl OfferingConfig {
                     release_compute_when_paused: true,
                     nested_kvm,
                     project_snapshots: SnapshotRequirement::NotRequired,
+                    arch: self.arch,
                 },
                 pause_policy,
             },
@@ -371,7 +410,8 @@ impl OfferingConfig {
 
 /// Why an orb of `from` cannot run as `to`, or None if `to` is like-for-like: `/dev/kvm`
 /// in the orb on both or neither, and at least as much compute. Sleep may differ: an
-/// orb spilled to Boat keeps its disk across a pause but not its processes.
+/// orb spilled to Boat keeps its disk across a pause but not its processes. So may the
+/// architecture: a new orb has none yet.
 fn unlike(from: &SpecTemplate, to: &SpecTemplate) -> Option<String> {
     let kvm = |s: &SpecTemplate| s.requirements.nested_kvm != NestedKvmRequirement::NotRequired;
     let (a, b) = (from.resources, to.resources);
@@ -403,10 +443,11 @@ impl CoordinatorConfig {
     }
 
     /// Turns a v2 file into v1 offerings and providers. Each orb type becomes an
-    /// offering with its id on the first place `prefer` allows, spilling to the others
-    /// (hidden offerings `<id>@<runtime>`). An orb records the orb type it was created
-    /// as, wherever it was placed. The provider and each retired token serve every orb
-    /// type.
+    /// offering with its id on the first place `prefer` and its `arch` list allow,
+    /// spilling to the others (hidden offerings `<id>@<runtime>`, `<id>@arm64`).
+    /// Within a place, archs go in the orb type's order. An orb records the orb type it
+    /// was created as, wherever it was placed. The provider and each retired token serve
+    /// every orb type.
     pub fn normalize(&mut self) -> Result<(), ConfigError> {
         let inv = |m: &str| Err(ConfigError::Invalid(m.into()));
         if self.config_version == ConfigVersion::V1 {
@@ -439,31 +480,51 @@ impl CoordinatorConfig {
             None => vec![Prefer::Local, Prefer::Boat],
         };
         for t in &self.orb_types {
+            let bad = |m: &str| Err(ConfigError::Invalid(format!("orb type {}: {m}", t.id)));
+            let archs = &t.arch;
+            if archs.is_empty()
+                || archs
+                    .iter()
+                    .enumerate()
+                    .any(|(i, a)| archs[..i].contains(a))
+            {
+                return bad("arch lists amd64 and arm64, each at most once");
+            }
+            if t.kvm && archs.contains(&Arch::Arm64) {
+                return bad("kvm orbs are amd64 only (Apple Silicon does not nest)");
+            }
+            // Boat runs amd64 orbs without kvm, in its own sizes.
             let boat = !t.kvm
+                && archs.contains(&Arch::Amd64)
                 && self.boat.is_some()
                 && crate::backend::boat::size_for(t.vcpus, t.memory_mib).is_some();
-            let runtimes: Vec<OfferingRuntime> = prefer
-                .iter()
-                .filter_map(|p| match p {
-                    Prefer::Local if t.kvm => Some(OfferingRuntime::Qemu),
-                    Prefer::Local => Some(OfferingRuntime::Firecracker),
-                    Prefer::Boat => boat.then_some(OfferingRuntime::Boat),
-                })
-                .collect();
-            if runtimes.is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "orb type {}: nowhere in prefer can run it (Boat runs no kvm and only {})",
-                    t.id,
-                    crate::backend::boat::describe_sizes()
-                )));
-            }
-            let id = |i: usize, r: OfferingRuntime| match i {
-                0 => t.id.clone(),
-                _ => OfferingId::new(format!("{}@{}", t.id, r.as_str())),
+            // On the agents: kvm and arm64 orbs in QEMU, other amd64 orbs in Firecracker.
+            let local = |a: Arch| match a {
+                Arch::Amd64 if !t.kvm => OfferingRuntime::Firecracker,
+                _ => OfferingRuntime::Qemu,
             };
-            for (i, &runtime) in runtimes.iter().enumerate() {
+            let mut places: Vec<(OfferingRuntime, Arch)> = Vec::new();
+            for p in &prefer {
+                match p {
+                    Prefer::Local => places.extend(archs.iter().map(|&a| (local(a), a))),
+                    Prefer::Boat if boat => places.push((OfferingRuntime::Boat, Arch::Amd64)),
+                    Prefer::Boat => {}
+                }
+            }
+            if places.is_empty() {
+                return bad(&format!(
+                    "nowhere in prefer can run it (Boat runs no kvm, no arm64 and only {})",
+                    crate::backend::boat::describe_sizes()
+                ));
+            }
+            let id = |i: usize, (r, a): (OfferingRuntime, Arch)| match (i, a) {
+                (0, _) => t.id.clone(),
+                (_, Arch::Amd64) => OfferingId::new(format!("{}@{}", t.id, r.as_str())),
+                _ => OfferingId::new(format!("{}@{}", t.id, a.as_str())),
+            };
+            for (i, &(runtime, arch)) in places.iter().enumerate() {
                 self.offerings.push(OfferingConfig {
-                    id: id(i, runtime),
+                    id: id(i, (runtime, arch)),
                     provider_token_file: None,
                     runtime,
                     resources: ResourcesConfig {
@@ -472,14 +533,15 @@ impl CoordinatorConfig {
                         disk_gib: t.disk_gib,
                     },
                     spill_to: match i {
-                        0 => runtimes
+                        0 => places
                             .iter()
                             .enumerate()
                             .skip(1)
-                            .map(|(j, &r)| id(j, r))
+                            .map(|(j, &p)| id(j, p))
                             .collect(),
                         _ => vec![],
                     },
+                    arch,
                 });
             }
         }
@@ -666,6 +728,7 @@ mod tests {
                 disk_gib: 20,
             },
             spill_to: vec![],
+            arch: Arch::Amd64,
         }
         .to_offering()
         .unwrap()
@@ -794,6 +857,60 @@ mod tests {
         let c = load_str(&yaml).unwrap();
         assert_eq!(c.offerings[0].runtime, Firecracker);
         assert_eq!(c.offerings[0].spill_to, [OfferingId::new("small@boat")]);
+    }
+
+    /// `arch` lists the architectures a new orb may get, in order: arm64 in QEMU without
+    /// kvm, amd64 as before, Boat (amd64 only) after the agents. amd64 specs serialize
+    /// as before (no `arch` key), so recorded orbs keep their digests.
+    #[test]
+    fn v2_orb_type_archs() {
+        let yaml = format!(
+            "{V2}orb_types:\n\
+             \x20 - {{ id: small, vcpus: 2, memory_mib: 4096, disk_gib: 20, arch: [amd64, arm64] }}\n\
+             \x20 - {{ id: mac, vcpus: 2, memory_mib: 4096, disk_gib: 20, arch: arm64 }}\n"
+        );
+        let c = load_str(&yaml).unwrap();
+        let got: Vec<_> = c
+            .offerings
+            .iter()
+            .map(|o| {
+                let spill: Vec<_> = o.spill_to.iter().map(|s| s.as_str()).collect();
+                (o.id.as_str(), o.runtime, o.arch, spill)
+            })
+            .collect();
+        use {Arch::*, OfferingRuntime::*};
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "small",
+                    Firecracker,
+                    Amd64,
+                    vec!["small@arm64", "small@boat"]
+                ),
+                ("small@arm64", Qemu, Arm64, vec![]),
+                ("small@boat", Boat, Amd64, vec![]),
+                ("mac", Qemu, Arm64, vec![]),
+            ]
+        );
+        let req = |id: &str| {
+            c.offering(id)
+                .unwrap()
+                .to_offering()
+                .unwrap()
+                .spec
+                .requirements
+        };
+        assert_eq!(req("mac").nested_kvm, NestedKvmRequirement::NotRequired);
+        let json = serde_json::to_string(&req("small")).unwrap();
+        assert!(!json.contains("arch"), "{json}");
+
+        for bad in ["[]", "[arm64, arm64]", "x86", "arm64, kvm: true"] {
+            let yaml = format!(
+                "{V2}orb_types:\n  - {{ id: a, vcpus: 2, memory_mib: 4096, disk_gib: 20, arch: {bad} }}\n"
+            );
+            assert!(load_str(&yaml).is_err(), "{bad}");
+        }
     }
 
     #[test]

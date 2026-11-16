@@ -1,5 +1,7 @@
-//! QEMU runtime: one q35 KVM VM per orb with nested `/dev/kvm` and memory-preserving
-//! sleep.
+//! QEMU runtime: one VM per orb with memory-preserving sleep. On Linux a q35 KVM VM with
+//! nested `/dev/kvm`; on Apple Silicon Macs a `virt` VM under Hypervisor.framework (HVF),
+//! whose saved memory is a plain file (no keychain), so orbs restore while the Mac is
+//! locked.
 //!
 //! Storage (per the agent layout):
 //!
@@ -66,7 +68,7 @@ use crate::model::{
 use async_trait::async_trait;
 use orbd_qemu::launch::{self, DEFAULT_CPU_MODEL, HostFiles, LaunchConfig, LaunchRecord, Machine};
 use orbd_qemu::migration::{self, MigrationError};
-use orbd_qemu::probe::{self, check_qemu_version, q35_machine};
+use orbd_qemu::probe::{self, check_qemu_version, machine_type};
 use orbd_qemu::qmp::{self, FileMigration, Qmp};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -83,8 +85,15 @@ const MIGRATION: FileMigration = FileMigration {
 };
 const QMP_TIMEOUT: Duration = Duration::from_secs(5);
 const PREPARE_SLEEP_TIMEOUT: Duration = Duration::from_secs(15);
-/// Orb's own kernel command line (guest contract in `guest/README.md`).
-const KERNEL_CMDLINE: &str = "console=ttyS0 root=/dev/vda rw";
+/// Orb's own kernel command line (guest contract in `guest/README.md`): the console is
+/// the 8250 UART on x86_64 and the PL011 on arm64's `virt`.
+const KERNEL_CMDLINE: &str = if cfg!(target_arch = "aarch64") {
+    "console=ttyAMA0 root=/dev/vda rw"
+} else {
+    "console=ttyS0 root=/dev/vda rw"
+};
+/// `sockaddr_un.sun_path` (108 bytes on Linux, 104 on macOS).
+const SUN_PATH_MAX: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
 /// How long a cold stop waits for a clean guest shutdown before quitting QEMU.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 /// Checkpoint headroom beyond guest RAM (device state, ROMs, stream framing).
@@ -247,7 +256,10 @@ pub struct QemuRuntime {
     run_dir: PathBuf,
     images: Arc<dyn ImageProvider>,
     qemu: VmmIdentity,
-    /// Versioned machine type (`q35` resolved at startup), recorded in each launch.
+    /// `orbd-netgroup`, setgid to `network_group`.
+    group_exec: Option<PathBuf>,
+    /// Versioned machine type (`q35` or `virt` resolved at startup), recorded in each
+    /// launch.
     machine: String,
     migration: FileMigration,
     cpu: CpuIdentity,
@@ -278,7 +290,7 @@ impl QemuRuntime {
         let longest = qemu_run
             .join(OrbId(uuid::Uuid::nil()).to_string())
             .join("guest.sock");
-        if longest.as_os_str().len() >= 108 {
+        if longest.as_os_str().len() >= SUN_PATH_MAX {
             return Err(other(
                 "run_dir",
                 &format!("{} is too long for unix socket paths", run_dir.display()),
@@ -289,10 +301,19 @@ impl QemuRuntime {
         }
         let qemu_path = on_path(&config.qemu)
             .ok_or_else(|| other("qemu", &format!("{} not found", config.qemu.display())))?;
+        let group_exec = match &config.network_group {
+            Some(group) => {
+                let exec = on_path(Path::new(GROUP_EXEC))
+                    .ok_or_else(|| other("network_group", &format!("{GROUP_EXEC} not found")))?;
+                check_network_group(&exec, group).map_err(|e| other("network_group", &e))?;
+                Some(exec)
+            }
+            None => None,
+        };
         let version = probe::qemu_version(&qemu_path)
             .map_err(|e| other(&qemu_path.display().to_string(), &e))?;
         check_qemu_version(&version).map_err(|e| other("qemu", &e))?;
-        let machine = q35_machine(&qemu_path).map_err(|e| other("qemu", &e))?;
+        let machine = machine_type(&qemu_path).map_err(|e| other("qemu", &e))?;
         let qemu = VmmIdentity {
             sha256: file_digest(&qemu_path, "qemu binary")?,
             path: qemu_path,
@@ -313,6 +334,7 @@ impl QemuRuntime {
             run_dir: run_dir.to_owned(),
             images,
             qemu,
+            group_exec,
             machine,
             migration,
             cpu,
@@ -571,6 +593,11 @@ impl QemuRuntime {
         config: LaunchConfig,
         ctx: &OpContext,
     ) -> Result<Process, RuntimeError> {
+        // Checked on every launch: replacing the binary drops the setgid bit.
+        if let (Some(exec), Some(group)) = (&self.group_exec, &self.config.network_group) {
+            check_network_group(exec, group).map_err(RuntimeError::Other)?;
+        }
+        let recipe = self.read_recipe(orb)?;
         let rp = self.run_paths(orb);
         self.clear_run(orb);
         create_private_dir(&rp.dir).map_err(io_err)?;
@@ -590,7 +617,13 @@ impl QemuRuntime {
             log: &op.qemu_log,
             record_path: &rp.launch,
             cgroup: self.cgroup_dir(orb),
-            netns: self.read_recipe(orb)?.net.netns_path(),
+            netns: recipe.net.netns_path(),
+            sandbox: launch::Sandbox {
+                orb_dir: &op.dir,
+                run_dir: &rp.dir,
+                base_dir: recipe.base.path.parent().unwrap_or(&recipe.base.path),
+            },
+            group_exec: self.group_exec.as_deref(),
         })
         .map_err(|e| RuntimeError::Other(format!("launching QEMU: {e}")))?;
         log(ctx, &format!("QEMU started (pid {})", proc.pid));
@@ -1071,6 +1104,7 @@ impl Runtime for QemuRuntime {
             nested_kvm: self.nested_kvm,
             nested_state_qualified: false,
             project_snapshots: true,
+            arch: crate::model::Arch::HOST,
         }
     }
 
@@ -1326,6 +1360,27 @@ impl Runtime for QemuRuntime {
     fn guest(&self) -> &dyn GuestControl {
         self
     }
+}
+
+/// Runs a program with the group it is setgid to (`src/bin/orbd-netgroup.rs`).
+const GROUP_EXEC: &str = "orbd-netgroup";
+
+/// `exec` must be setgid `group`, so every socket QEMU opens for an orb (slirp) carries
+/// that group and host firewall rules for it (macOS pf `group`) apply to orb traffic only.
+fn check_network_group(exec: &Path, group: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let g = nix::unistd::Group::from_name(group)
+        .map_err(|e| format!("group {group}: {e}"))?
+        .ok_or_else(|| format!("group {group} does not exist"))?;
+    let m = std::fs::metadata(exec).map_err(|e| format!("{}: {e}", exec.display()))?;
+    if m.mode() & 0o2000 == 0 || m.gid() != g.gid.as_raw() {
+        return Err(format!(
+            "{} must be setgid {group} (chgrp {group}; chmod g+s), or orb traffic escapes the \
+             firewall rules for that group",
+            exec.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Cancels an outgoing migration that is still running and waits (up to 30 s) until
