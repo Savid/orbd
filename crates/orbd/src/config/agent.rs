@@ -138,6 +138,8 @@ pub struct AgentSection {
     pub dns_servers: Vec<String>,
     /// The network VM orbs see.
     pub guest_network: GuestNetwork,
+    /// Which private destinations VM orbs may reach (none by default).
+    pub egress: Egress,
     pub metrics_listen: Option<SocketAddr>,
     /// Overrides the coordinator URL from enrollment (`ORBD_COORDINATOR_URL`).
     pub coordinator_url: Option<String>,
@@ -230,6 +232,157 @@ impl std::str::FromStr for GuestNetwork {
     }
 }
 
+/// Which private destinations Firecracker orbs may reach. By default they get the
+/// internet only: private, shared (a tailnet's 100.64.0.0/10), loopback, multicast,
+/// documentation and reserved IPv4 destinations are dropped for their traffic, except
+/// what `allow` names and the orbs' DNS servers (port 53). Cloud metadata endpoints,
+/// IPv6 and the agent itself stay blocked whatever this says, and the agent's own
+/// traffic is never affected. QEMU and Docker orbs are not filtered by orbd.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Egress {
+    /// Orbs may reach every private destination (`ORBD_ALLOW_PRIVATE_EGRESS`): orbd
+    /// before this setting existed.
+    pub allow_private: bool,
+    /// Private destinations orbs may reach anyway (`ORBD_EGRESS_ALLOW`).
+    pub allow: Vec<EgressRule>,
+}
+
+impl Egress {
+    /// From `ORBD_EGRESS_ALLOW` entries (empty ones are skipped) and
+    /// `ORBD_ALLOW_PRIVATE_EGRESS`.
+    pub fn new(allow_private: bool, allow: &[String]) -> Result<Self, String> {
+        let allow = allow
+            .iter()
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .map(str::parse)
+            .collect::<Result<Vec<EgressRule>, String>>()?;
+        if allow_private && !allow.is_empty() {
+            return Err(
+                "set ORBD_EGRESS_ALLOW or ORBD_ALLOW_PRIVATE_EGRESS, not both: the latter \
+                 already allows every private destination"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            allow_private,
+            allow,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EgressProto {
+    Tcp,
+    Udp,
+    /// Every protocol; with ports, TCP or UDP to them.
+    Any,
+}
+
+/// One allowed destination: `<proto>:<address or CIDR>[:<ports>]`, e.g.
+/// `udp:192.168.2.201:41641` (Tailscale to a LAN host), `tcp:10.0.0.0/8:8000-8100`,
+/// `any:192.168.2.0/24` (every protocol and port). `proto` is tcp, udp or any; ports are
+/// one port or a range, every port without them. Prefixes shorter than /8 (and `*`) are
+/// refused, as is link-local: `ORBD_ALLOW_PRIVATE_EGRESS` allows everything private.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EgressRule {
+    pub proto: EgressProto,
+    pub net: Ipv4Addr,
+    pub prefix: u8,
+    /// Inclusive range; `None` for every port.
+    pub ports: Option<(u16, u16)>,
+}
+
+impl std::fmt::Display for EgressRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let proto = match self.proto {
+            EgressProto::Tcp => "tcp",
+            EgressProto::Udp => "udp",
+            EgressProto::Any => "any",
+        };
+        write!(f, "{proto}:")?;
+        match self.prefix {
+            32 => write!(f, "{}", self.net)?,
+            p => write!(f, "{}/{p}", self.net)?,
+        }
+        match self.ports {
+            None => Ok(()),
+            Some((a, b)) if a == b => write!(f, ":{a}"),
+            Some((a, b)) => write!(f, ":{a}-{b}"),
+        }
+    }
+}
+
+impl std::str::FromStr for EgressRule {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = |why: &str| {
+            format!(
+                "{s:?}: {why} (expected <tcp|udp|any>:<address or CIDR>[:<port or range>], \
+                 e.g. udp:192.168.2.201:41641)"
+            )
+        };
+        let mut parts = s.trim().split(':');
+        let (Some(proto), Some(addr), ports, None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(bad("wrong number of parts"));
+        };
+        let proto = match proto.to_ascii_lowercase().as_str() {
+            "tcp" => EgressProto::Tcp,
+            "udp" => EgressProto::Udp,
+            "any" => EgressProto::Any,
+            _ => return Err(bad("protocol must be tcp, udp or any")),
+        };
+        if addr == "*" {
+            return Err(bad(
+                "`*` would allow every private destination: ORBD_ALLOW_PRIVATE_EGRESS does that",
+            ));
+        }
+        let (ip, prefix) = match addr.split_once('/') {
+            Some((ip, p)) => (ip, p.parse::<u8>().map_err(|_| bad("bad prefix"))?),
+            None => (addr, 32),
+        };
+        let net: Ipv4Addr = ip.parse().map_err(|_| bad("bad IPv4 address"))?;
+        if prefix > 32 {
+            return Err(bad("prefix above /32"));
+        }
+        if prefix < 8 {
+            return Err(bad(
+                "prefixes shorter than /8 are refused: ORBD_ALLOW_PRIVATE_EGRESS allows every \
+                 private destination",
+            ));
+        }
+        if u32::from(net) & !GuestNetwork::mask(prefix) != 0 {
+            return Err(bad("host bits are set"));
+        }
+        let link_local = Ipv4Addr::new(169, 254, 0, 0);
+        let mask = GuestNetwork::mask(prefix.min(16));
+        if u32::from(net) & mask == u32::from(link_local) & mask {
+            return Err(bad("link-local (cloud metadata) is never allowed"));
+        }
+        let ports = match ports {
+            None | Some("") | Some("*") => None,
+            Some(p) => {
+                let (a, b) = p.split_once('-').unwrap_or((p, p));
+                let a: u16 = a.parse().map_err(|_| bad("bad port"))?;
+                let b: u16 = b.parse().map_err(|_| bad("bad port"))?;
+                if a == 0 || a > b {
+                    return Err(bad("ports must be 1-65535, low to high"));
+                }
+                Some((a, b))
+            }
+        };
+        Ok(Self {
+            proto,
+            net,
+            prefix,
+            ports,
+        })
+    }
+}
+
 impl AgentSection {
     pub fn new(state_dir: PathBuf) -> Self {
         Self {
@@ -239,6 +392,7 @@ impl AgentSection {
             capacity: CapacityOverrides::default(),
             dns_servers: DEFAULT_DNS.map(String::from).to_vec(),
             guest_network: GuestNetwork::default(),
+            egress: Egress::default(),
             metrics_listen: None,
             coordinator_url: None,
             overflow: false,
@@ -342,6 +496,9 @@ pub struct FirecrackerRuntimeConfig {
     /// Network for new orbs (from `agent.guest_network`).
     #[serde(skip)]
     pub guest_network: GuestNetwork,
+    /// Private destinations orbs may reach (from `agent.egress`).
+    #[serde(skip)]
+    pub egress: Egress,
 }
 
 impl Default for FirecrackerRuntimeConfig {
@@ -352,6 +509,7 @@ impl Default for FirecrackerRuntimeConfig {
             cgroup_parent: None,
             dns_servers: Vec::new(),
             guest_network: GuestNetwork::default(),
+            egress: Egress::default(),
         }
     }
 }
@@ -434,7 +592,93 @@ impl AgentConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::GuestNetwork;
+    use super::{Egress, EgressProto, EgressRule, GuestNetwork};
+
+    #[test]
+    fn egress_rules_parse_and_print() {
+        for (input, printed, proto, prefix, ports) in [
+            (
+                "udp:192.168.2.201:41641",
+                "udp:192.168.2.201:41641",
+                EgressProto::Udp,
+                32,
+                Some((41641, 41641)),
+            ),
+            (
+                "tcp:10.0.0.0/8:8000-8100",
+                "tcp:10.0.0.0/8:8000-8100",
+                EgressProto::Tcp,
+                8,
+                Some((8000, 8100)),
+            ),
+            (
+                "any:192.168.2.0/24",
+                "any:192.168.2.0/24",
+                EgressProto::Any,
+                24,
+                None,
+            ),
+            (
+                " TCP:100.64.0.0/10:443 ",
+                "tcp:100.64.0.0/10:443",
+                EgressProto::Tcp,
+                10,
+                Some((443, 443)),
+            ),
+            (
+                "any:172.16.0.0/12:*",
+                "any:172.16.0.0/12",
+                EgressProto::Any,
+                12,
+                None,
+            ),
+        ] {
+            let r: EgressRule = input.parse().unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(
+                (r.proto, r.prefix, r.ports),
+                (proto, prefix, ports),
+                "{input}"
+            );
+            assert_eq!(r.to_string(), printed);
+            assert_eq!(printed.parse::<EgressRule>().unwrap(), r, "round trip");
+        }
+        for bad in [
+            "",
+            "192.168.2.201:41641",    // no protocol
+            "icmp:192.168.2.201",     // unknown protocol
+            "*:192.168.2.201",        // `any`, not `*`
+            "udp:192.168.2.201:1:2",  // too many parts
+            "udp:192.168.2.1/24:53",  // host bits
+            "udp:192.168.2.0/33",     // prefix
+            "tcp:*:443",              // every private address: ORBD_ALLOW_PRIVATE_EGRESS
+            "any:0.0.0.0/0",          // the same
+            "any:96.0.0.0/3",         // shorter than /8
+            "tcp:169.254.169.254:80", // link-local: cloud metadata
+            "any:169.0.0.0/8",        // contains link-local
+            "udp:host.lan:53",        // names: addresses only
+            "udp:fd00::1:53",         // IPv4 only
+            "tcp:10.0.0.1:0",         // port 0
+            "tcp:10.0.0.1:90-80",     // range backwards
+            "tcp:10.0.0.1:70000",     // out of range
+        ] {
+            assert!(bad.parse::<EgressRule>().is_err(), "{bad:?} parsed");
+        }
+    }
+
+    #[test]
+    fn egress_lists_skip_empty_entries() {
+        let list = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // `ORBD_EGRESS_ALLOW=` and a trailing comma.
+        assert_eq!(Egress::new(false, &list(&[""])).unwrap(), Egress::default());
+        let e = Egress::new(false, &list(&["udp:10.0.0.1:53", " "])).unwrap();
+        assert_eq!(e.allow.len(), 1);
+        assert!(Egress::new(true, &list(&[""])).unwrap().allow_private);
+        assert!(
+            Egress::new(true, &list(&["udp:10.0.0.1:53"])).is_err(),
+            "both settings"
+        );
+        assert!(Egress::new(false, &list(&["udp:10.0.0.1:53", "bad"])).is_err());
+    }
 
     #[test]
     fn guest_network_parsing() {

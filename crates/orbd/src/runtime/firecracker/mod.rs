@@ -266,7 +266,7 @@ impl FirecrackerRuntime {
             path,
             version,
         };
-        net::prepare_host().map_err(|e| other("network", &e))?;
+        net::prepare_host(&config.egress, &config.dns_servers).map_err(|e| other("network", &e))?;
         let cpu = CpuIdentity::host();
         tracing::info!(firecracker = %firecracker.version, cpu = %cpu.model, "firecracker runtime ready");
         Ok(Self {

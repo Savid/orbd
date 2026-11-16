@@ -79,7 +79,16 @@ jobs:
         with:
           key: ${{ matrix.features }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # orbd's nftables table is loaded in a throwaway user and network namespace
+      # (ORBD_TEST_NFT makes that test fail instead of skipping).
+      - name: nft in unprivileged namespaces
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -rn nft list ruleset
       - run: cargo test --workspace --locked --features "${{ matrix.features }}"
+        env:
+          ORBD_TEST_NFT: "1"
 
   # Apple Silicon agents. GitHub's macOS runners cannot start Hypervisor.framework
   # guests, so this lints the macOS code and runs every test that needs no VM; the VM

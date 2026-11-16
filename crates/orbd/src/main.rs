@@ -234,6 +234,18 @@ struct AgentArgs {
     /// that is not always on (orbs stay on the agent they were created on).
     #[arg(long, env = "ORBD_OVERFLOW")]
     overflow: bool,
+    /// Private destinations Firecracker orbs may reach, comma-separated
+    /// `<tcp|udp|any>:<address or CIDR>[:<port or range>]`, e.g.
+    /// `udp:192.168.2.201:41641,tcp:10.0.0.0/8:8000-8100`. Otherwise they reach the
+    /// internet only: the LAN, a tailnet's 100.64.0.0/10, loopback, multicast,
+    /// documentation and reserved addresses are dropped for them; cloud metadata always
+    /// is. Their DNS servers are allowed on port 53.
+    #[arg(long, env = "ORBD_EGRESS_ALLOW", value_delimiter = ',')]
+    egress_allow: Vec<String>,
+    /// Let Firecracker orbs reach every private destination, the host's LAN included
+    /// (orbd before 0.2; cloud metadata stays blocked).
+    #[arg(long, env = "ORBD_ALLOW_PRIVATE_EGRESS")]
+    allow_private_egress: bool,
     /// Optional YAML with advanced runtime and image settings.
     #[arg(long, short, env = "ORBD_AGENT_CONFIG")]
     config: Option<PathBuf>,
@@ -425,6 +437,8 @@ fn main() -> anyhow::Result<()> {
             s.metrics_listen = a.metrics_listen;
             s.coordinator_url = a.coordinator_url;
             s.overflow = a.overflow;
+            s.egress = orbd::config::agent::Egress::new(a.allow_private_egress, &a.egress_allow)
+                .map_err(anyhow::Error::msg)?;
             config.agent = s;
             rt.block_on(async {
                 let shutdown = shutdown_on_signal();

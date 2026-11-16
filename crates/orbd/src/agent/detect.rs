@@ -112,6 +112,20 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
     if let Some(f) = &mut r.firecracker {
         f.dns_servers = config.agent.dns_servers.clone();
         f.guest_network = config.agent.guest_network;
+        f.egress = config.agent.egress.clone();
+    }
+    // orbd filters only Firecracker orbs' traffic (their own network namespaces).
+    if r.firecracker.is_none() && config.agent.egress != Default::default() {
+        tracing::warn!(
+            "ORBD_EGRESS_ALLOW / ORBD_ALLOW_PRIVATE_EGRESS have no effect: this agent has no \
+             Firecracker runtime"
+        );
+    }
+    if cfg!(target_os = "linux") && r.qemu.is_some() {
+        tracing::warn!(
+            "QEMU orbs (orb types with kvm) are not filtered by orbd: their user-mode network \
+             reaches whatever this agent can, its LAN included; use host firewall rules"
+        );
     }
     Ok(())
 }
