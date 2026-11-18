@@ -255,8 +255,12 @@ fn sleep_preserves_processes_and_nested_guest() {
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "first spawn");
     eprintln!("cold spawn (create, boot, Wake ack): {:?}", t.elapsed());
     wait_progress(&orb_dir(&c), (0, 0));
+    let console = console(&orb_dir(&c));
+    assert!(
+        console.contains("landlock: Up and running."),
+        "the guest kernel must enable Landlock"
+    );
     if runtime() == "firecracker" {
-        let console = console(&orb_dir(&c));
         assert!(
             console.contains("/dev/kvm is missing") && !console.contains("l2counter"),
             "a Firecracker orb must have no /dev/kvm"
