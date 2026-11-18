@@ -6,6 +6,11 @@ targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "x86_64-un
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # Unmaintained, not a vulnerability. Only oci-client pulls it in; drop this once
+    # a release of it doesn't.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; transitive via oci-client" },
+]
 
 [bans]
 multiple-versions = "warn"
