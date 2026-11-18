@@ -48,7 +48,7 @@ FROM base AS base-amd64
 # build means sleeping orbs cold-boot once and agents delete their checkpoints:
 # checkpoints restore only on the exact binary. So the version is pinned, and a build
 # fails once backports drops it; bump it on purpose.
-ARG QEMU_VERSION=1:11.1.2+ds-3~bpo13+4
+ARG QEMU_VERSION=1:11.1.3+ds-1~bpo13+1
 RUN printf 'Types: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie-backports\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' \
         >/etc/apt/sources.list.d/backports.sources \
     && apt-get update \
