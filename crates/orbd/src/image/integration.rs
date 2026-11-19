@@ -38,6 +38,10 @@ const FILES: &[(&str, u32, &str)] = &[
     // Empty: systemd generates a machine id on each new orb's first boot instead of
     // every orb sharing the one baked into the image.
     ("etc/machine-id", 0o444, ""),
+    // Linger for Amp's `user`: logind starts its systemd user manager at boot. Amp runs
+    // its agent from a system unit, never a login session, so without this there is no
+    // user bus and `systemctl --user` / `systemd-run --user` fail.
+    ("var/lib/systemd/linger/user", 0o644, ""),
 ];
 
 const SYMLINKS: &[(&str, &str)] = &[
