@@ -260,9 +260,14 @@ pub async fn initial_source(
         .join("projects")
         .join(snapshot.key.as_str())
         .join("disk.raw");
-    let current = match images.prepared(&image_ref).await {
-        Ok(img) if here.is_file() => img.lineage,
-        _ => None,
+    let current = if here.is_file() {
+        images
+            .prepared(&image_ref)
+            .await
+            .ok()
+            .and_then(|i| i.lineage)
+    } else {
+        None
     };
     let built_on = project_lineage(state_dir, &snapshot.key);
     let Some(current) = current.filter(|c| built_on.as_ref() != Some(c)) else {
@@ -275,7 +280,7 @@ pub async fn initial_source(
         "project snapshot {} was built on another image lineage ({}); creating the disk from {image_ref}",
         snapshot.key,
         match built_on {
-            Some(_) => "an older Debian or guest integration",
+            Some(_) => "another Debian release or guest integration",
             None => "not recorded",
         }
     );

@@ -65,18 +65,17 @@ pub struct PreparedImage {
     pub lineage: Option<String>,
 }
 
-/// Identity of an image as far as project snapshots go: the recipe, [`GUEST_LINEAGE`]
-/// and the image's bottom layer (its distribution). Amp's routine rebuilds keep it; a
-/// new Debian release or a bump of `GUEST_LINEAGE` changes it, and project snapshots of
-/// the previous lineage are then passed over for the image.
+/// Identity of an image as far as project snapshots go: [`GUEST_LINEAGE`] and the
+/// image's distribution release (`os=` from its os-release, or `layer=` its bottom
+/// layer when it has none). Amp's routine rebuilds, a refreshed base image and orbd's
+/// own recipe changes keep it; a new Debian release or a bump of `GUEST_LINEAGE`
+/// changes it, and project snapshots of the previous lineage are then passed over for
+/// the image.
 ///
 /// [`GUEST_LINEAGE`]: integration::GUEST_LINEAGE
-pub fn lineage(bottom_layer: &str) -> String {
+pub fn lineage(base: &str) -> String {
     let guest = integration::GUEST_LINEAGE;
-    sha256_hex(
-        format!("orbd-lineage\nrecipe={RECIPE_VERSION}\nguest={guest}\nbottom={bottom_layer}\n")
-            .as_bytes(),
-    )
+    sha256_hex(format!("orbd-lineage\nguest={guest}\n{base}\n").as_bytes())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -547,8 +546,12 @@ impl ImageStore {
         std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
         rootfs::write_layout(&layout, &self.inner.blobs, resolved)?;
         let file = out.join(ROOTFS_FILE);
-        let bytes =
+        let (bytes, os) =
             rootfs::build(tools, &layout, &self.inner.integration, work, &file, set).await?;
+        let base = os.map(|os| format!("os={os}")).or_else(|| {
+            let bottom = resolved.manifest.layers.first()?;
+            Some(format!("layer={}", bottom.digest))
+        });
         set("publishing");
         let f = std::fs::File::open(&file).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
@@ -564,7 +567,7 @@ impl ImageStore {
                 guest_integration_digest: self.inner.integration.digest.clone(),
                 rootfs_bytes: bytes,
                 created_unix: now_unix(),
-                lineage: resolved.manifest.layers.first().map(|l| lineage(&l.digest)),
+                lineage: base.map(|b| lineage(&b)),
             },
         )
         .map_err(|e| e.to_string())?;
