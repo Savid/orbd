@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds orbd's pinned QEMU guest kernel: Linux 7.3 stable, everything built in (no modules,
-# no initrd), booted with `root=/dev/vda`.
+# Builds orbd's pinned guest kernel (QEMU and Firecracker): Linux 7.3 stable, everything
+# built in (no modules, no initrd), booted with `root=/dev/vda`.
 #
 #   guest/kernel/build.sh [OUT_DIR]        (default: target/guest-kernel)
 #   ARCH=arm64 guest/kernel/build.sh       (default: x86_64; build on a host of that arch)

@@ -265,6 +265,17 @@ fn sleep_preserves_processes_and_nested_guest() {
         "/sys/kernel/security/lsm must list Landlock; console tail:\n{}",
         tail(&console)
     );
+    // ABI 8 added LANDLOCK_RESTRICT_SELF_TSYNC; multithreaded sandboxers (go-landlock)
+    // otherwise signal every thread, which seccomp filters blocking tkill break.
+    let abi: i64 = console
+        .lines()
+        .find_map(|l| l.split("guest landlock abi: ").nth(1))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no Landlock ABI on the console; tail:\n{}", tail(&console)));
+    assert!(
+        abi >= 8,
+        "the guest kernel's Landlock ABI is {abi}, need >= 8 (TSYNC)"
+    );
     if runtime() == "firecracker" {
         assert!(
             console.contains("/dev/kvm is missing") && !console.contains("l2counter"),
