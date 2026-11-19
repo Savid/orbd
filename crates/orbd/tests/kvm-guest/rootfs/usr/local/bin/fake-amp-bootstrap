@@ -3,6 +3,9 @@
 echo "fake-amp-bootstrap: ORB_TOKEN has ${#ORB_TOKEN} chars"
 # Active LSMs, read as the unprivileged user (needs securityfs, which systemd mounts).
 echo "guest lsm: $(cat /sys/kernel/security/lsm 2>&1)"
+# Landlock ABI version: landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION),
+# syscall 444 on x86_64 and arm64 (perl-base is essential, so always present).
+echo "guest landlock abi: $(perl -e 'print syscall(444, 0, 0, 1)' 2>&1)"
 # E2E_PROBE="host:port ...": which TCP destinations this orb reaches (open: accepted;
 # refused: reachable, nothing listening; dropped: filtered).
 for target in $E2E_PROBE; do

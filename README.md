@@ -296,8 +296,8 @@ raise it too, e.g. a drop-in `/etc/systemd/system/docker.service.d/orbd.conf` wi
 `[Service]` and `TimeoutStopSec=360`. Orb disk sizes must be at least Amp's image
 (~5 GiB).
 
-The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Linux 6.18
-LTS guest kernel; an agent run outside it needs QEMU 9.0 or newer, and for Firecracker
+The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Linux 7.3
+guest kernel; an agent run outside it needs QEMU 9.0 or newer, and for Firecracker
 `ip` and `nft` (`orbd doctor` checks). Firecracker orbs run in their own network
 namespace behind NAT and cannot reach the agent itself, each other or private networks
 (see above). A sleeping orb wakes only on the

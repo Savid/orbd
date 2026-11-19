@@ -1,6 +1,6 @@
 # Guest assets for the VM runtimes (QEMU, Firecracker)
 
-- `kernel/`: `build.sh` builds the pinned 6.18 LTS guest kernel (`bzImage`, final
+- `kernel/`: `build.sh` builds the pinned Linux 7.3 guest kernel (`bzImage`, final
   `config`, `bzImage.sha256`, `manifest.txt`) from `orbd.config`. Everything is built in:
   no modules, no initrd. `ARCH=arm64` builds an `Image` for macOS agents.
 - `builder/`: the container macOS agents build orb images in.
