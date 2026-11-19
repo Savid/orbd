@@ -116,14 +116,13 @@ struct VmRecipe {
     created_unix_ms: u64,
 }
 
-/// The base disk directory (`images/<key>`, `projects/<key>`) a Firecracker orb's
-/// `vm.json` was copied from, or None if `json` is not a Firecracker recipe.
+/// The base disk directories (`images/<key>`, `projects/<key>`) a Firecracker orb
+/// still reads, or None if `json` is not a Firecracker recipe. Always empty: the disk
+/// is a standalone copy, finished under [`crate::runtime::vm::BASES`] before the recipe
+/// is published, so the base it came from (`source`, provenance only) can go once idle.
 pub(crate) fn recipe_bases(json: &[u8]) -> Option<Vec<String>> {
-    let recipe: VmRecipe = serde_json::from_slice(json).ok()?;
-    Some(vec![match recipe.source {
-        DiskSource::Image { key, .. } => format!("images/{key}"),
-        DiskSource::ProjectSnapshot { key } => format!("projects/{key}"),
-    }])
+    serde_json::from_slice::<VmRecipe>(json).ok()?;
+    Some(Vec::new())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

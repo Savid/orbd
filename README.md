@@ -223,8 +223,10 @@ the orb's files and processes even if its thread is in use.
 Amp never deletes project snapshots either: it reuses one for at most 72 hours, then
 names a new one. An agent deletes a project snapshot or prepared image once no orb on it
 is built on it and nothing has used it for 72 hours (the current image of a prewarmed
-reference is kept), and image layers no build has used for as long. It checks at
-startup, hourly and after each orb delete.
+reference is kept), and image layers no build has used for as long. Only QEMU orbs are
+built on their base, since their disks read through to it; a Firecracker orb's disk is a
+standalone copy and keeps nothing. It checks at startup, hourly and after each orb
+delete.
 
 `prefer` sets where new orbs go, in order: `[local, boat]` (the default) runs them on
 the agents and sends them to Boat when no agent can take them (all full, down or
