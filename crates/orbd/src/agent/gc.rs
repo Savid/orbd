@@ -4,7 +4,8 @@
 //! snapshots and prepared images pile up unless the agent deletes them.
 //!
 //! A project snapshot or prepared image is deleted once no orb on this host is built on
-//! it (its `vm.json` names it; QEMU disks read through to their base) and nothing has
+//! it (a QEMU orb's `vm.json` names it: its disk reads through to its base; a
+//! Firecracker orb's disk is a standalone copy, so it pins nothing) and nothing has
 //! used it for [`IDLE`]. A spawn that creates a disk from it counts as a use, and so
 //! does publishing it. The current image of a prewarmed reference is kept. Collection
 //! runs at startup, hourly and after every orb delete, under
@@ -120,7 +121,7 @@ async fn collect(sh: &Arc<Shared>) {
 }
 
 /// Every base directory (`images/<key>`, `projects/<key>`) an orb in `<state>/orbs`
-/// is built on. Fails, so nothing is deleted, if any orb's recipe cannot be read.
+/// is built on (QEMU orbs only). Fails, so nothing is deleted, if any orb's recipe cannot be read.
 fn orb_bases(state: &Path) -> Result<HashSet<String>, String> {
     let dir = state.join("orbs");
     let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -216,6 +217,50 @@ mod tests {
             "created_unix_ms": 1,
         })
         .to_string()
+    }
+
+    /// A Firecracker orb's `vm.json` as the runtime writes it, copied from `base`.
+    fn firecracker_recipe(base: &str) -> String {
+        let (kind, key) = base.split_once('/').unwrap();
+        let source = match kind {
+            "images" => {
+                serde_json::json!({"kind": "image", "image_ref": "r", "key": key, "manifest_digest": "d"})
+            }
+            _ => serde_json::json!({"kind": "project_snapshot", "key": key}),
+        };
+        let orb = crate::model::OrbId::generate();
+        serde_json::json!({
+            "orb": orb,
+            "vcpus": 2, "memory_bytes": 1u64 << 31, "disk_bytes": 1u64 << 32,
+            "source": source,
+            "net": {"backend": {"kind": "tap", "netns": format!("orbd-{orb}"), "index": 1},
+                    "mac": "m", "ipv4_cidr": "c", "ipv4_gateway": "g", "mtu": 1500},
+            "created_unix_ms": 1,
+        })
+        .to_string()
+    }
+
+    /// A Firecracker orb's disk is a standalone copy: the base it was copied from goes
+    /// once idle, like one no orb was ever built on.
+    #[test]
+    fn firecracker_orbs_pin_no_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        for (i, base) in ["projects/copied", "images/k1"].iter().enumerate() {
+            let dir = state
+                .join("orbs")
+                .join(format!("01a17b00-0000-7000-8000-00000000000{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("vm.json"), firecracker_recipe(base)).unwrap();
+        }
+        std::fs::create_dir_all(state.join("projects/copied")).unwrap();
+        age(&state.join("projects/copied"), 4);
+
+        let in_use = orb_bases(state).unwrap();
+        assert!(in_use.is_empty(), "{in_use:?}");
+        let trashed = collect_projects(state, &in_use, IDLE);
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].0, "copied");
     }
 
     /// Only a project snapshot that no orb is built on and nothing used for the idle
