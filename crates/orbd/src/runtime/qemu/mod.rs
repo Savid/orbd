@@ -56,8 +56,8 @@ use super::vm::{
     on_path, publish_project, run_tool,
 };
 use super::{
-    GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError, RuntimeObservation,
-    StartSource,
+    CheckpointInfo, GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError,
+    RuntimeObservation, StartSource,
 };
 use crate::config::agent::QemuRuntimeConfig;
 use crate::image::ImageError;
@@ -1280,6 +1280,14 @@ impl Runtime for QemuRuntime {
     ) -> Result<(), RuntimeError> {
         let _g = self.lock(orb).await;
         self.checkpoints(orb).discard(checkpoint.generation)
+    }
+
+    async fn checkpoint_info(
+        &self,
+        orb: OrbId,
+        checkpoint: &SleepCheckpointRef,
+    ) -> Result<Option<CheckpointInfo>, RuntimeError> {
+        self.checkpoints(orb).info(checkpoint.generation)
     }
 
     /// `qemu-img convert` of the stopped overlay (with its backing) into a standalone

@@ -57,8 +57,8 @@ use super::vm::{
     machine_id, on_path, publish_project,
 };
 use super::{
-    GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError, RuntimeObservation,
-    StartSource,
+    CheckpointInfo, GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError,
+    RuntimeObservation, StartSource,
 };
 use crate::config::agent::FirecrackerRuntimeConfig;
 use crate::image::ImageError;
@@ -1228,6 +1228,14 @@ impl Runtime for FirecrackerRuntime {
     ) -> Result<(), RuntimeError> {
         let _g = self.locks.lock(orb).await;
         self.checkpoints(orb).discard(checkpoint.generation)
+    }
+
+    async fn checkpoint_info(
+        &self,
+        orb: OrbId,
+        checkpoint: &SleepCheckpointRef,
+    ) -> Result<Option<CheckpointInfo>, RuntimeError> {
+        self.checkpoints(orb).info(checkpoint.generation)
     }
 
     /// Copies the stopped orb's disk (reflink or sparse) into a project snapshot, the

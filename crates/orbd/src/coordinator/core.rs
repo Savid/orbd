@@ -1307,13 +1307,21 @@ impl Core {
     ) -> Result<()> {
         for (orb, generation, state) in orbs {
             let (loc, st, now) = (location.clone(), state.clone(), unix_ms_now());
-            let changed = self
+            let replaced = self
                 .db
                 .call(move |c| store::observe_stopped(c, orb, &loc, generation, &st, now))
                 .await?;
-            if changed {
-                tracing::warn!(%orb, ?state, "orb recorded as running has stopped on its host");
-                metrics::counter!("orbd_orbs_found_stopped_total").increment(1);
+            match replaced {
+                Some(OrbState::Known {
+                    state: StableOrbState::Sleeping { .. },
+                }) => {
+                    tracing::info!(%orb, "asleep orb's memory checkpoint was dropped on its host; it cold-boots on its next wake");
+                }
+                Some(_) => {
+                    tracing::warn!(%orb, ?state, "orb recorded as running has stopped on its host");
+                    metrics::counter!("orbd_orbs_found_stopped_total").increment(1);
+                }
+                None => {}
             }
         }
         Ok(())

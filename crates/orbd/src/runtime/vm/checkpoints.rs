@@ -14,7 +14,7 @@
 use super::fsutil::write_atomic;
 use super::io_err;
 use crate::model::OrbId;
-use crate::runtime::RuntimeError;
+use crate::runtime::{CheckpointInfo, RuntimeError};
 use orbd_vm::checkpoint::CheckpointStore;
 use std::path::{Path, PathBuf};
 
@@ -70,6 +70,28 @@ impl Checkpoints {
     pub fn is_consumed(&self, generation: u64) -> bool {
         let dir = self.published(generation);
         !dir.is_dir() || dir.join("consumed").exists()
+    }
+
+    /// A published, unconsumed checkpoint's save time (its manifest's `created_unix_ms`,
+    /// written as the save completed, so when the orb went to sleep) and the bytes its
+    /// files hold. `None` if it is missing or consumed.
+    pub fn info(&self, generation: u64) -> Result<Option<CheckpointInfo>, RuntimeError> {
+        #[derive(serde::Deserialize)]
+        struct Saved {
+            created_unix_ms: u64,
+        }
+        if self.is_consumed(generation) {
+            return Ok(None);
+        }
+        let dir = self.published(generation);
+        let Some(saved) = super::fsutil::read_json::<Saved>(&dir.join(MANIFEST)).map_err(io_err)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(CheckpointInfo {
+            saved_unix_ms: saved.created_unix_ms,
+            bytes: allocated_bytes(&dir),
+        }))
     }
 
     /// Durably marks a published checkpoint consumed: it is never restored again.
@@ -181,6 +203,19 @@ pub fn file_len(path: &Path) -> Result<u64, RuntimeError> {
     std::fs::metadata(path).map(|m| m.len()).map_err(io_err)
 }
 
+/// Blocks allocated by the files directly in `dir` (a checkpoint has no subdirectories).
+fn allocated_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.blocks().saturating_mul(512))
+        .fold(0, u64::saturating_add)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +272,34 @@ mod tests {
         publish(&cps, 13, false);
         cps.discard_all().unwrap();
         assert!(on_disk(&dir).is_empty());
+    }
+
+    /// A published checkpoint's age comes from its manifest (either runtime's: only
+    /// `created_unix_ms` is read) and its size from the blocks its files hold; one
+    /// that is consumed, discarded or still being saved has none.
+    #[test]
+    fn info_reads_the_save_time_and_allocated_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("checkpoints");
+        let cps = Checkpoints::new(OrbId::generate(), dir.clone(), tmp.path().join("trash"));
+        let p = cps.published(4);
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("memory"), vec![7u8; 256 << 10]).unwrap();
+        std::fs::write(
+            p.join(MANIFEST),
+            br#"{"orb": "x", "generation": 4, "created_unix_ms": 1700000000000, "save_ms": 3}"#,
+        )
+        .unwrap();
+        let info = cps.info(4).unwrap().unwrap();
+        assert_eq!(info.saved_unix_ms, 1_700_000_000_000);
+        assert!(info.bytes >= 256 << 10, "{info:?}");
+
+        assert_eq!(cps.info(5).unwrap(), None, "not published");
+        std::fs::create_dir_all(cps.tmp(5)).unwrap();
+        assert_eq!(cps.info(5).unwrap(), None, "save in progress");
+        cps.consume(4).unwrap();
+        assert_eq!(cps.info(4).unwrap(), None, "consumed");
+        cps.discard(4).unwrap();
+        assert_eq!(cps.info(4).unwrap(), None, "discarded");
     }
 }

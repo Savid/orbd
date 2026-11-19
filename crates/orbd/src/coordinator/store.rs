@@ -181,9 +181,10 @@ fn reserve_for(c: &Connection, orb: OrbId, state: &OrbState) -> Result<()> {
 }
 
 /// Applies what the orb's host reports outside any command: only that an orb recorded
-/// as running has stopped (its VM died with the host, or while the agent was down),
-/// only when no command is open for it and the report is not older than the record.
-/// Returns whether the record changed.
+/// as running has stopped (its VM died with the host, or while the agent was down), or
+/// that an orb recorded asleep has lost its memory checkpoint (its agent dropped it past
+/// `ORBD_CHECKPOINT_MAX_AGE_HOURS`), only when no command is open for it and the report
+/// is not older than the record. Returns the state it replaced, if it changed.
 pub fn observe_stopped(
     c: &mut Connection,
     orb: OrbId,
@@ -191,36 +192,50 @@ pub fn observe_stopped(
     generation: u64,
     state: &OrbState,
     now: u64,
-) -> Result<bool> {
-    let stopped = matches!(
-        state,
+) -> Result<Option<OrbState>> {
+    let (stopped, without_checkpoint) = match state {
         OrbState::Known {
-            state: StableOrbState::Sleeping { .. } | StableOrbState::DiskOnlyStopped { .. }
-        }
-    );
+            state: StableOrbState::Sleeping { .. },
+        } => (true, false),
+        OrbState::Known {
+            state: StableOrbState::DiskOnlyStopped { .. },
+        } => (true, true),
+        _ => (false, false),
+    };
     if !stopped {
-        return Ok(false);
+        return Ok(None);
     }
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let Some(rec) = get_orb(&tx, orb)? else {
-        return Ok(false);
+        return Ok(None);
     };
+    let (running, asleep) = match &rec.observation.state {
+        OrbState::Known {
+            state: StableOrbState::Running,
+        } => (true, false),
+        OrbState::Known {
+            state: StableOrbState::Sleeping { .. },
+        } => (false, true),
+        _ => (false, false),
+    };
+    let lost_checkpoint = asleep && without_checkpoint;
     if &rec.location != location
         || generation < rec.observation.generation
-        || !matches!(
-            rec.observation.state,
-            OrbState::Known {
-                state: StableOrbState::Running
-            }
-        )
+        || !(running || lost_checkpoint)
         || open_command(&tx, orb)?.is_some()
     {
-        return Ok(false);
+        return Ok(None);
     }
     let obs = VersionedObservation {
         state: state.clone(),
         generation: rec.observation.generation,
-        observed_at_unix_ms: now,
+        // An orb that lost its checkpoint has been stopped since it went to sleep: its
+        // idle time (`idle_orb_ttl_days`, `--asleep-days`) goes on from then.
+        observed_at_unix_ms: if lost_checkpoint {
+            rec.observation.observed_at_unix_ms
+        } else {
+            now
+        },
     };
     tx.execute(
         "UPDATE orbs SET observation_json = ?2 WHERE id = ?1",
@@ -228,7 +243,7 @@ pub fn observe_stopped(
     )?;
     reserve_for(&tx, orb, state)?;
     tx.commit()?;
-    Ok(true)
+    Ok(Some(rec.observation.state))
 }
 
 pub fn get_command(c: &Connection, op: OperationId) -> Result<Option<CmdRow>> {

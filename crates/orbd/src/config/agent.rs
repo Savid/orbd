@@ -145,6 +145,10 @@ pub struct AgentSection {
     pub coordinator_url: Option<String>,
     /// New orbs come here only when no other agent fits them (`ORBD_OVERFLOW`).
     pub overflow: bool,
+    /// Memory checkpoints of orbs asleep longer than this are dropped, so they cold-boot
+    /// on their next wake (`ORBD_CHECKPOINT_MAX_AGE_HOURS`; None: kept for as long as
+    /// the orb sleeps).
+    pub checkpoint_max_age: Option<std::time::Duration>,
 }
 
 pub const DEFAULT_DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
@@ -396,7 +400,15 @@ impl AgentSection {
             metrics_listen: None,
             coordinator_url: None,
             overflow: false,
+            checkpoint_max_age: None,
         }
+    }
+
+    /// `ORBD_CHECKPOINT_MAX_AGE_HOURS`: unset or 0 keeps checkpoints (the default).
+    pub fn checkpoint_max_age_hours(hours: Option<u64>) -> Option<std::time::Duration> {
+        hours
+            .filter(|&h| h > 0)
+            .map(|h| std::time::Duration::from_secs(h.saturating_mul(3600)))
     }
 }
 
@@ -592,7 +604,23 @@ impl AgentConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{Egress, EgressProto, EgressRule, GuestNetwork};
+    use super::{AgentSection, Egress, EgressProto, EgressRule, GuestNetwork};
+    use std::time::Duration;
+
+    /// Checkpoints are kept for as long as an orb sleeps unless a max age is set; 0
+    /// (e.g. compose's `${VAR:-0}`) means unset.
+    #[test]
+    fn checkpoint_max_age_is_off_unless_set() {
+        assert_eq!(AgentSection::default().checkpoint_max_age, None);
+        assert_eq!(AgentSection::new("/s".into()).checkpoint_max_age, None);
+        assert_eq!(AgentSection::checkpoint_max_age_hours(None), None);
+        assert_eq!(AgentSection::checkpoint_max_age_hours(Some(0)), None);
+        assert_eq!(
+            AgentSection::checkpoint_max_age_hours(Some(12)),
+            Some(Duration::from_secs(12 * 3600))
+        );
+        assert!(AgentSection::checkpoint_max_age_hours(Some(u64::MAX)).is_some());
+    }
 
     #[test]
     fn egress_rules_parse_and_print() {

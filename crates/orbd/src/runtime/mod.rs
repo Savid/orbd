@@ -84,6 +84,15 @@ pub enum RuntimeObservation {
     },
 }
 
+/// A published memory checkpoint's age and size (see [`Runtime::checkpoint_info`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointInfo {
+    /// When the save completed: the orb went to sleep then (wall clock).
+    pub saved_unix_ms: u64,
+    /// Bytes its files hold on disk (allocated blocks; memory files may be sparse).
+    pub bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogStream {
     Stdout,
@@ -165,12 +174,26 @@ pub trait Runtime: Send + Sync {
     /// Stops the orb without saving memory (processes lost). Idempotent.
     async fn cold_stop(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), RuntimeError>;
 
-    /// Cleanup only: removes a checkpoint that `start` already consumed. Idempotent.
+    /// Removes a checkpoint, marking it consumed first so it is never restored: one that
+    /// `start` already consumed, or (agent maintenance, orb stopped) one dropped so that
+    /// the orb cold-boots on its next start. Idempotent.
     async fn discard_checkpoint(
         &self,
         orb: OrbId,
         checkpoint: &SleepCheckpointRef,
     ) -> Result<(), RuntimeError>;
+
+    /// When a published, unconsumed checkpoint was saved and what it holds on disk.
+    /// `None` when there is no such checkpoint, or the runtime keeps none (then the
+    /// agent never drops one for its age). Reads only immutable published files, so it
+    /// is safe beside the orb's operations.
+    async fn checkpoint_info(
+        &self,
+        _orb: OrbId,
+        _checkpoint: &SleepCheckpointRef,
+    ) -> Result<Option<CheckpointInfo>, RuntimeError> {
+        Ok(None)
+    }
 
     /// Clones the (stopped) orb's disk into an immutable project snapshot.
     async fn clone_disk(
