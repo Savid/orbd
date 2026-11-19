@@ -260,17 +260,17 @@ fn sleep_preserves_processes_and_nested_guest() {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let console = console(&orb_dir(&c));
-        if console.contains("stale-dns: restored") {
-            assert!(
-                console.contains("dns: tailscaled is not running but its /etc/resolv.conf"),
-                "the stale resolv.conf must be restored by orbd-guest's watcher; console tail:\n{}",
-                tail(&console)
-            );
+        // The unit's own line can reach the console before orbd-guest's (via journald).
+        if console.contains("stale-dns: restored")
+            && console.contains("dns: tailscaled is not running but its /etc/resolv.conf")
+        {
             break;
         }
         assert!(
-            Instant::now() < deadline && !console.contains("stale-dns: still stale"),
-            "orbd-guest did not restore a stale Tailscale resolv.conf; console tail:\n{}",
+            Instant::now() < deadline
+                && !console.contains("stale-dns: still stale")
+                && !console.contains("stale-dns: orbd-guest never wrote"),
+            "orbd-guest's watcher did not restore a stale Tailscale resolv.conf; console tail:\n{}",
             tail(&console)
         );
         std::thread::sleep(Duration::from_millis(500));
