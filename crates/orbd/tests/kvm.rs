@@ -260,6 +260,11 @@ fn sleep_preserves_processes_and_nested_guest() {
         console.contains("landlock: Up and running."),
         "the guest kernel must enable Landlock"
     );
+    assert!(
+        console.contains("guest lsm: capability,landlock"),
+        "/sys/kernel/security/lsm must list Landlock; console tail:\n{}",
+        tail(&console)
+    );
     if runtime() == "firecracker" {
         assert!(
             console.contains("/dev/kvm is missing") && !console.contains("l2counter"),
