@@ -522,9 +522,8 @@ offerings:
             .expect("orb on the agent")
     }
 
-    /// Moves the save time of `amp_orb`'s memory checkpoints on `agent` back by `by`, as
-    /// if it had slept that much longer. Stop the agent first.
-    pub fn age_checkpoints(&self, agent: &str, amp_orb: &str, by: Duration) {
+    /// Edits the fake state of `amp_orb` on `agent`. Stop the agent first.
+    fn edit_fake_orb(&self, agent: &str, amp_orb: &str, edit: impl FnOnce(&mut serde_json::Value)) {
         let file = self
             .root()
             .join("agents")
@@ -533,14 +532,30 @@ offerings:
             .join(format!("{}.json", self.orb_id(amp_orb)));
         let mut st: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        for saved in st["checkpoint_saved_unix_ms"]
-            .as_object_mut()
-            .unwrap()
-            .values_mut()
-        {
-            *saved = (saved.as_u64().unwrap() - by.as_millis() as u64).into();
-        }
+        edit(&mut st);
         std::fs::write(&file, serde_json::to_vec(&st).unwrap()).unwrap();
+    }
+
+    /// Moves the save time of `amp_orb`'s memory checkpoints on `agent` back by `by`, as
+    /// if it had slept that much longer. Stop the agent first.
+    pub fn age_checkpoints(&self, agent: &str, amp_orb: &str, by: Duration) {
+        self.edit_fake_orb(agent, amp_orb, |st| {
+            for saved in st["checkpoint_saved_unix_ms"]
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+            {
+                *saved = (saved.as_u64().unwrap() - by.as_millis() as u64).into();
+            }
+        });
+    }
+
+    /// Makes `amp_orb`'s memory checkpoints on `agent` disappear (consumed), as a
+    /// checkpoint its runtime discarded. Stop the agent first.
+    pub fn lose_checkpoints(&self, agent: &str, amp_orb: &str) {
+        self.edit_fake_orb(agent, amp_orb, |st| {
+            st["consumed"] = st["checkpoints"].clone();
+        });
     }
 
     /// The single orb on `agent` (panics if there isn't exactly one).

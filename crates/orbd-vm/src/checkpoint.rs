@@ -11,7 +11,9 @@
 //! maps a memory file keeps a valid mapping after it is unlinked. What a published
 //! checkpoint may be used for (restored once or many times) is the caller's policy.
 
-use crate::fsutil::{create_private_dir, fsync_dir, remove_via_trash, rename_durable};
+use crate::fsutil::{
+    create_private_dir, fsync_dir, move_to_trash, remove_via_trash, rename_durable,
+};
 use std::path::{Path, PathBuf};
 
 /// Written last into a checkpoint in progress; its presence marks the save complete.
@@ -87,6 +89,13 @@ impl CheckpointStore {
     /// Removes a published checkpoint. Missing is fine.
     pub fn discard(&self, name: &str) -> std::io::Result<()> {
         remove_via_trash(&self.published(name), &self.trash)
+    }
+
+    /// The first step of [`discard`](Self::discard): renames a published checkpoint into
+    /// the trash (one durable step) and returns its path there, or None if it is
+    /// missing. Delete that with [`crate::fsutil::remove`].
+    pub fn move_to_trash(&self, name: &str) -> std::io::Result<Option<PathBuf>> {
+        move_to_trash(&self.published(name), &self.trash)
     }
 
     /// Removes a save in progress. Missing is fine.

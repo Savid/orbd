@@ -91,6 +91,10 @@ pub struct CheckpointInfo {
     pub saved_unix_ms: u64,
     /// Bytes its files hold on disk (allocated blocks; memory files may be sparse).
     pub bytes: u64,
+    /// The guest synced its filesystems before the save, so its disk is consistent
+    /// without the checkpoint. Without that, a cold boot of the disk can find data the
+    /// guest had not yet written out.
+    pub synced: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,7 +180,8 @@ pub trait Runtime: Send + Sync {
 
     /// Removes a checkpoint, marking it consumed first so it is never restored: one that
     /// `start` already consumed, or (agent maintenance, orb stopped) one dropped so that
-    /// the orb cold-boots on its next start. Idempotent.
+    /// the orb cold-boots on its next start. The files (GiB) are deleted off the async
+    /// workers. Idempotent.
     async fn discard_checkpoint(
         &self,
         orb: OrbId,

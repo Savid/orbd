@@ -45,8 +45,8 @@ pub(crate) enum Task {
     Restore {
         intent: RestoreIntent,
     },
-    /// Drop the memory checkpoint of an orb asleep longer than `max_age` (see
-    /// [`super::checkpoint_age`]).
+    /// Drop the memory checkpoint of an orb asleep longer than `max_age`, or record that
+    /// its host no longer has it (see [`super::checkpoint_age`]).
     DropCheckpoint {
         checkpoint: SleepCheckpointRef,
         max_age: Duration,
@@ -59,6 +59,9 @@ pub(crate) enum Outcome {
     Restored,
     /// The memory checkpoint was dropped.
     Dropped,
+    /// The host no longer had the checkpoint the orb was recorded asleep on; what it
+    /// has was recorded.
+    Recorded,
     /// Nothing to do (not running, or already running; for a drop, not due).
     Unchanged,
     /// Could not save or restore; what is left was recorded.

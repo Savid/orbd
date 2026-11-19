@@ -361,20 +361,31 @@ fn orbs_whose_vm_dies_while_the_agent_runs_are_stopped() {
 }
 
 /// ORBD_CHECKPOINT_MAX_AGE_HOURS. Unset (the default), an orb asleep for days still
-/// wakes from its memory checkpoint. Set, the agent drops the checkpoint of an orb asleep
-/// longer (here at its start): the coordinator records the orb stopped, and its next wake
-/// cold-boots its disk. An orb asleep less long keeps its checkpoint.
+/// wakes from its memory checkpoint. Set, the agent checks ten minutes after it starts
+/// (here sooner, by failpoint) and drops the checkpoint of an orb asleep longer: the
+/// coordinator records the orb stopped, and its next wake cold-boots its disk. An orb
+/// asleep less long keeps its checkpoint; one whose checkpoint is gone from the host is
+/// recorded stopped too.
+#[cfg(feature = "failpoints")]
 #[test]
 fn memory_checkpoints_older_than_the_max_age_are_dropped() {
     const HOUR: Duration = Duration::from_secs(3600);
-    let mut c = Cluster::new(&["agent-a"], 2);
+    const FIRST_CHECK_NOW: &str = "agent::checkpoint_age::first_check_secs=return(0)";
+    let state = |c: &Cluster, amp: &str| {
+        c.orb_rows()
+            .into_iter()
+            .find(|r| r.0 == amp)
+            .map(|r| r.1)
+            .unwrap_or_default()
+    };
+    let mut c = Cluster::new(&["agent-a"], 3);
     c.start_all();
     assert_ok(&c.dispatch("spawn", "amp-old", &[]), "spawn old");
     assert_ok(&c.dispatch("pause", "amp-old", &[]), "pause old");
 
     c.kill_agent("agent-a");
     c.age_checkpoints("agent-a", "amp-old", 48 * HOUR);
-    c.start_agent("agent-a", "");
+    c.start_agent("agent-a", FIRST_CHECK_NOW);
     c.wait_connected(1);
     assert_ok(&c.dispatch("spawn", "amp-old", &[]), "wake old");
     let old = c.fake_orb("agent-a", "amp-old");
@@ -384,32 +395,37 @@ fn memory_checkpoints_older_than_the_max_age_are_dropped() {
         "off by default: restored after two days asleep"
     );
     assert_ok(&c.dispatch("pause", "amp-old", &[]), "pause old again");
-    assert_ok(&c.dispatch("spawn", "amp-new", &[]), "spawn new");
-    assert_ok(&c.dispatch("pause", "amp-new", &[]), "pause new");
+    for amp in ["amp-new", "amp-gone"] {
+        assert_ok(&c.dispatch("spawn", amp, &[]), "spawn");
+        assert_ok(&c.dispatch("pause", amp, &[]), "pause");
+    }
 
     c.kill_agent("agent-a");
     c.age_checkpoints("agent-a", "amp-old", 13 * HOUR);
+    c.lose_checkpoints("agent-a", "amp-gone");
     c.agent_env
         .push(("ORBD_CHECKPOINT_MAX_AGE_HOURS".into(), "12".into()));
     c.start_agent("agent-a", "");
     c.wait_connected(1);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        state(&c, "amp-old"),
+        "asleep",
+        "no check right at the start"
+    );
+
+    c.kill_agent("agent-a");
+    c.start_agent("agent-a", FIRST_CHECK_NOW);
+    c.wait_connected(1);
     wait_until(
         Duration::from_secs(20),
-        "amp-old recorded as stopped",
-        || {
-            c.orb_rows()
-                .iter()
-                .any(|r| r.0 == "amp-old" && r.1 == "stopped")
-        },
+        "amp-old and amp-gone recorded as stopped",
+        || state(&c, "amp-old") == "stopped" && state(&c, "amp-gone") == "stopped",
     );
-    assert!(
-        c.orb_rows()
-            .iter()
-            .any(|r| r.0 == "amp-new" && r.1 == "asleep"),
-        "{:?}",
-        c.orb_rows()
-    );
-    assert!(c.logs().contains("dropped the memory checkpoint"));
+    assert_eq!(state(&c, "amp-new"), "asleep");
+    let logs = c.logs();
+    assert!(logs.contains("dropped the memory checkpoint"));
+    assert!(logs.contains("asleep orb lost its memory checkpoint on its host"));
 
     assert_ok(&c.dispatch("spawn", "amp-old", &[]), "wake old cold");
     let old = c.fake_orb("agent-a", "amp-old");
@@ -419,6 +435,9 @@ fn memory_checkpoints_older_than_the_max_age_are_dropped() {
         "cold-booted"
     );
     assert!(old.disk && old.bootstraps.last().unwrap().cold_boot);
+    assert_ok(&c.dispatch("spawn", "amp-gone", &[]), "wake gone cold");
+    let gone = c.fake_orb("agent-a", "amp-gone");
+    assert_eq!((gone.counters.boots, gone.counters.restores), (2, 0));
     assert_ok(&c.dispatch("spawn", "amp-new", &[]), "wake new");
     let new = c.fake_orb("agent-a", "amp-new");
     assert_eq!((new.counters.boots, new.counters.restores), (1, 1));

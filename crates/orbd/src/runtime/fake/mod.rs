@@ -61,6 +61,10 @@ pub struct FakeOrbState {
     /// When each checkpoint generation was saved (unix ms), as a VM's manifest records.
     #[serde(default)]
     pub checkpoint_saved_unix_ms: std::collections::BTreeMap<u64, u64>,
+    /// Checkpoint generations saved without the guest syncing its disk first (as when a
+    /// VM's guest does not answer PrepareSleep); tests set it.
+    #[serde(default)]
+    pub checkpoints_unsynced: Vec<u64>,
     /// Project snapshot keys cloned from this orb.
     pub snapshots: Vec<String>,
     pub counters: FakeCounters,
@@ -355,6 +359,7 @@ impl Runtime for FakeRuntime {
             .map(|&saved_unix_ms| CheckpointInfo {
                 saved_unix_ms,
                 bytes: 0,
+                synced: !st.checkpoints_unsynced.contains(&g),
             }))
     }
 

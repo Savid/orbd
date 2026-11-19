@@ -1315,7 +1315,7 @@ impl Core {
                 Some(OrbState::Known {
                     state: StableOrbState::Sleeping { .. },
                 }) => {
-                    tracing::info!(%orb, "asleep orb's memory checkpoint was dropped on its host; it cold-boots on its next wake");
+                    tracing::info!(%orb, ?state, "asleep orb lost its memory checkpoint on its host; it cold-boots on its next wake");
                 }
                 Some(_) => {
                     tracing::warn!(%orb, ?state, "orb recorded as running has stopped on its host");
