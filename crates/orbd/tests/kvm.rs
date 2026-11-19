@@ -719,8 +719,8 @@ fn spawn_boots_from_project_snapshot() {
     let job = c.dispatch("spawn", "amp-older", &snap);
     assert_ok(&job, "spawn from a snapshot of an older image");
     assert!(
-        job.stdout.contains("descends from an older image")
-            || job.stderr.contains("descends from an older image")
+        job.stdout.contains("built on another image lineage")
+            || job.stderr.contains("built on another image lineage")
     );
     let (created, other) = wait_marker(&new_orb(&c, &before));
     assert!(created && other != id, "a fresh disk from the image");
@@ -735,8 +735,7 @@ fn spawn_boots_from_project_snapshot() {
     let job = c.dispatch("spawn", "amp-4", &snap);
     assert_ok(&job, "spawn with a vanished snapshot");
     assert!(
-        job.stdout.contains("creating the disk from")
-            || job.stderr.contains("creating the disk from")
+        job.stdout.contains("is not on this host") || job.stderr.contains("is not on this host")
     );
     let fourth = new_orb(&c, &before);
     let (created, other) = wait_marker(&fourth);

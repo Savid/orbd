@@ -60,6 +60,12 @@ const SYMLINKS: &[(&str, &str)] = &[
 
 pub const GUEST_HELPER_PATH: &str = "usr/local/sbin/orbd-guest";
 
+/// Bump when a change to the guest integration must reach orbs of existing projects:
+/// their project snapshots, which keep the integration they were built with, are then
+/// passed over once for the image (see [`super::lineage`]). Not the layer's digest,
+/// which changes with every orbd build.
+pub const GUEST_LINEAGE: u32 = 1;
+
 /// The integration layer (uncompressed tar) and its digest (`sha256:<hex>`).
 pub struct IntegrationLayer {
     pub tar: Vec<u8>,

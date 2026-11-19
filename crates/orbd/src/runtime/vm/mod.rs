@@ -255,27 +255,33 @@ pub async fn initial_source(
     else {
         return src;
     };
+    // A snapshot that is not here is the runtime's NotFound (and the executor's fallback).
+    let here = state_dir
+        .join("projects")
+        .join(snapshot.key.as_str())
+        .join("disk.raw");
     let current = match images.prepared(&image_ref).await {
-        Ok(img) => img.lineage,
-        Err(_) => None,
+        Ok(img) if here.is_file() => img.lineage,
+        _ => None,
     };
-    match current {
-        Some(current)
-            if project_lineage(state_dir, &snapshot.key).as_deref() != Some(&*current) =>
-        {
-            let why = format!(
-                "project snapshot {} descends from an older image; creating the disk from {image_ref}",
-                snapshot.key
-            );
-            tracing::info!("{why}");
-            log(ctx, &why);
-            InitialDiskSource::Image { image_ref }
-        }
-        _ => InitialDiskSource::ProjectSnapshot {
+    let built_on = project_lineage(state_dir, &snapshot.key);
+    let Some(current) = current.filter(|c| built_on.as_ref() != Some(c)) else {
+        return InitialDiskSource::ProjectSnapshot {
             snapshot,
             image_ref,
-        },
-    }
+        };
+    };
+    let why = format!(
+        "project snapshot {} was built on another image lineage ({}); creating the disk from {image_ref}",
+        snapshot.key,
+        match built_on {
+            Some(_) => "an older Debian or guest integration",
+            None => "not recorded",
+        }
+    );
+    tracing::info!(current, "{why}");
+    log(ctx, &why);
+    InitialDiskSource::Image { image_ref }
 }
 
 /// Publishes the project snapshot `<state>/projects/<key>/{disk.raw, meta.json}`:
@@ -373,6 +379,7 @@ mod tests {
         let key = ProjectSnapshotKey::from_external("project-1");
         let dir = state.path().join("projects").join(key.as_str());
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("disk.raw"), b"").unwrap();
         let (log, _rx) = tokio::sync::mpsc::channel(16);
         let now = std::time::Instant::now();
         let ctx = OpContext {
@@ -411,8 +418,14 @@ mod tests {
             "image not prepared"
         );
         assert!(
-            uses_snapshot(Fake(Some(None)), older).await,
+            uses_snapshot(Fake(Some(None)), older.clone()).await,
             "lineage unknown"
+        );
+        // Not on this host: left to the runtime (NotFound) and the executor's fallback.
+        std::fs::remove_file(dir.join("disk.raw")).unwrap();
+        assert!(
+            uses_snapshot(Fake(Some(Some("trixie"))), older).await,
+            "missing"
         );
         let image = InitialDiskSource::Image {
             image_ref: "amp-orb:latest".into(),
