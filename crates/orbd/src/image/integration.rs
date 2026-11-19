@@ -9,7 +9,7 @@
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-/// Files from `guest/rootfs/` (path inside the guest, mode, content).
+/// Files the layer adds, most from `guest/rootfs/` (path inside the guest, mode, content).
 const FILES: &[(&str, u32, &str)] = &[
     (
         "etc/systemd/system/orbd-guest.service",
