@@ -208,26 +208,9 @@ impl BlobCache {
         progress: Arc<AtomicU64>,
     ) -> Result<(), String> {
         let path = self.path(&desc.digest)?;
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
-            if desc.size < 0 || meta.len() == desc.size as u64 {
-                // Reused: garbage collection keeps blobs builds still use.
-                if let Ok(f) = std::fs::File::options().append(true).open(&path) {
-                    let _ = f.set_modified(std::time::SystemTime::now());
-                }
-                progress.fetch_add(desc.size.max(0) as u64, Ordering::Relaxed);
-                return Ok(());
-            }
-            // A damaged cache entry (older orbd emptied the blob of a layer a manifest
-            // lists twice); download it again.
-            tracing::warn!(
-                digest = %desc.digest,
-                cached = meta.len(),
-                expected = desc.size,
-                "cached blob has the wrong size; downloading it again"
-            );
-            tokio::fs::remove_file(&path)
-                .await
-                .map_err(|e| format!("{}: {e}", path.display()))?;
+        if self.cached(desc)? {
+            progress.fetch_add(desc.size.max(0) as u64, Ordering::Relaxed);
+            return Ok(());
         }
         let tmp = path.with_extension(format!("part-{}", uuid::Uuid::new_v4().simple()));
         let result = async {
@@ -261,6 +244,30 @@ impl BlobCache {
             let _ = tokio::fs::remove_file(&tmp).await;
         }
         result
+    }
+
+    /// Whether `desc` is in the cache with its full size; if so, marks it used so garbage
+    /// collection keeps it. A wrong-sized entry is reported as missing, and the download
+    /// that follows renames a good copy over it: older orbd emptied the cached blob of a
+    /// layer that a manifest lists twice.
+    fn cached(&self, desc: &OciDescriptor) -> Result<bool, String> {
+        let path = self.path(&desc.digest)?;
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return Ok(false);
+        };
+        if desc.size >= 0 && meta.len() != desc.size as u64 {
+            tracing::warn!(
+                digest = %desc.digest,
+                cached = meta.len(),
+                expected = desc.size,
+                "cached blob has the wrong size; downloading it again"
+            );
+            return Ok(false);
+        }
+        if let Ok(f) = std::fs::File::options().append(true).open(&path) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+        Ok(true)
     }
 
     /// Hard-links (or copies across filesystems) a cached blob into an OCI layout. A blob
@@ -302,5 +309,28 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Counting<W> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cache entry shorter than its descriptor (as older orbd left the blob of a
+    /// repeated layer) is downloaded again instead of reused.
+    #[test]
+    fn only_a_full_sized_cached_blob_is_reused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::new(tmp.path().to_path_buf());
+        let desc = OciDescriptor {
+            digest: format!("sha256:{}", "b".repeat(64)),
+            size: 34,
+            ..Default::default()
+        };
+        assert!(!cache.cached(&desc).unwrap(), "missing");
+        std::fs::write(cache.path(&desc.digest).unwrap(), b"").unwrap();
+        assert!(!cache.cached(&desc).unwrap(), "emptied");
+        std::fs::write(cache.path(&desc.digest).unwrap(), [0u8; 34]).unwrap();
+        assert!(cache.cached(&desc).unwrap(), "intact");
     }
 }
