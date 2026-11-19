@@ -60,6 +60,22 @@ pub struct PreparedImage {
     pub rootfs: PathBuf,
     /// Size of `rootfs` in bytes (the filesystem size; orb disks grow beyond it).
     pub rootfs_bytes: u64,
+    /// What a project snapshot must descend from to stand in for this image: see
+    /// [`lineage`]. None for images published before orbd recorded their bottom layer.
+    pub lineage: Option<String>,
+}
+
+/// Identity of an image as far as project snapshots go: the recipe, the guest
+/// integration and the image's bottom layer (its distribution). Amp's routine rebuilds
+/// keep it; a new Debian release or new guest integration changes it, and project
+/// snapshots of the previous lineage are then passed over for the image.
+pub fn lineage(recipe_version: u32, guest_integration_digest: &str, bottom_layer: &str) -> String {
+    sha256_hex(
+        format!(
+            "orbd-lineage\nrecipe={recipe_version}\nguest={guest_integration_digest}\nbottom={bottom_layer}\n"
+        )
+        .as_bytes(),
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +97,9 @@ struct ImageMeta {
     guest_integration_digest: String,
     rootfs_bytes: u64,
     created_unix: u64,
+    /// Digest of the image's first layer; absent in images published by older orbd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bottom_layer: Option<String>,
 }
 
 /// `images/refs/<sha256(ref)>.json`: what a reference last resolved to.
@@ -425,6 +444,10 @@ impl ImageStore {
         Some(PreparedImage {
             key,
             image_ref: image_ref.to_owned(),
+            lineage: meta
+                .bottom_layer
+                .as_deref()
+                .map(|bottom| lineage(meta.recipe_version, &meta.guest_integration_digest, bottom)),
             manifest_digest: meta.manifest_digest,
             rootfs: dir.join(ROOTFS_FILE),
             rootfs_bytes: meta.rootfs_bytes,
@@ -543,6 +566,7 @@ impl ImageStore {
                 guest_integration_digest: self.inner.integration.digest.clone(),
                 rootfs_bytes: bytes,
                 created_unix: now_unix(),
+                bottom_layer: resolved.manifest.layers.first().map(|l| l.digest.clone()),
             },
         )
         .map_err(|e| e.to_string())?;
