@@ -43,7 +43,7 @@
 
 mod guest;
 
-use super::vm::checkpoints::{Checkpoints, MANIFEST};
+use super::vm::checkpoints::{Checkpoints, MANIFEST, remove_trashed};
 use super::vm::fsutil::{
     free_bytes, fsync_dir, read_json, remove_via_trash, rename_durable, write_json_atomic,
 };
@@ -56,8 +56,8 @@ use super::vm::{
     on_path, publish_project, run_tool,
 };
 use super::{
-    GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError, RuntimeObservation,
-    StartSource,
+    CheckpointInfo, GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError,
+    RuntimeObservation, StartSource,
 };
 use crate::config::agent::QemuRuntimeConfig;
 use crate::image::ImageError;
@@ -1204,7 +1204,8 @@ impl Runtime for QemuRuntime {
             Ok(boot_id) => Some(boot_id),
             Err(e) => {
                 // The memory image is consistent without it; the sync only matters if
-                // the checkpoint is later lost and the disk cold-boots.
+                // the checkpoint is later lost and the disk cold-boots (the manifest's
+                // missing guest_boot_id keeps it from ORBD_CHECKPOINT_MAX_AGE_HOURS).
                 tracing::warn!(orb = %orb.id, error = %e, "guest did not prepare for sleep; saving anyway");
                 log(
                     ctx,
@@ -1278,8 +1279,20 @@ impl Runtime for QemuRuntime {
         orb: OrbId,
         checkpoint: &SleepCheckpointRef,
     ) -> Result<(), RuntimeError> {
-        let _g = self.lock(orb).await;
-        self.checkpoints(orb).discard(checkpoint.generation)
+        let trashed = {
+            let _g = self.lock(orb).await;
+            self.checkpoints(orb).trash(checkpoint.generation)?
+        };
+        remove_trashed(orb, trashed).await;
+        Ok(())
+    }
+
+    async fn checkpoint_info(
+        &self,
+        orb: OrbId,
+        checkpoint: &SleepCheckpointRef,
+    ) -> Result<Option<CheckpointInfo>, RuntimeError> {
+        self.checkpoints(orb).info(checkpoint.generation)
     }
 
     /// `qemu-img convert` of the stopped overlay (with its backing) into a standalone
@@ -1422,4 +1435,55 @@ fn inject_write_fault() -> Result<(), String> {
 
 fn qmp_err(e: qmp::QmpError) -> RuntimeError {
     RuntimeError::Other(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(guest_boot_id: Option<String>) -> CheckpointManifest {
+        CheckpointManifest {
+            orb: OrbId::generate(),
+            generation: 1,
+            created_unix_ms: 1_700_000_000_000,
+            launch: LaunchConfig {
+                qemu: VmmIdentity {
+                    path: "/usr/bin/qemu-system-x86_64".into(),
+                    version: "1".into(),
+                    sha256: "s".into(),
+                },
+                cpu: CpuIdentity {
+                    model: "cpu".into(),
+                    flags_sha256: "f".into(),
+                },
+                kernel: KernelIdentity {
+                    path: "/k".into(),
+                    sha256: "k".into(),
+                },
+                machine_args: vec!["-m".into(), "4096M".into()],
+            },
+            base: BaseDisk {
+                source: "{}".into(),
+                path: "/b/rootfs.ext4".into(),
+                size: 1,
+                inode: 1,
+                mtime_ns: 1,
+            },
+            ram_bytes: 64 << 20,
+            migration: MIGRATION,
+            memory_file_bytes: 64 << 20,
+            guest_boot_id,
+            save_ms: 3,
+        }
+    }
+
+    /// The agent reads a QEMU checkpoint's save time and whether the guest synced its
+    /// disk from the manifest this runtime writes.
+    #[test]
+    fn checkpoint_info_reads_this_runtimes_manifest() {
+        let info = crate::runtime::vm::checkpoints::info_of(&manifest(Some("boot".into())));
+        assert_eq!((info.saved_unix_ms, info.synced), (1_700_000_000_000, true));
+        let info = crate::runtime::vm::checkpoints::info_of(&manifest(None));
+        assert!(!info.synced, "the guest did not answer PrepareSleep");
+    }
 }

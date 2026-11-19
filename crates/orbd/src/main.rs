@@ -59,7 +59,7 @@ enum Command {
         #[command(subcommand)]
         manage: Option<AgentCommand>,
         #[command(flatten)]
-        run: AgentArgs,
+        run: Box<AgentArgs>,
     },
     /// Print a single-use join token for a new agent (run on the coordinator).
     JoinToken {
@@ -227,6 +227,10 @@ struct AgentArgs {
     /// available memory, less this, holds it [default: max(4 GiB, 10% of memory)].
     #[arg(long, env = "ORBD_MEMORY_RESERVE_GIB")]
     memory_reserve_gib: Option<u64>,
+    /// Drop the memory checkpoint of an orb asleep longer than this: it cold-boots on
+    /// its next wake (disk kept, processes lost) [default: 0, checkpoints are kept].
+    #[arg(long, env = "ORBD_CHECKPOINT_MAX_AGE_HOURS")]
+    checkpoint_max_age_hours: Option<u64>,
     /// Prometheus listener, e.g. `127.0.0.1:9465`.
     #[arg(long, env = "ORBD_METRICS_LISTEN")]
     metrics_listen: Option<std::net::SocketAddr>,
@@ -419,6 +423,7 @@ fn main() -> anyhow::Result<()> {
             manage: None,
             run: a,
         } => {
+            let a = *a;
             orbd::telemetry::init_logging(cli.log_json);
             let mut config = match &a.config {
                 Some(p) => orbd::config::agent::AgentConfig::load(p)?,
@@ -437,6 +442,9 @@ fn main() -> anyhow::Result<()> {
             s.metrics_listen = a.metrics_listen;
             s.coordinator_url = a.coordinator_url;
             s.overflow = a.overflow;
+            s.checkpoint_max_age = orbd::config::agent::AgentSection::checkpoint_max_age_hours(
+                a.checkpoint_max_age_hours,
+            );
             s.egress = orbd::config::agent::Egress::new(a.allow_private_egress, &a.egress_allow)
                 .map_err(anyhow::Error::msg)?;
             config.agent = s;

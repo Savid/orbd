@@ -181,9 +181,10 @@ fn reserve_for(c: &Connection, orb: OrbId, state: &OrbState) -> Result<()> {
 }
 
 /// Applies what the orb's host reports outside any command: only that an orb recorded
-/// as running has stopped (its VM died with the host, or while the agent was down),
-/// only when no command is open for it and the report is not older than the record.
-/// Returns whether the record changed.
+/// as running has stopped (its VM died with the host, or while the agent was down), or
+/// that an orb recorded asleep has lost its memory checkpoint (its agent dropped it past
+/// `ORBD_CHECKPOINT_MAX_AGE_HOURS`), only when no command is open for it and the report
+/// is not older than the record. Returns the state it replaced, if it changed.
 pub fn observe_stopped(
     c: &mut Connection,
     orb: OrbId,
@@ -191,36 +192,50 @@ pub fn observe_stopped(
     generation: u64,
     state: &OrbState,
     now: u64,
-) -> Result<bool> {
-    let stopped = matches!(
-        state,
+) -> Result<Option<OrbState>> {
+    let (stopped, without_checkpoint) = match state {
         OrbState::Known {
-            state: StableOrbState::Sleeping { .. } | StableOrbState::DiskOnlyStopped { .. }
-        }
-    );
+            state: StableOrbState::Sleeping { .. },
+        } => (true, false),
+        OrbState::Known {
+            state: StableOrbState::DiskOnlyStopped { .. },
+        } => (true, true),
+        _ => (false, false),
+    };
     if !stopped {
-        return Ok(false);
+        return Ok(None);
     }
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let Some(rec) = get_orb(&tx, orb)? else {
-        return Ok(false);
+        return Ok(None);
     };
+    let (running, asleep) = match &rec.observation.state {
+        OrbState::Known {
+            state: StableOrbState::Running,
+        } => (true, false),
+        OrbState::Known {
+            state: StableOrbState::Sleeping { .. },
+        } => (false, true),
+        _ => (false, false),
+    };
+    let lost_checkpoint = asleep && without_checkpoint;
     if &rec.location != location
         || generation < rec.observation.generation
-        || !matches!(
-            rec.observation.state,
-            OrbState::Known {
-                state: StableOrbState::Running
-            }
-        )
+        || !(running || lost_checkpoint)
         || open_command(&tx, orb)?.is_some()
     {
-        return Ok(false);
+        return Ok(None);
     }
     let obs = VersionedObservation {
         state: state.clone(),
         generation: rec.observation.generation,
-        observed_at_unix_ms: now,
+        // An orb that lost its checkpoint has been stopped since it went to sleep: its
+        // idle time (`idle_orb_ttl_days`, `--asleep-days`) goes on from then.
+        observed_at_unix_ms: if lost_checkpoint {
+            rec.observation.observed_at_unix_ms
+        } else {
+            now
+        },
     };
     tx.execute(
         "UPDATE orbs SET observation_json = ?2 WHERE id = ?1",
@@ -228,7 +243,7 @@ pub fn observe_stopped(
     )?;
     reserve_for(&tx, orb, state)?;
     tx.commit()?;
-    Ok(true)
+    Ok(Some(rec.observation.state))
 }
 
 pub fn get_command(c: &Connection, op: OperationId) -> Result<Option<CmdRow>> {
@@ -878,4 +893,162 @@ pub fn running_reservations(c: &Connection) -> Result<std::collections::HashMap<
         ))
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fleet(agent: &str) -> Location {
+        Location::Fleet {
+            backend_id: BackendId::new("fleet"),
+            agent_id: AgentId::new(agent),
+        }
+    }
+
+    /// An orb on agent-a, recorded `state` by its generation 5 command at
+    /// `observed_at`.
+    fn orb(c: &Connection, state: &OrbState, observed_at: u64) -> OrbId {
+        let id = OrbId::generate();
+        let spec = OrbSpec {
+            template: SpecTemplate {
+                target: ExecutionTarget::Fleet {
+                    runtime: RuntimeKind::Fake,
+                },
+                resources: Resources {
+                    vcpus: 2,
+                    memory_bytes: 2 * GIB,
+                    disk_bytes: 4 * GIB,
+                },
+                requirements: CapabilityRequirements {
+                    release_compute_when_paused: true,
+                    nested_kvm: NestedKvmRequirement::NotRequired,
+                    project_snapshots: SnapshotRequirement::NotRequired,
+                    arch: Arch::Amd64,
+                },
+                pause_policy: PausePolicy::MemoryPreserving {
+                    on_failure: CheckpointFailurePolicy::ColdStop,
+                },
+            },
+            initial_disk: InitialDiskSource::Image {
+                image_ref: "image".into(),
+            },
+        };
+        let obs = VersionedObservation {
+            state: state.clone(),
+            generation: 5,
+            observed_at_unix_ms: observed_at,
+        };
+        c.execute(
+            "INSERT INTO orbs(id, amp_endpoint, amp_orb_id, offering_id, spec_json, spec_digest,
+                location_json, last_issued_generation, observation_json, observation_generation,
+                created_ms)
+             VALUES (?1, 'amp', ?2, 'offering', ?3, ?4, ?5, 5, ?6, 5, 0)",
+            params![
+                id.to_string(),
+                format!("amp-{id}"),
+                js(&spec),
+                spec.digest().0,
+                js(&fleet("agent-a")),
+                js(&obs)
+            ],
+        )
+        .unwrap();
+        id
+    }
+
+    /// What a host reports outside any command is applied only to an orb recorded
+    /// running (it stopped: stopped since now) or asleep that has lost its checkpoint
+    /// (stopped since it went to sleep), from the orb's own location, not older than the
+    /// record, and while no command is open for it.
+    #[test]
+    fn observe_stopped_applies_a_stop_or_a_lost_checkpoint_only() {
+        let mut c = crate::coordinator::db::test_connection();
+        let (here, then, now) = (fleet("agent-a"), 1_000_000, 2_000_000);
+        let asleep = OrbState::known(StableOrbState::Sleeping {
+            checkpoint: SleepCheckpointRef { generation: 3 },
+        });
+        let stopped = OrbState::known(StableOrbState::DiskOnlyStopped {
+            reason: "memory checkpoint dropped".into(),
+        });
+        let running = OrbState::known(StableOrbState::Running);
+        let observed = |c: &Connection, id| get_orb(c, id).unwrap().unwrap().observation;
+
+        let a = orb(&c, &asleep, then);
+        let other = fleet("agent-b");
+        assert_eq!(
+            observe_stopped(&mut c, a, &other, 5, &stopped, now).unwrap(),
+            None,
+            "another location"
+        );
+        assert_eq!(
+            observe_stopped(&mut c, a, &here, 4, &stopped, now).unwrap(),
+            None,
+            "older than the record"
+        );
+        c.execute(
+            "INSERT INTO commands(operation_id, orb_id, generation, action_json, command_digest,
+                status, created_ms, work_deadline_ms, cleanup_deadline_ms)
+             VALUES (?1, ?2, 6, ?3, 'd', 'accepted', 0, 0, 0)",
+            params![
+                OperationId::generate().to_string(),
+                a.to_string(),
+                js(&Action::Spawn)
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            observe_stopped(&mut c, a, &here, 6, &stopped, now).unwrap(),
+            None,
+            "a command is open"
+        );
+        c.execute("UPDATE commands SET status = 'terminal'", [])
+            .unwrap();
+        assert_eq!(
+            observe_stopped(&mut c, a, &here, 6, &asleep, now).unwrap(),
+            None,
+            "asleep is no news"
+        );
+        assert_eq!(
+            observe_stopped(&mut c, a, &here, 6, &running, now).unwrap(),
+            None,
+            "only stops are applied"
+        );
+        assert_eq!(observed(&c, a).state, asleep, "nothing applied so far");
+        assert_eq!(
+            observe_stopped(&mut c, a, &here, 6, &stopped, now).unwrap(),
+            Some(asleep.clone()),
+            "asleep, then lost its checkpoint"
+        );
+        let o = observed(&c, a);
+        assert_eq!(
+            (o.state, o.generation, o.observed_at_unix_ms),
+            (stopped.clone(), 5, then),
+            "stopped since it went to sleep"
+        );
+
+        let r = orb(&c, &running, then);
+        assert_eq!(
+            observe_stopped(&mut c, r, &here, 5, &stopped, now).unwrap(),
+            Some(running.clone())
+        );
+        let o = observed(&c, r);
+        assert_eq!(
+            (o.state, o.observed_at_unix_ms),
+            (stopped.clone(), now),
+            "stopped since now"
+        );
+
+        let faulted = OrbState::Faulted {
+            last_known: StableOrbState::Running,
+            reason: "inspect failed".into(),
+        };
+        let f = orb(&c, &faulted, then);
+        assert_eq!(
+            observe_stopped(&mut c, f, &here, 5, &stopped, now).unwrap(),
+            None,
+            "faulted"
+        );
+        assert_eq!(observed(&c, f).state, faulted);
+    }
 }

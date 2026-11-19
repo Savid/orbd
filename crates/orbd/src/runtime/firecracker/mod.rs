@@ -45,7 +45,7 @@
 mod api;
 mod guest;
 
-use super::vm::checkpoints::{Checkpoints, MANIFEST};
+use super::vm::checkpoints::{Checkpoints, MANIFEST, remove_trashed};
 use super::vm::fsutil::write_json_atomic;
 use super::vm::fsutil::{free_bytes, fsync_dir, read_json, remove_via_trash, rename_durable};
 use super::vm::guest as channel;
@@ -57,8 +57,8 @@ use super::vm::{
     machine_id, on_path, publish_project,
 };
 use super::{
-    GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError, RuntimeObservation,
-    StartSource,
+    CheckpointInfo, GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError,
+    RuntimeObservation, StartSource,
 };
 use crate::config::agent::FirecrackerRuntimeConfig;
 use crate::image::ImageError;
@@ -1225,8 +1225,20 @@ impl Runtime for FirecrackerRuntime {
         orb: OrbId,
         checkpoint: &SleepCheckpointRef,
     ) -> Result<(), RuntimeError> {
-        let _g = self.locks.lock(orb).await;
-        self.checkpoints(orb).discard(checkpoint.generation)
+        let trashed = {
+            let _g = self.locks.lock(orb).await;
+            self.checkpoints(orb).trash(checkpoint.generation)?
+        };
+        remove_trashed(orb, trashed).await;
+        Ok(())
+    }
+
+    async fn checkpoint_info(
+        &self,
+        orb: OrbId,
+        checkpoint: &SleepCheckpointRef,
+    ) -> Result<Option<CheckpointInfo>, RuntimeError> {
+        self.checkpoints(orb).info(checkpoint.generation)
     }
 
     /// Copies the stopped orb's disk (reflink or sparse) into a project snapshot, the
@@ -1371,4 +1383,49 @@ fn throttle(
         return Some(Duration::from_millis(bytes / MIB * 1000 / mib.max(1)));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(guest_boot_id: Option<String>) -> CheckpointManifest {
+        CheckpointManifest {
+            orb: OrbId::generate(),
+            generation: 1,
+            created_unix_ms: 1_700_000_000_000,
+            machine: Machine {
+                firecracker: VmmIdentity {
+                    path: "/usr/bin/firecracker".into(),
+                    version: "1".into(),
+                    sha256: "s".into(),
+                },
+                cpu: CpuIdentity {
+                    model: "cpu".into(),
+                    flags_sha256: "f".into(),
+                },
+                kernel: KernelIdentity {
+                    path: "/k".into(),
+                    sha256: "k".into(),
+                },
+                vcpus: 2,
+                memory_mib: 64,
+                boot_args: "console=ttyS0".into(),
+            },
+            memory_bytes: 64 << 20,
+            vmstate_bytes: 1,
+            guest_boot_id,
+            save_ms: 3,
+        }
+    }
+
+    /// The agent reads a Firecracker checkpoint's save time and whether the guest
+    /// synced its disk from the manifest this runtime writes.
+    #[test]
+    fn checkpoint_info_reads_this_runtimes_manifest() {
+        let info = crate::runtime::vm::checkpoints::info_of(&manifest(Some("boot".into())));
+        assert_eq!((info.saved_unix_ms, info.synced), (1_700_000_000_000, true));
+        let info = crate::runtime::vm::checkpoints::info_of(&manifest(None));
+        assert!(!info.synced, "the guest did not answer PrepareSleep");
+    }
 }

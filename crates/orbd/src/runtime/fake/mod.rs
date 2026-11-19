@@ -16,8 +16,8 @@
 //! `clone_disk`, `delete`, `bootstrap`.
 
 use super::{
-    BootstrapRequest, GuestControl, GuestError, OpContext, Runtime, RuntimeCapabilities,
-    RuntimeError, RuntimeObservation, StartSource,
+    BootstrapRequest, CheckpointInfo, GuestControl, GuestError, OpContext, Runtime,
+    RuntimeCapabilities, RuntimeError, RuntimeObservation, StartSource,
 };
 use crate::config::agent::FakeRuntimeConfig;
 use crate::model::{
@@ -58,6 +58,13 @@ pub struct FakeOrbState {
     pub checkpoints: Vec<u64>,
     /// Checkpoint generations consumed (restored from, or invalidated by a cold boot).
     pub consumed: Vec<u64>,
+    /// When each checkpoint generation was saved (unix ms), as a VM's manifest records.
+    #[serde(default)]
+    pub checkpoint_saved_unix_ms: std::collections::BTreeMap<u64, u64>,
+    /// Checkpoint generations saved without the guest syncing its disk first (as when a
+    /// VM's guest does not answer PrepareSleep); tests set it.
+    #[serde(default)]
+    pub checkpoints_unsynced: Vec<u64>,
     /// Project snapshot keys cloned from this orb.
     pub snapshots: Vec<String>,
     pub counters: FakeCounters,
@@ -288,6 +295,8 @@ impl Runtime for FakeRuntime {
             }
             st.running = false;
             st.checkpoints.push(checkpoint_generation);
+            st.checkpoint_saved_unix_ms
+                .insert(checkpoint_generation, crate::model::unix_ms_now());
             st.counters.checkpoints += 1;
             Ok(())
         })?;
@@ -328,6 +337,30 @@ impl Runtime for FakeRuntime {
         })?;
         crate::crash_point!("fake::discard_checkpoint::after_effect");
         Ok(())
+    }
+
+    async fn checkpoint_info(
+        &self,
+        orb: OrbId,
+        checkpoint: &SleepCheckpointRef,
+    ) -> Result<Option<CheckpointInfo>, RuntimeError> {
+        let st = {
+            let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.load(orb)?
+        };
+        let g = checkpoint.generation;
+        if !st.checkpoints.contains(&g) || st.consumed.contains(&g) {
+            return Ok(None);
+        }
+        // The fake holds no files: a checkpoint is as big as nothing.
+        Ok(st
+            .checkpoint_saved_unix_ms
+            .get(&g)
+            .map(|&saved_unix_ms| CheckpointInfo {
+                saved_unix_ms,
+                bytes: 0,
+                synced: !st.checkpoints_unsynced.contains(&g),
+            }))
     }
 
     async fn clone_disk(

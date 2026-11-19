@@ -621,6 +621,34 @@ pub fn list_orbs(conn: &Connection, after: &str, limit: usize) -> rusqlite::Resu
         .collect()
 }
 
+/// Orb rows, each with whether something other than its recorded state decides what
+/// happens to it next: an accepted operation that is not terminal, or a maintenance
+/// restore intent.
+const CLAIMED_ORBS: &str = "SELECT orb_id, highest_generation, created, last_state_json,
+        restore_json IS NOT NULL OR EXISTS (
+            SELECT 1 FROM receipts r WHERE r.orb_id = o.orb_id AND r.status = 'accepted')
+     FROM orbs o";
+
+fn claimed_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(OrbRow, bool)> {
+    Ok((orb_from_row(r)?, r.get(4)?))
+}
+
+/// Every orb, with whether it is claimed (see [`CLAIMED_ORBS`]).
+pub fn list_orbs_claimed(conn: &Connection) -> rusqlite::Result<Vec<(OrbRow, bool)>> {
+    let mut st = conn.prepare(&format!("{CLAIMED_ORBS} ORDER BY o.orb_id"))?;
+    st.query_map([], claimed_from_row)?.collect()
+}
+
+/// One orb, with whether it is claimed (see [`CLAIMED_ORBS`]).
+pub fn get_orb_claimed(conn: &Connection, orb: OrbId) -> rusqlite::Result<Option<(OrbRow, bool)>> {
+    conn.query_row(
+        &format!("{CLAIMED_ORBS} WHERE o.orb_id = ?1"),
+        [orb.to_string()],
+        claimed_from_row,
+    )
+    .optional()
+}
+
 /// The most recent orb definition for every orb the agent has accepted work for.
 pub fn list_orb_definitions(conn: &Connection) -> rusqlite::Result<Vec<OrbDefinition>> {
     let mut st = conn.prepare(

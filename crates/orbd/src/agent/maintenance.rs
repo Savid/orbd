@@ -13,6 +13,9 @@
 //! resynced (no credentials: Amp sent no spawn). An orb with its own unfinished
 //! operation, or a newer accepted command, is left to that command. Nothing here
 //! reports an Amp command result.
+//!
+//! The same per-orb serialization runs [`super::checkpoint_age`]'s drops of memory
+//! checkpoints older than `ORBD_CHECKPOINT_MAX_AGE_HOURS`.
 
 use super::db::{self, RestoreIntent};
 use super::{Shared, executor};
@@ -36,15 +39,30 @@ const CLEANUP_RESERVE: Duration = Duration::from_secs(20);
 const RESTORE_BUDGET: Duration = Duration::from_secs(120);
 
 pub(crate) enum Task {
-    Checkpoint { deadline: Instant },
-    Restore { intent: RestoreIntent },
+    Checkpoint {
+        deadline: Instant,
+    },
+    Restore {
+        intent: RestoreIntent,
+    },
+    /// Drop the memory checkpoint of an orb asleep longer than `max_age`, or record that
+    /// its host no longer has it (see [`super::checkpoint_age`]).
+    DropCheckpoint {
+        checkpoint: SleepCheckpointRef,
+        max_age: Duration,
+    },
 }
 
 #[derive(Debug)]
 pub(crate) enum Outcome {
     Saved,
     Restored,
-    /// Nothing to do (not running, or already running).
+    /// The memory checkpoint was dropped.
+    Dropped,
+    /// The host no longer had the checkpoint the orb was recorded asleep on; what it
+    /// has was recorded.
+    Recorded,
+    /// Nothing to do (not running, or already running; for a drop, not due).
     Unchanged,
     /// Could not save or restore; what is left was recorded.
     Failed(String),
@@ -172,6 +190,11 @@ pub(super) async fn run(sh: &Arc<Shared>, orb: &OrbDefinition, task: Task) -> Ou
     let outcome = match task {
         Task::Checkpoint { deadline } => checkpoint(sh, &*rt, orb, deadline).await,
         Task::Restore { intent } => restore(sh, &*rt, orb, intent).await,
+        // Only ever drops a stopped orb's checkpoint: its reservation is unchanged.
+        Task::DropCheckpoint {
+            checkpoint,
+            max_age,
+        } => return super::checkpoint_age::run(sh, &*rt, orb.id, checkpoint, max_age).await,
     };
     let running = matches!(rt.inspect(orb.id).await, Ok(RuntimeObservation::Running));
     let mut reserved = sh.reserved.lock().unwrap_or_else(|e| e.into_inner());

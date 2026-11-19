@@ -182,6 +182,15 @@ impl Db {
     }
 }
 
+/// An in-memory database with the coordinator's schema, for tests of `store`.
+#[cfg(test)]
+pub(crate) fn test_connection() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(SCHEMA).unwrap();
+    conn
+}
+
 fn migrate(conn: &mut Connection, path: &Path, schema: &str, version: i64) -> Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     match current {

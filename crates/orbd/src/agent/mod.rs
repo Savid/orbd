@@ -10,6 +10,8 @@
 //! * [`maintenance`]: graceful stop (drain: checkpoint running orbs, leave restore
 //!   intents) and their restore at the next start.
 //! * [`gc`]: deletes project snapshots and prepared images no orb is built on.
+//! * [`checkpoint_age`]: opt-in, drops the memory checkpoints of orbs asleep longer than
+//!   `ORBD_CHECKPOINT_MAX_AGE_HOURS` (they cold-boot on their next wake).
 //!
 //! Crash points (feature `failpoints`, `FAILPOINTS="<name>=return"` aborts):
 //! `agent::accepted_committed` (receipt durable, Accepted not yet sent),
@@ -19,6 +21,7 @@
 //! commit) and `agent::terminal_committed` (result durable, Completed not yet sent).
 //! The fake runtime adds `fake::<method>::after_effect`.
 
+mod checkpoint_age;
 mod db;
 mod detect;
 mod executor;
@@ -382,6 +385,7 @@ pub async fn run(
     executor::recover(&shared).await?;
     tokio::spawn(executor::watch(shared.clone()));
     tokio::spawn(gc::run_loop(shared.clone()));
+    tokio::spawn(checkpoint_age::run_loop(shared.clone()));
     measure_disk(&shared).await;
     tokio::spawn({
         let sh = shared.clone();

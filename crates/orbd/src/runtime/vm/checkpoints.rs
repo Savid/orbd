@@ -14,7 +14,7 @@
 use super::fsutil::write_atomic;
 use super::io_err;
 use crate::model::OrbId;
-use crate::runtime::RuntimeError;
+use crate::runtime::{CheckpointInfo, RuntimeError};
 use orbd_vm::checkpoint::CheckpointStore;
 use std::path::{Path, PathBuf};
 
@@ -72,6 +72,33 @@ impl Checkpoints {
         !dir.is_dir() || dir.join("consumed").exists()
     }
 
+    /// A published, unconsumed checkpoint's save time (its manifest's `created_unix_ms`,
+    /// written as the save completed, so when the orb went to sleep), whether the guest
+    /// synced its disk first (the manifest has the `guest_boot_id` it answered
+    /// PrepareSleep with) and the bytes its files hold. `None` if it is missing or
+    /// consumed; an error if its manifest cannot be read.
+    pub fn info(&self, generation: u64) -> Result<Option<CheckpointInfo>, RuntimeError> {
+        /// What both runtimes' manifests record about the save.
+        #[derive(serde::Deserialize)]
+        struct Saved {
+            created_unix_ms: u64,
+            guest_boot_id: Option<String>,
+        }
+        if self.is_consumed(generation) {
+            return Ok(None);
+        }
+        let dir = self.published(generation);
+        let Some(saved) = super::fsutil::read_json::<Saved>(&dir.join(MANIFEST)).map_err(io_err)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(CheckpointInfo {
+            saved_unix_ms: saved.created_unix_ms,
+            bytes: allocated_bytes(&dir),
+            synced: saved.guest_boot_id.is_some(),
+        }))
+    }
+
     /// Durably marks a published checkpoint consumed: it is never restored again.
     pub fn consume(&self, generation: u64) -> Result<(), RuntimeError> {
         let dir = self.published(generation);
@@ -98,6 +125,16 @@ impl Checkpoints {
     pub fn discard(&self, generation: u64) -> Result<(), RuntimeError> {
         self.consume(generation)?;
         self.store.discard(&generation.to_string()).map_err(io_err)
+    }
+
+    /// The durable part of [`discard`](Self::discard): consumes a checkpoint and moves
+    /// it into the trash, so it is no longer the orb's. Returns its path in the trash
+    /// (None if it was missing), for [`remove_trashed`].
+    pub fn trash(&self, generation: u64) -> Result<Option<PathBuf>, RuntimeError> {
+        self.consume(generation)?;
+        self.store
+            .move_to_trash(&generation.to_string())
+            .map_err(io_err)
     }
 
     pub fn discard_tmp(&self, generation: u64) -> Result<(), RuntimeError> {
@@ -176,9 +213,66 @@ impl Checkpoints {
     }
 }
 
+/// Deletes a checkpoint [`Checkpoints::trash`] moved into the trash, on a blocking
+/// thread: its memory file may hold GiB, and unlinking it can take a while. Already out
+/// of the orb's way, so a failure only leaves it in the trash (logged).
+pub async fn remove_trashed(orb: OrbId, trashed: Option<PathBuf>) {
+    let Some(path) = trashed else {
+        return;
+    };
+    let p = path.clone();
+    let removed = match tokio::task::spawn_blocking(move || super::fsutil::remove(&p)).await {
+        Ok(r) => r,
+        Err(e) => Err(std::io::Error::other(e)),
+    };
+    if let Err(e) = removed {
+        tracing::warn!(%orb, path = %path.display(), error = %e, "deleting a checkpoint from the trash");
+    }
+}
+
+/// For the runtimes' tests: what [`Checkpoints::info`] reads of a checkpoint published
+/// with `manifest` (the runtime's own manifest type) and a sparse 64 MiB memory file
+/// holding 4 KiB.
+#[cfg(test)]
+pub(crate) fn info_of(manifest: &impl serde::Serialize) -> CheckpointInfo {
+    use std::io::Write;
+    let tmp = tempfile::tempdir().unwrap();
+    let cps = Checkpoints::new(
+        OrbId::generate(),
+        tmp.path().join("checkpoints"),
+        tmp.path().join("trash"),
+    );
+    let dir = cps.published(1);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut memory = std::fs::File::create(dir.join("memory")).unwrap();
+    memory.set_len(64 << 20).unwrap();
+    memory.write_all(&[7u8; 4096]).unwrap();
+    memory.sync_all().unwrap();
+    super::fsutil::write_json_atomic(&dir.join(MANIFEST), manifest).unwrap();
+    let info = cps.info(1).unwrap().expect("a published checkpoint");
+    assert!(
+        info.bytes >= 4096 && info.bytes < 64 << 20,
+        "allocated, not apparent, bytes: {info:?}"
+    );
+    info
+}
+
 /// Size of a checkpoint file, for manifests and compatibility checks.
 pub fn file_len(path: &Path) -> Result<u64, RuntimeError> {
     std::fs::metadata(path).map(|m| m.len()).map_err(io_err)
+}
+
+/// Blocks allocated by the files directly in `dir` (a checkpoint has no subdirectories).
+fn allocated_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.blocks().saturating_mul(512))
+        .fold(0, u64::saturating_add)
 }
 
 #[cfg(test)]
@@ -237,5 +331,52 @@ mod tests {
         publish(&cps, 13, false);
         cps.discard_all().unwrap();
         assert!(on_disk(&dir).is_empty());
+    }
+
+    /// A checkpoint that is not published (or still being saved), has no manifest, or
+    /// was consumed or discarded has no info; one whose manifest cannot be read is an
+    /// error, so it is kept. (Each runtime's tests read its own manifest type.)
+    #[test]
+    fn info_only_for_a_published_unconsumed_checkpoint_with_a_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("checkpoints");
+        let cps = Checkpoints::new(OrbId::generate(), dir.clone(), tmp.path().join("trash"));
+        assert_eq!(cps.info(5).unwrap(), None, "not published");
+        std::fs::create_dir_all(cps.tmp(5)).unwrap();
+        assert_eq!(cps.info(5).unwrap(), None, "save in progress");
+
+        let p = cps.published(4);
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("memory"), b"ram").unwrap();
+        assert_eq!(cps.info(4).unwrap(), None, "no manifest");
+        std::fs::write(p.join(MANIFEST), b"{\"generation\": 4}").unwrap();
+        assert!(cps.info(4).is_err(), "a manifest without a save time");
+        std::fs::write(p.join(MANIFEST), b"{\"created_unix").unwrap();
+        assert!(cps.info(4).is_err(), "a corrupt manifest");
+
+        cps.consume(4).unwrap();
+        assert_eq!(cps.info(4).unwrap(), None, "consumed");
+        cps.discard(4).unwrap();
+        assert_eq!(cps.info(4).unwrap(), None, "discarded");
+    }
+
+    /// Trashing is the durable step (consumed, out of the checkpoints directory); the
+    /// trashed files are then deleted off the async workers.
+    #[tokio::test]
+    async fn trash_then_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("checkpoints");
+        let cps = Checkpoints::new(OrbId::generate(), dir.clone(), tmp.path().join("trash"));
+        publish(&cps, 6, false);
+        let trashed = cps.trash(6).unwrap().expect("moved");
+        assert!(
+            trashed.join("consumed").exists(),
+            "consumed before it moved"
+        );
+        assert!(on_disk(&dir).is_empty());
+        assert!(cps.is_consumed(6));
+        assert_eq!(cps.trash(6).unwrap(), None, "already gone");
+        remove_trashed(cps.orb, Some(trashed)).await;
+        assert!(on_disk(&tmp.path().join("trash")).is_empty());
     }
 }

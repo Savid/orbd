@@ -205,6 +205,20 @@ is used again, its next spawn starts a fresh orb from the image (or project snap
 without its files, uncommitted work or processes, and Amp runs setup again. Set the TTL
 longer than any thread you might come back to.
 
+Until then, a sleeping QEMU or Firecracker orb keeps its memory checkpoint, a file the
+size of its memory, on its agent's disk. An agent started with
+`ORBD_CHECKPOINT_MAX_AGE_HOURS` (`--checkpoint-max-age-hours`; default 0: checkpoints are
+kept for as long as orbs sleep), e.g. `-e ORBD_CHECKPOINT_MAX_AGE_HOURS=12`, deletes the
+checkpoint of an orb asleep longer than that. It checks 10 minutes after it starts (so a
+clock that is still wrong at boot deletes nothing), then hourly. The orb's next wake
+cold-boots its disk: its files and uncommitted work are kept, its processes (shells, dev
+servers, builds in progress) are lost as after a reboot, and Amp's executor restarts as
+it does on every wake. `orbd orb list` then shows the orb `stopped` instead of `asleep`,
+with no checkpoint. A checkpoint is never deleted while its orb is being woken, paused or
+deleted, and is kept however old if the guest did not sync its disk before it was saved
+(it did not answer in time when it went to sleep), or if its save time is more than an
+hour in the future.
+
 To delete the orbs of archived threads sooner, run a job that checks each orb's thread
 in Amp: `orbd orb list --json` lists every orb's Amp id (`amp-<thread id>`), state,
 agent and what it holds on disk (`--asleep-days 7` narrows it to orbs asleep a week or
