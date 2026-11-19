@@ -661,8 +661,8 @@ fn wait_marker(orb: &Path) -> (bool, String) {
 #[test]
 #[ignore = "needs KVM; see the module docs"]
 fn spawn_boots_from_project_snapshot() {
-    // Disk is reserved per orb for life: room for four.
-    let mut c = cluster(4);
+    // Disk is reserved per orb for life: room for five.
+    let mut c = cluster(5);
     let _vms = Vms(c.root().to_owned());
     c.start_all();
     let snap = [("ORB_SNAPSHOT_ID", "snap-1")];
@@ -690,20 +690,64 @@ fn spawn_boots_from_project_snapshot() {
         "booted from the snapshot"
     );
     eprintln!("amp-2 (snapshot known from the pause result): marker present {id}");
-    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2");
+    // A snapshot of an orb that started from a snapshot carries the same lineage.
+    let snap2 = [("ORB_SNAPSHOT_ID", "snap-2")];
+    assert_ok(
+        &c.dispatch("pause", "amp-2", &snap2),
+        "pause 2 with snapshot",
+    );
+    let lineages: Vec<serde_json::Value> = std::fs::read_dir(state(&c).join("projects"))
+        .unwrap()
+        .map(|e| {
+            let m: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(e.unwrap().path().join("meta.json")).unwrap(),
+            )
+            .unwrap();
+            m["lineage"].clone()
+        })
+        .collect();
+    assert_eq!(lineages.len(), 2, "snap-1 and snap-2: {lineages:?}");
+    assert!(
+        lineages[0].is_string() && lineages[0] == lineages[1],
+        "{lineages:?}"
+    );
 
     // Known from the agent's Hello after a restart.
     c.kill_agent("agent-a");
     start_again(&mut c, "");
     let before = orb_dirs(&c);
     assert_ok(
-        &c.dispatch("spawn", "amp-3", &snap),
-        "spawn from snapshot after restart",
+        &c.dispatch("spawn", "amp-3", &snap2),
+        "spawn from the second snapshot after restart",
     );
     let third = new_orb(&c, &before);
     assert_eq!(wait_marker(&third), (false, id.clone()));
-    eprintln!("amp-3 (snapshot known from Hello after an agent restart): marker present {id}");
+    eprintln!(
+        "amp-3 (second snapshot known from Hello after an agent restart): marker present {id}"
+    );
     assert_ok(&c.dispatch("pause", "amp-3", &[]), "pause 3");
+
+    // Built on another image lineage (another Debian release or guest integration): the
+    // orb starts from the image instead.
+    for e in std::fs::read_dir(state(&c).join("projects")).unwrap() {
+        let meta = e.unwrap().path().join("meta.json");
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&meta).unwrap()).unwrap();
+        assert!(m["lineage"].is_string(), "lineage recorded: {m}");
+        m["lineage"] = "an-older-image".into();
+        std::fs::write(&meta, m.to_string()).unwrap();
+    }
+    let before = orb_dirs(&c);
+    let job = c.dispatch("spawn", "amp-older", &snap);
+    assert_ok(&job, "spawn from a snapshot of an older image");
+    assert!(
+        job.stdout.contains("built on another image lineage")
+            || job.stderr.contains("built on another image lineage")
+    );
+    let (created, other) = wait_marker(&new_orb(&c, &before));
+    assert!(created && other != id, "a fresh disk from the image");
+    eprintln!("amp-older (snapshot of an older image): marker created {other}");
+    assert_ok(&c.dispatch("pause", "amp-older", &[]), "pause older");
 
     // Gone from the host: the orb starts from the image.
     for e in std::fs::read_dir(state(&c).join("projects")).unwrap() {
@@ -713,8 +757,7 @@ fn spawn_boots_from_project_snapshot() {
     let job = c.dispatch("spawn", "amp-4", &snap);
     assert_ok(&job, "spawn with a vanished snapshot");
     assert!(
-        job.stdout.contains("creating the disk from")
-            || job.stderr.contains("creating the disk from")
+        job.stdout.contains("is not on this host") || job.stderr.contains("is not on this host")
     );
     let fourth = new_orb(&c, &before);
     let (created, other) = wait_marker(&fourth);

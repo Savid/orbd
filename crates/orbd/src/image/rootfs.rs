@@ -31,11 +31,14 @@ pub struct Tools {
 
 /// The pipeline inside a builder container: `$1` work dir, `$2` OCI layout, `$3` output.
 /// Sizing is [`sizing`]'s (a test checks they agree). The last stdout line is
-/// `size <bytes>`.
+/// `size <bytes>`; the rootfs's os-release is left in the work dir as [`OS_RELEASE`].
 const BUILDER_SCRIPT: &str = r#"set -euo pipefail
 work=$1 layout=$2 out=$3
 umoci raw add-layer --image "$layout:base" --tag orbd --no-history "$work/integration.tar"
 umoci raw unpack --image "$layout:orbd" /rootfs
+for f in usr/lib/os-release etc/os-release; do
+  if [ -f "/rootfs/$f" ] && [ ! -L "/rootfs/$f" ]; then cp "/rootfs/$f" "$work/os-release"; break; fi
+done
 used=$(du -s -x --block-size=1 /rootfs | cut -f1)
 files=$(du -s -x --inodes /rootfs | cut -f1)
 inodes=$(( files * 2 > used / 16384 ? files * 2 : used / 16384 ))
@@ -186,8 +189,37 @@ pub fn write_layout(layout: &Path, cache: &BlobCache, resolved: &Resolved) -> Re
     std::fs::write(layout.join("index.json"), index.to_string()).map_err(|e| e.to_string())
 }
 
+/// Where the builder container leaves the rootfs's os-release in the work dir.
+const OS_RELEASE: &str = "os-release";
+
+/// The distribution of an os-release file: `ID` and `VERSION_ID` (`VERSION_CODENAME`
+/// when there is no version, as on Debian testing), e.g. `debian 13`.
+fn os_identity(os_release: &str) -> Option<String> {
+    let field = |key: &str| {
+        os_release.lines().find_map(|l| {
+            let v = l.trim().strip_prefix(key)?.strip_prefix('=')?;
+            Some(v.trim().trim_matches(['"', '\''])).filter(|v| !v.is_empty())
+        })
+    };
+    let id = field("ID")?;
+    let version = field("VERSION_ID").or_else(|| field("VERSION_CODENAME"))?;
+    Some(format!("{id} {version}"))
+}
+
+/// [`os_identity`] of the first of `candidates` that is a regular file (a symlink in an
+/// image is not followed on the host).
+fn read_os_identity(candidates: &[PathBuf]) -> Option<String> {
+    candidates.iter().find_map(|p| {
+        if !std::fs::symlink_metadata(p).ok()?.is_file() {
+            return None;
+        }
+        os_identity(&std::fs::read_to_string(p).ok()?)
+    })
+}
+
 /// Builds `out` (raw ext4) from the layout plus the integration layer. `work` is a
-/// scratch directory that the caller removes (its rootfs is root-owned).
+/// scratch directory that the caller removes (its rootfs is root-owned). Returns the
+/// image's size and its distribution ([`os_identity`]) when it has an os-release.
 pub async fn build(
     tools: &Tools,
     layout: &Path,
@@ -195,7 +227,7 @@ pub async fn build(
     work: &Path,
     out: &Path,
     status: &(dyn Fn(&str) + Sync),
-) -> Result<u64, String> {
+) -> Result<(u64, Option<String>), String> {
     let layer = work.join("integration.tar");
     std::fs::write(&layer, &integration.tar).map_err(|e| e.to_string())?;
     if let Some(builder) = &tools.builder {
@@ -216,11 +248,12 @@ pub async fn build(
         let container = Container(Some(name));
         let stdout = run(false, Path::new("docker"), &args).await?;
         container.done();
-        return stdout
+        let size = stdout
             .lines()
             .rev()
             .find_map(|l| l.strip_prefix("size ")?.trim().parse().ok())
-            .ok_or_else(|| format!("builder printed no size: {stdout:?}"));
+            .ok_or_else(|| format!("builder printed no size: {stdout:?}"))?;
+        return Ok((size, read_os_identity(&[work.join(OS_RELEASE)])));
     }
     let base = format!("{}:{BASE_TAG}", layout.display());
     status("adding guest integration layer");
@@ -277,6 +310,7 @@ pub async fn build(
                 .ok_or_else(|| format!("unexpected du output {out:?}"))
         }
     };
+    let os = read_os_identity(&["usr/lib/os-release", "etc/os-release"].map(|p| rootfs.join(p)));
     let used = du("--block-size=1").await?;
     let files = du("--inodes").await?;
     let (inodes, size) = sizing(used, files);
@@ -313,7 +347,7 @@ pub async fn build(
         ],
     )
     .await?;
-    Ok(size)
+    Ok((size, os))
 }
 
 /// Removes a staging directory whose contents may be root-owned.
@@ -389,6 +423,33 @@ mod tests {
 
     /// The builder container sizes images with `BUILDER_SCRIPT`'s shell arithmetic, which
     /// must stay [`sizing`].
+    #[test]
+    fn os_identity_is_the_release_not_the_point_release() {
+        let trixie = "PRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"\nNAME=\"Debian GNU/Linux\"\nVERSION_ID=\"13\"\nVERSION=\"13 (trixie)\"\nVERSION_CODENAME=trixie\nDEBIAN_VERSION_FULL=13.2\nID=debian\n";
+        assert_eq!(os_identity(trixie).as_deref(), Some("debian 13"));
+        let sid = "PRETTY_NAME=\"Debian GNU/Linux forky/sid\"\nVERSION_CODENAME=forky\nID=debian\n";
+        assert_eq!(os_identity(sid).as_deref(), Some("debian forky"));
+        let ubuntu = "ID=ubuntu\nID_LIKE=debian\nVERSION_ID='24.04'\nVERSION=\"24.04.1 LTS (Noble Numbat)\"\n";
+        assert_eq!(os_identity(ubuntu).as_deref(), Some("ubuntu 24.04"));
+        assert_eq!(os_identity("ID_LIKE=debian\nVERSION_ID=1\n"), None);
+        assert_eq!(os_identity(""), None);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (link, file) = (tmp.path().join("link"), tmp.path().join("file"));
+        std::fs::write(&file, trixie).unwrap();
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let missing = tmp.path().join("missing");
+        assert_eq!(
+            read_os_identity(std::slice::from_ref(&link)),
+            None,
+            "symlinks are not followed"
+        );
+        assert_eq!(
+            read_os_identity(&[missing, link, file]).as_deref(),
+            Some("debian 13")
+        );
+    }
+
     #[test]
     fn builder_script_sizes_like_sizing() {
         let arith: Vec<&str> = BUILDER_SCRIPT
