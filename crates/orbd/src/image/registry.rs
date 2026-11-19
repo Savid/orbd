@@ -60,8 +60,13 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The config and layer blobs, each once: a manifest may list the same layer more
+    /// than once (Amp's image repeats an empty layer).
     pub fn blobs(&self) -> impl Iterator<Item = &OciDescriptor> {
-        std::iter::once(&self.manifest.config).chain(self.manifest.layers.iter())
+        let mut seen = std::collections::HashSet::new();
+        std::iter::once(&self.manifest.config)
+            .chain(self.manifest.layers.iter())
+            .filter(move |d| seen.insert(d.digest.as_str()))
     }
 
     pub fn compressed_bytes(&self) -> u64 {
@@ -203,13 +208,26 @@ impl BlobCache {
         progress: Arc<AtomicU64>,
     ) -> Result<(), String> {
         let path = self.path(&desc.digest)?;
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            // Reused: garbage collection keeps blobs builds still use.
-            if let Ok(f) = std::fs::File::options().append(true).open(&path) {
-                let _ = f.set_modified(std::time::SystemTime::now());
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if desc.size < 0 || meta.len() == desc.size as u64 {
+                // Reused: garbage collection keeps blobs builds still use.
+                if let Ok(f) = std::fs::File::options().append(true).open(&path) {
+                    let _ = f.set_modified(std::time::SystemTime::now());
+                }
+                progress.fetch_add(desc.size.max(0) as u64, Ordering::Relaxed);
+                return Ok(());
             }
-            progress.fetch_add(desc.size.max(0) as u64, Ordering::Relaxed);
-            return Ok(());
+            // A damaged cache entry (older orbd emptied the blob of a layer a manifest
+            // lists twice); download it again.
+            tracing::warn!(
+                digest = %desc.digest,
+                cached = meta.len(),
+                expected = desc.size,
+                "cached blob has the wrong size; downloading it again"
+            );
+            tokio::fs::remove_file(&path)
+                .await
+                .map_err(|e| format!("{}: {e}", path.display()))?;
         }
         let tmp = path.with_extension(format!("part-{}", uuid::Uuid::new_v4().simple()));
         let result = async {
@@ -245,13 +263,17 @@ impl BlobCache {
         result
     }
 
-    /// Hard-links (or copies across filesystems) a cached blob into an OCI layout.
+    /// Hard-links (or copies across filesystems) a cached blob into an OCI layout. A blob
+    /// already in the layout is left alone: copying onto it would truncate the hard-linked
+    /// cache entry.
     pub fn link_into(&self, digest: &str, layout: &Path) -> Result<(), String> {
         let dst = layout.join("blobs/sha256").join(hex_of(digest)?);
         let src = self.path(digest)?;
-        std::fs::hard_link(&src, &dst)
-            .or_else(|_| std::fs::copy(&src, &dst).map(|_| ()))
-            .map_err(|e| format!("{} -> {}: {e}", src.display(), dst.display()))
+        match std::fs::hard_link(&src, &dst) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            r => r.or_else(|_| std::fs::copy(&src, &dst).map(|_| ())),
+        }
+        .map_err(|e| format!("{} -> {}: {e}", src.display(), dst.display()))
     }
 }
 

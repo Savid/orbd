@@ -342,6 +342,51 @@ pub async fn remove_tree(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A manifest that lists a layer twice (Amp's image repeats an empty layer) links it
+    /// once and leaves the cached blob intact.
+    #[test]
+    fn a_repeated_layer_keeps_its_cached_blob() {
+        use oci_client::manifest::{OciDescriptor, OciImageManifest};
+        use sha2::Digest;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::new(tmp.path().join("cache"));
+        std::fs::create_dir_all(tmp.path().join("cache")).unwrap();
+        let blob = |data: &[u8]| {
+            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
+            std::fs::write(cache.path(&digest).unwrap(), data).unwrap();
+            OciDescriptor {
+                digest,
+                size: data.len() as i64,
+                ..Default::default()
+            }
+        };
+        let (config, empty, other) = (blob(b"{}"), blob(b"empty layer"), blob(b"layer"));
+        let resolved = Resolved {
+            reference: "example.invalid/amp-orb:latest".parse().unwrap(),
+            manifest_digest: format!("sha256:{}", "0".repeat(64)),
+            manifest_raw: b"{}".to_vec(),
+            manifest: OciImageManifest {
+                config,
+                layers: vec![empty.clone(), other, empty.clone()],
+                ..Default::default()
+            },
+        };
+        assert_eq!(resolved.blobs().count(), 3);
+        write_layout(&tmp.path().join("layout"), &cache, &resolved).unwrap();
+        assert_eq!(
+            std::fs::read(cache.path(&empty.digest).unwrap()).unwrap(),
+            b"empty layer"
+        );
+        // Linking a blob the layout already has is a no-op, never a copy onto itself.
+        cache
+            .link_into(&empty.digest, &tmp.path().join("layout"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read(cache.path(&empty.digest).unwrap()).unwrap(),
+            b"empty layer"
+        );
+    }
+
     /// The builder container sizes images with `BUILDER_SCRIPT`'s shell arithmetic, which
     /// must stay [`sizing`].
     #[test]
