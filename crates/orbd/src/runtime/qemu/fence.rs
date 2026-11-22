@@ -82,19 +82,33 @@ impl Probe {
         if accepted(&listener, Duration::from_secs(2)) == 0 {
             return Err(format!("the agent's own connection never reached {addr}"));
         }
-        let mut child = Command::new(&self.exec)
-            .arg(&self.program)
-            .args([
-                PROBE_COMMAND,
-                &addr.to_string(),
-                "--gid",
-                &self.gid.to_string(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("{}: {e}", self.exec.display()))?;
+        let spawn = || {
+            Command::new(&self.exec)
+                .arg(&self.program)
+                .args([
+                    PROBE_COMMAND,
+                    &addr.to_string(),
+                    "--gid",
+                    &self.gid.to_string(),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+        };
+        // ETXTBSY: a just-written executable is briefly held open for writing by a
+        // process another thread forked (until it execs); retry shortly.
+        let mut child = spawn();
+        for _ in 0..20 {
+            match &child {
+                Err(e) if e.raw_os_error() == Some(nix::libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(25));
+                    child = spawn();
+                }
+                _ => break,
+            }
+        }
+        let mut child = child.map_err(|e| format!("{}: {e}", self.exec.display()))?;
         let status = wait_bounded(&mut child, PROBE_TIMEOUT);
         let mut stderr = String::new();
         if let Some(mut e) = child.stderr.take() {
@@ -314,7 +328,9 @@ mod tests {
     /// (args: fence-probe <addr> --gid <gid>).
     fn probe(dir: &Path, body: &str) -> Probe {
         Probe {
-            exec: script(dir, "netgroup", r#"exec "$@""#),
+            // The program runs under bash rather than by exec: a script written a
+            // moment ago can be ETXTBSY while another test's fork holds it open.
+            exec: script(dir, "netgroup", r#"exec bash "$@""#),
             program: script(dir, "orbd", body),
             group: "orbdvm".into(),
             gid: nix::unistd::getegid().as_raw(),

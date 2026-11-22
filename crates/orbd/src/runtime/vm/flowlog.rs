@@ -5,7 +5,9 @@
 //! [`super::net`]) sends the first packets of each new orb flow (conntrack state `new`)
 //! through a chain that mirrors the egress rules and logs, instead of deciding, to
 //! NFLOG group [`GROUP`] with prefix [`PREFIX_ACCEPT`] or [`PREFIX_DROP`] and the first
-//! [`SNAPLEN`] bytes (IPv4 and ports). The agent reads them from a netlink socket on a
+//! [`SNAPLEN`] bytes (IPv4 and ports); an orb whose type restricts egress is logged by
+//! its own chain's verdict, with [`PREFIX_RESTRICTED_ACCEPT`] or
+//! [`PREFIX_RESTRICTED_DROP`]. The agent reads them from a netlink socket on a
 //! thread of its own: the datapath never waits for it (the kernel drops log messages
 //! the socket has no room for, and NFLOG's sequence numbers count them), and the kernel
 //! logs at most [`super::net::FLOW_LOG_RATE`] new flows a second (the rest are counted
@@ -27,6 +29,9 @@ pub const GROUP: u16 = 4731;
 /// Log prefixes for flows the egress policy accepts and drops.
 pub const PREFIX_ACCEPT: &str = "orbd:a";
 pub const PREFIX_DROP: &str = "orbd:d";
+/// The same for orbs with restricted egress, decided by their orb type's policy.
+pub const PREFIX_RESTRICTED_ACCEPT: &str = "orbd:ra";
+pub const PREFIX_RESTRICTED_DROP: &str = "orbd:rd";
 /// Bytes of each packet logged: an IPv4 header with options and the ports.
 pub const SNAPLEN: u32 = 64;
 
@@ -49,6 +54,8 @@ impl Verdict {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Flow {
     pub verdict: Verdict,
+    /// Decided by the orb type's restricted egress policy.
+    pub restricted: bool,
     /// IP protocol number.
     pub proto: u8,
     pub src: Ipv4Addr,
@@ -213,9 +220,11 @@ fn packet(body: &[u8]) -> Option<Logged<'_>> {
 
 /// The flow a logged packet starts, if it is one of orbd's (by its prefix) and IPv4.
 pub fn flow(p: &Logged<'_>) -> Option<Flow> {
-    let verdict = match p.prefix {
-        b if b == PREFIX_ACCEPT.as_bytes() => Verdict::Accept,
-        b if b == PREFIX_DROP.as_bytes() => Verdict::Drop,
+    let (verdict, restricted) = match p.prefix {
+        b if b == PREFIX_ACCEPT.as_bytes() => (Verdict::Accept, false),
+        b if b == PREFIX_DROP.as_bytes() => (Verdict::Drop, false),
+        b if b == PREFIX_RESTRICTED_ACCEPT.as_bytes() => (Verdict::Accept, true),
+        b if b == PREFIX_RESTRICTED_DROP.as_bytes() => (Verdict::Drop, true),
         _ => return None,
     };
     let ip = p.payload;
@@ -233,6 +242,7 @@ pub fn flow(p: &Logged<'_>) -> Option<Flow> {
         .flatten();
     Some(Flow {
         verdict,
+        restricted,
         proto,
         src: Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]),
         dst: Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]),
@@ -702,6 +712,7 @@ fn emit(f: &Flow, index: u32, who: Option<FlowOrb>) {
         src_port = f.sport,
         dst = %f.destination(),
         verdict = f.verdict.as_str(),
+        egress = if f.restricted { "restricted" } else { "default" },
         "orb flow"
     );
 }
@@ -813,15 +824,17 @@ mod tests {
         let mut buf = message(GROUP, 7, PREFIX_ACCEPT, &tcp);
         buf.extend(message(GROUP, 8, PREFIX_DROP, &icmp));
         buf.extend(message(GROUP, 9, "someone-else", &tcp));
+        buf.extend(message(GROUP, 10, PREFIX_RESTRICTED_DROP, &tcp));
+        buf.extend(message(GROUP, 11, PREFIX_RESTRICTED_ACCEPT, &tcp));
         let mut done = vec![0u8; 20];
         done[0..4].copy_from_slice(&20u32.to_ne_bytes());
         done[4..6].copy_from_slice(&NLMSG_DONE.to_ne_bytes());
         buf.extend(done);
         let (messages, bad) = parse(&buf);
         assert_eq!(bad, None);
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[3], Message::Done);
-        let flows: Vec<Option<Flow>> = messages[..3]
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[5], Message::Done);
+        let flows: Vec<Option<Flow>> = messages[..5]
             .iter()
             .map(|m| match m {
                 Message::Packet(p) => flow(p),
@@ -839,6 +852,10 @@ mod tests {
             (Verdict::Drop, "icmp", "10.0.0.1".into(), None)
         );
         assert_eq!(flows[2], None, "not orbd's prefix");
+        assert!(!flows[0].unwrap().restricted && !flows[1].unwrap().restricted);
+        let (d, a) = (flows[3].unwrap(), flows[4].unwrap());
+        assert_eq!((d.verdict, d.restricted), (Verdict::Drop, true));
+        assert_eq!((a.verdict, a.restricted), (Verdict::Accept, true));
         let Message::Packet(p) = &messages[1] else {
             unreachable!()
         };
@@ -906,6 +923,7 @@ mod tests {
     fn tcp_flow(sport: u16, dport: u16, verdict: Verdict) -> Flow {
         Flow {
             verdict,
+            restricted: false,
             proto: 6,
             src: Ipv4Addr::new(169, 254, 0, 6),
             dst: Ipv4Addr::new(1, 1, 1, 1),

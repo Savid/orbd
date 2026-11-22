@@ -40,10 +40,17 @@ pub fn ceiling(runtime: RuntimeKind) -> BackendCapabilities {
             Support::Unsupported,
         ),
     };
+    // Orbs in orbd's network namespaces (Linux VMs); agents that cannot (macOS QEMU)
+    // say so. The fake runtime enforces nothing; it advertises what its config says.
+    let egress_policy = match runtime {
+        RuntimeKind::Docker => Support::Unsupported,
+        RuntimeKind::Fake | RuntimeKind::Qemu | RuntimeKind::Firecracker => Support::Supported,
+    };
     BackendCapabilities {
         arch: None,
         sleep,
         nested_kvm,
+        egress_policy,
         project_snapshots: SnapshotCapability::Supported {
             scope: SnapshotScope::RecordedLocation,
         },
@@ -98,6 +105,9 @@ pub fn effective(runtime: RuntimeKind, info: &pb::RuntimeInfo) -> Option<Backend
     };
     if !info.nested_kvm {
         caps.nested_kvm = Support::Unsupported;
+    }
+    if !info.egress_policy {
+        caps.egress_policy = Support::Unsupported;
     }
     if !info.project_snapshots {
         caps.project_snapshots = SnapshotCapability::Unsupported;

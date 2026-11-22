@@ -112,6 +112,8 @@ pub struct BackendCapabilities {
     pub arch: Option<super::Arch>,
     pub sleep: SleepCapability,
     pub nested_kvm: Support,
+    /// Enforces an orb type's restricted egress (`egress`): agents with Linux VM runtimes.
+    pub egress_policy: Support,
     pub project_snapshots: SnapshotCapability,
     pub capacity: CapacityModel,
     pub resume_locality: ResumeLocality,
@@ -135,6 +137,8 @@ pub enum CapabilityMismatch {
     NoSleep,
     #[error("offering runs {0} orbs; this host runs {1}")]
     Arch(&'static str, &'static str),
+    #[error("offering restricts egress (`egress`), which this profile cannot enforce")]
+    EgressPolicy,
 }
 
 impl BackendCapabilities {
@@ -147,11 +151,15 @@ impl BackendCapabilities {
             nested_kvm,
             project_snapshots,
             arch,
+            ref egress,
         } = spec.requirements;
         if let Some(host) = self.arch
             && host != arch
         {
             out.push(CapabilityMismatch::Arch(arch.as_str(), host.as_str()));
+        }
+        if egress.is_some() && self.egress_policy != Support::Supported {
+            out.push(CapabilityMismatch::EgressPolicy);
         }
 
         let (compute, nested_state) = match (self.sleep, spec.pause_policy) {

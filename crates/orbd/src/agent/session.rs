@@ -111,6 +111,7 @@ async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
                 nested_state_qualified: c.nested_state_qualified,
                 project_snapshots: c.project_snapshots,
                 arch: pb::Arch::from(c.arch) as i32,
+                egress_policy: c.egress_policy,
             })
             .collect(),
         capacity: Some(sh.capacity.into()),
@@ -285,13 +286,14 @@ fn parse_delivery(sh: &Shared, d: &pb::CommandDelivery) -> Result<Parsed, (Failu
             "spec digest does not match the orb spec".into(),
         ));
     }
-    if executor::runtime_for(sh, &orb).is_none() {
+    let Some(runtime) = executor::runtime_for(sh, &orb) else {
         return Err((
             FailureCode::UnsupportedCapability,
             "this agent has no runtime for the orb's execution target".into(),
         ));
-    }
-    if let Some(why) = refused_by_policy(&sh.config.agent, &command, &orb) {
+    };
+    if let Some(why) = refused_by_policy(&sh.config.agent, &runtime.capabilities(), &command, &orb)
+    {
         return Err((FailureCode::UnsupportedCapability, why.into()));
     }
     let env = PermittedGuestEnv(
@@ -309,17 +311,23 @@ fn parse_delivery(sh: &Shared, d: &pb::CommandDelivery) -> Result<Parsed, (Failu
     Ok(Parsed { command, orb, env })
 }
 
-/// Why this agent's own settings refuse `command`, whatever the coordinator decided (it
-/// may be wrong or compromised). Pauses and deletes are never refused, so orbs created
-/// before a setting changed can still be put to sleep and removed.
+/// Why this agent's own settings or its orb's runtime (`caps`) refuse `command`,
+/// whatever the coordinator decided (it may be wrong or compromised). Pauses and deletes
+/// are never refused, so orbs created before a setting changed can still be put to sleep
+/// and removed.
 fn refused_by_policy(
     agent: &crate::config::agent::AgentSection,
+    caps: &crate::runtime::RuntimeCapabilities,
     command: &crate::model::Command,
     orb: &OrbDefinition,
 ) -> Option<&'static str> {
     let spawn = matches!(command.action, crate::model::Action::Spawn);
     if spawn && agent.refuse_nested_kvm && crate::runtime::needs_nested_kvm(orb) {
         return Some(crate::runtime::NESTED_KVM_REFUSED);
+    }
+    // Restricted egress fails closed: never started where it would run open.
+    if spawn && orb.egress_policy().is_some() && !caps.egress_policy {
+        return Some(crate::runtime::EGRESS_REFUSED);
     }
     None
 }
@@ -568,6 +576,7 @@ mod tests {
                     nested_kvm,
                     project_snapshots: SnapshotRequirement::NotRequired,
                     arch: Arch::Amd64,
+                    egress: None,
                 },
                 pause_policy: PausePolicy::MemoryPreserving {
                     on_failure: CheckpointFailurePolicy::ColdStop,
@@ -586,6 +595,20 @@ mod tests {
             offering_id: OfferingId::new("kvm"),
             spec_digest: spec.digest(),
             spec,
+            egress: None,
+        }
+    }
+
+    fn caps(egress_policy: bool) -> crate::runtime::RuntimeCapabilities {
+        crate::runtime::RuntimeCapabilities {
+            kind: RuntimeKind::Firecracker,
+            version: "1".into(),
+            memory_preserving_sleep: true,
+            nested_kvm: false,
+            nested_state_qualified: false,
+            project_snapshots: true,
+            arch: Arch::Amd64,
+            egress_policy,
         }
     }
 
@@ -614,12 +637,18 @@ mod tests {
         let plain = orb(NestedKvmRequirement::NotRequired);
         let spawn = |o: &OrbDefinition| command(o, Action::Spawn);
         assert_eq!(
-            refused_by_policy(&off, &spawn(&kvm), &kvm),
+            refused_by_policy(&off, &caps(true), &spawn(&kvm), &kvm),
             Some(crate::runtime::NESTED_KVM_REFUSED)
         );
-        assert!(refused_by_policy(&off, &spawn(&preserved), &preserved).is_some());
-        assert_eq!(refused_by_policy(&off, &spawn(&plain), &plain), None);
-        assert_eq!(refused_by_policy(&on, &spawn(&kvm), &kvm), None);
+        assert!(refused_by_policy(&off, &caps(true), &spawn(&preserved), &preserved).is_some());
+        assert_eq!(
+            refused_by_policy(&off, &caps(true), &spawn(&plain), &plain),
+            None
+        );
+        assert_eq!(
+            refused_by_policy(&on, &caps(true), &spawn(&kvm), &kvm),
+            None
+        );
         for action in [
             Action::Delete,
             Action::Pause {
@@ -627,10 +656,65 @@ mod tests {
             },
         ] {
             assert_eq!(
-                refused_by_policy(&off, &command(&kvm, action.clone()), &kvm),
+                refused_by_policy(&off, &caps(true), &command(&kvm, action.clone()), &kvm),
                 None,
                 "{action:?}"
             );
         }
+    }
+
+    /// An orb whose type restricts egress never starts on a runtime that cannot enforce
+    /// it, whatever the coordinator sends (by the spec it was created with, also when the
+    /// coordinator drops the current policy), but can still be paused and deleted. An
+    /// unrestricted spec stays unrestricted whatever policy comes with it.
+    #[test]
+    fn restricted_egress_is_refused_where_it_cannot_be_enforced() {
+        let agent = AgentSection::new("/s".into());
+        let policy: EgressPolicy =
+            serde_json::from_str(r#"{"domains":["ampcode.com"],"allow":[]}"#).unwrap();
+        let mut restricted = orb(NestedKvmRequirement::NotRequired);
+        restricted.spec.template.requirements.egress = Some(policy.clone());
+        restricted.spec_digest = restricted.spec.digest();
+        let spawn = command(&restricted, Action::Spawn);
+        assert_eq!(
+            refused_by_policy(&agent, &caps(false), &spawn, &restricted),
+            Some(crate::runtime::EGRESS_REFUSED)
+        );
+        assert_eq!(
+            refused_by_policy(&agent, &caps(true), &spawn, &restricted),
+            None
+        );
+        for action in [
+            Action::Delete,
+            Action::Pause {
+                publish_snapshot: None,
+            },
+        ] {
+            let c = command(&restricted, action);
+            assert_eq!(
+                refused_by_policy(&agent, &caps(false), &c, &restricted),
+                None
+            );
+        }
+        assert_eq!(restricted.egress_policy(), Some(&policy));
+        // The orb type's current policy replaces the recorded one...
+        let edited: EgressPolicy =
+            serde_json::from_str(r#"{"domains":["ampcode.com","github.com"]}"#).unwrap();
+        restricted.egress = Some(edited.clone());
+        assert_eq!(restricted.egress_policy(), Some(&edited));
+        // ...but never makes an unrestricted orb restricted, or the reverse.
+        let mut plain = orb(NestedKvmRequirement::NotRequired);
+        plain.egress = Some(edited);
+        assert_eq!(plain.egress_policy(), None);
+        let p = command(&plain, Action::Spawn);
+        assert_eq!(refused_by_policy(&agent, &caps(false), &p, &plain), None);
+        // The spec's policy is part of its digest; an unrestricted spec's digest is as
+        // before the field existed.
+        let mut json = serde_json::to_value(&plain.spec).unwrap();
+        assert!(json.to_string().find("egress").is_none(), "{json}");
+        json["template"]["requirements"]["egress"] = serde_json::Value::Null;
+        let back: OrbSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.digest(), plain.spec.digest());
+        assert_ne!(restricted.spec.digest(), plain.spec.digest());
     }
 }

@@ -188,7 +188,7 @@ impl TryFrom<&OrbSpec> for pb::OrbSpec {
             Some(CheckpointFailurePolicy::KeepRunning) => pb::CheckpointFailurePolicy::KeepRunning,
             Some(CheckpointFailurePolicy::ColdStop) => pb::CheckpointFailurePolicy::ColdStop,
         };
-        let req = s.template.requirements;
+        let req = &s.template.requirements;
         let nested = match req.nested_kvm {
             NestedKvmRequirement::NotRequired => pb::NestedKvm::NotRequired,
             NestedKvmRequirement::GuestDevice => pb::NestedKvm::GuestDevice,
@@ -231,6 +231,7 @@ impl TryFrom<&OrbSpec> for pb::OrbSpec {
             release_compute_when_paused: req.release_compute_when_paused,
             required_snapshot_scope: snap_scope as i32,
             arch: pb::Arch::from(req.arch) as i32,
+            egress: req.egress.as_ref().map(Into::into),
         })
     }
 }
@@ -303,6 +304,7 @@ impl TryFrom<&pb::OrbSpec> for OrbSpec {
                     nested_kvm,
                     project_snapshots,
                     arch: arch(s.arch)?,
+                    egress: s.egress.as_ref().map(egress_policy).transpose()?,
                 },
                 pause_policy,
             },
@@ -321,6 +323,7 @@ impl TryFrom<&OrbDefinition> for pb::OrbDefinition {
             offering_id: d.offering_id.0.clone(),
             spec: Some((&d.spec).try_into()?),
             spec_digest: d.spec_digest.0.clone(),
+            egress: d.egress.as_ref().map(Into::into),
         })
     }
 }
@@ -341,8 +344,25 @@ impl TryFrom<&pb::OrbDefinition> for OrbDefinition {
                 .ok_or(WireError("spec".into()))?
                 .try_into()?,
             spec_digest: SpecDigest(d.spec_digest.clone()),
+            egress: d.egress.as_ref().map(egress_policy).transpose()?,
         })
     }
+}
+
+impl From<&EgressPolicy> for pb::EgressPolicy {
+    fn from(p: &EgressPolicy) -> Self {
+        let (domains, ports, allow) = p.parts();
+        Self {
+            domains,
+            ports,
+            allow,
+        }
+    }
+}
+
+/// A policy from the wire, validated as one from orbd.yaml.
+pub fn egress_policy(p: &pb::EgressPolicy) -> Result<EgressPolicy, WireError> {
+    EgressPolicy::from_parts(&p.domains, &p.ports, &p.allow).map_err(WireError)
 }
 
 // --- commands ---------------------------------------------------------------
@@ -566,5 +586,73 @@ impl TryFrom<&pb::CommandOutcome> for CommandOutcome {
             processes: process_disposition(o.processes)?,
             snapshot,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(egress: Option<EgressPolicy>) -> OrbSpec {
+        OrbSpec {
+            template: SpecTemplate {
+                target: ExecutionTarget::Fleet {
+                    runtime: RuntimeKind::Firecracker,
+                },
+                resources: Resources {
+                    vcpus: 2,
+                    memory_bytes: 2 * GIB,
+                    disk_bytes: 4 * GIB,
+                },
+                requirements: CapabilityRequirements {
+                    release_compute_when_paused: true,
+                    nested_kvm: NestedKvmRequirement::NotRequired,
+                    project_snapshots: SnapshotRequirement::NotRequired,
+                    arch: Arch::Amd64,
+                    egress,
+                },
+                pause_policy: PausePolicy::MemoryPreserving {
+                    on_failure: CheckpointFailurePolicy::ColdStop,
+                },
+            },
+            initial_disk: InitialDiskSource::Image {
+                image_ref: "image".into(),
+            },
+        }
+    }
+
+    /// The egress policy survives the wire unchanged (so does the spec's digest), the
+    /// current one beside the spec too, and a malformed one is rejected, never dropped.
+    #[test]
+    fn egress_policies_cross_the_wire() {
+        let policy: EgressPolicy = serde_json::from_str(
+            r#"{"domains":["ampcode.com","*.ampcode.com"],"ports":["tcp:443","udp:443"],"allow":["tcp:203.0.113.0/24:443"]}"#,
+        )
+        .unwrap();
+        for egress in [None, Some(policy.clone())] {
+            let s = spec(egress.clone());
+            let w = pb::OrbSpec::try_from(&s).unwrap();
+            assert_eq!(w.egress.is_some(), egress.is_some());
+            let back = OrbSpec::try_from(&w).unwrap();
+            assert_eq!(back, s);
+            assert_eq!(back.digest(), s.digest());
+            let d = OrbDefinition {
+                id: OrbId::generate(),
+                identity: OrbIdentity {
+                    amp_endpoint: AmpEndpointId::new("amp"),
+                    amp_orb_id: AmpOrbId::new("amp-1"),
+                },
+                offering_id: OfferingId::new("untrusted"),
+                spec_digest: s.digest(),
+                spec: s,
+                egress: egress.clone(),
+            };
+            let back = OrbDefinition::try_from(&pb::OrbDefinition::try_from(&d).unwrap()).unwrap();
+            assert_eq!(back, d);
+        }
+        let mut w = pb::OrbSpec::try_from(&spec(Some(policy))).unwrap();
+        w.egress.as_mut().unwrap().domains.push("*".into());
+        let e = OrbSpec::try_from(&w).unwrap_err();
+        assert!(e.to_string().contains("egress.domains"), "{e}");
     }
 }

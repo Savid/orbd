@@ -130,6 +130,20 @@ message OrbSpec {
   bool release_compute_when_paused = 7;
   SnapshotScope required_snapshot_scope = 8;  // UNSPECIFIED = not required
   Arch arch = 9;
+  // Set: the orb's egress is restricted to this policy, for life (its orb type's
+  // `egress`). Only agents that advertise `egress_policy` may run such an orb; one that
+  // cannot enforce it refuses to start it.
+  EgressPolicy egress = 10;
+}
+
+// An orb type's restricted egress: the orb reaches names matching `domains` (as the
+// agent's DNS proxy resolves them) on `ports`, the destinations `allow` names, and
+// nothing else. Strings as in orbd.yaml; the receiver validates them and rejects the
+// message if any is malformed.
+message EgressPolicy {
+  repeated string domains = 1;  // "example.com" or "*.example.com"
+  repeated string ports = 2;    // "tcp:443", "udp:8000-8100"
+  repeated string allow = 3;    // "<tcp|udp|any>:<address or CIDR>[:<port or range>]"
 }
 
 // CPU architecture of an orb or a host. UNSPECIFIED (older peers) is amd64.
@@ -152,6 +166,10 @@ message OrbDefinition {
   string offering_id = 4;
   OrbSpec spec = 5;
   string spec_digest = 6;   // hex sha256 of the canonical spec
+  // For a spec with `egress`: the orb type's policy now, applied from the orb's next
+  // launch on. Unset (the type lost `egress` or is gone): the agent keeps the policy the
+  // orb last launched with. Not sent for a spec without `egress`.
+  EgressPolicy egress = 7;
 }
 
 message SpawnAction {}
@@ -401,6 +419,9 @@ message RuntimeInfo {
   bool nested_state_qualified = 5;
   bool project_snapshots = 6;
   Arch arch = 7;                    // of the host's orbs
+  // Enforces OrbSpec.egress (Linux VM runtimes). Older agents leave it false and get no
+  // restricted orbs.
+  bool egress_policy = 8;
 }
 
 message Hello {

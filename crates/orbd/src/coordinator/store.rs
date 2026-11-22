@@ -925,6 +925,7 @@ mod tests {
                     nested_kvm: NestedKvmRequirement::NotRequired,
                     project_snapshots: SnapshotRequirement::NotRequired,
                     arch: Arch::Amd64,
+                    egress: None,
                 },
                 pause_policy: PausePolicy::MemoryPreserving {
                     on_failure: CheckpointFailurePolicy::ColdStop,

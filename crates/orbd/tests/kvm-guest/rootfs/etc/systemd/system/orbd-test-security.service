@@ -1,0 +1,9 @@
+[Unit]
+Description=orbd test: kernel hardening as an unprivileged process sees it
+
+[Service]
+ExecStart=/usr/local/bin/orbd-test-security
+StandardOutput=file:/dev/console
+
+[Install]
+WantedBy=multi-user.target

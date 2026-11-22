@@ -409,6 +409,97 @@ fn assert_probes_dropped(orb: &Path, targets: &[String]) {
     }
 }
 
+/// The console without the kernel's own messages (`[    1.801470] ...` to the end of its
+/// line): printk can land in the middle of a line a guest service is printing, splitting
+/// it (Yama reports the very ptrace denial the security check provokes).
+fn without_kernel_messages(console: &str) -> String {
+    let mut out = String::with_capacity(console.len());
+    let mut rest = console;
+    while let Some(i) = rest.find('[') {
+        let stamp = rest[i + 1..]
+            .find(']')
+            .map(|j| rest[i + 1..i + 1 + j].trim());
+        if stamp
+            .is_some_and(|t| t.contains('.') && t.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        {
+            out.push_str(&rest[..i]);
+            rest = rest[i..].find('\n').map_or("", |n| &rest[i + n + 1..]);
+        } else {
+            out.push_str(&rest[..=i]);
+            rest = &rest[i + 1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What CI's QEMU guest printed: kernel lines landing inside the security check's.
+#[test]
+fn kernel_messages_are_taken_out() {
+    let console = "security: net.core.bpf_jit_harde[    1.801470] e2scrub_all (153) used \
+                   greatest stack depth: 12288 bytes left\nn=2\nsecurity: user-m[    1.831064] \
+                   ptrace attach of \"sh\" was attempted by \"sh\"\nem-parent=denied\n\
+                   [    2.000000] a whole kernel line\nsecurity: lsm=[x] kept\n";
+    assert_eq!(
+        without_kernel_messages(console),
+        "security: net.core.bpf_jit_harden=2\nsecurity: user-mem-parent=denied\n\
+         security: lsm=[x] kept\n"
+    );
+}
+
+/// The guest kernel's hardening, as `orbd-test-security` reports it on the console
+/// (`security: <name>=<value>`): the LSMs, the sysctls of guest/rootfs/etc/sysctl.d, and
+/// what `user` may do without capabilities.
+const GUEST_SECURITY: &[(&str, &str)] = &[
+    ("lsm", "capability,landlock,yama"),
+    ("kernel.yama.ptrace_scope", "1"),
+    ("kernel.kptr_restrict", "1"),
+    ("kernel.dmesg_restrict", "1"),
+    ("kernel.unprivileged_bpf_disabled", "1"),
+    ("net.core.bpf_jit_harden", "2"),
+    ("fs.suid_dumpable", "0"),
+    ("dev.tty.legacy_tiocsti", "0"),
+    ("vm.mmap_min_addr", "65536"),
+    // Root keeps the kernel log: `sudo dmesg` works.
+    ("root-dmesg", "allowed"),
+    ("user-dmesg", "denied"),
+    // Yama: the memory of a child, not of the parent. The parent's environment is read
+    // access, which Yama leaves alone (README, "Inside an orb").
+    ("user-mem-child", "allowed"),
+    ("user-mem-parent", "denied"),
+    ("user-environ-parent", "allowed"),
+    // Unprivileged user namespaces still work (bwrap, unshare, rootless containers).
+    ("user-userns", "allowed"),
+];
+
+fn assert_guest_security(orb: &Path) {
+    let want: Vec<String> = GUEST_SECURITY
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let console = without_kernel_messages(&console(orb));
+        let reported: Vec<&str> = console
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("security: "))
+            .collect();
+        let missing: Vec<&String> = want
+            .iter()
+            .filter(|w| !reported.contains(&w.as_str()))
+            .collect();
+        if missing.is_empty() {
+            eprintln!("guest security: {}", want.join(" "));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "guest hardening: want {missing:?}; the guest reported {reported:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// The cluster's orb directories, oldest orb first (orb ids are time-ordered).
 fn orb_dirs(c: &Cluster) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(state(c).join("orbs"))
@@ -579,9 +670,11 @@ fn sleep_preserves_processes_and_nested_guest() {
         console.contains("landlock: Up and running."),
         "the guest kernel must enable Landlock"
     );
+    // Read as `user` (securityfs is readable without root); the exact list is checked
+    // by assert_guest_security.
     assert!(
-        console.contains("guest lsm: capability,landlock"),
-        "/sys/kernel/security/lsm must list Landlock; console tail:\n{}",
+        console.contains("guest lsm: capability,landlock,yama"),
+        "/sys/kernel/security/lsm must list Landlock and Yama; console tail:\n{}",
         tail(&console)
     );
     // ABI 8 added LANDLOCK_RESTRICT_SELF_TSYNC; multithreaded sandboxers (go-landlock)
@@ -595,6 +688,7 @@ fn sleep_preserves_processes_and_nested_guest() {
         abi >= 8,
         "the guest kernel's Landlock ABI is {abi}, need >= 8 (TSYNC)"
     );
+    assert_guest_security(&orb_dir(&c));
     if runtime() == "firecracker" {
         assert!(
             console.contains("/dev/kvm is missing") && !console.contains("l2counter"),
@@ -1406,4 +1500,442 @@ fn flow_log_records_orb_connections() {
         t.contains("chain forward") && !t.contains("log ") && !t.contains("flowlog"),
         "{t}"
     );
+}
+
+/// A DNS server for the agent's egress proxy to resolve with (`ORBD_DNS`): fixed
+/// answers, NXDOMAIN for every other name; it records the names it is asked.
+#[cfg(target_os = "linux")]
+mod upstream {
+    use orbd::runtime::vm::dns::{self, Answer, AnswerData};
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub const ADDR: &str = "127.53.0.1";
+
+    pub struct Upstream {
+        pub asked: Mutex<Vec<String>>,
+        records: Mutex<HashMap<String, Vec<Answer>>>,
+    }
+
+    pub fn a(name: &str, ip: [u8; 4]) -> Answer {
+        Answer {
+            name: name.into(),
+            ttl: 60,
+            data: AnswerData::A(Ipv4Addr::from(ip)),
+        }
+    }
+
+    pub fn cname(name: &str, target: &str) -> Answer {
+        Answer {
+            name: name.into(),
+            ttl: 300,
+            data: AnswerData::Cname(target.into()),
+        }
+    }
+
+    /// Serves `records` (by queried name) on [`ADDR`] port 53.
+    pub fn start(records: Vec<(&str, Vec<Answer>)>) -> Arc<Upstream> {
+        static UP: OnceLock<Arc<Upstream>> = OnceLock::new();
+        let up = UP
+            .get_or_init(|| {
+                let up = Arc::new(Upstream {
+                    asked: Mutex::new(Vec::new()),
+                    records: Mutex::new(HashMap::new()),
+                });
+                let sock =
+                    std::net::UdpSocket::bind((ADDR, 53)).expect("binding the fake upstream");
+                let u = up.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok((n, src)) = sock.recv_from(&mut buf) else {
+                            continue;
+                        };
+                        let Ok(q) = dns::parse_query(&buf[..n]) else {
+                            continue;
+                        };
+                        let name = q.question.name.text().unwrap_or_default();
+                        u.asked.lock().unwrap().push(name.clone());
+                        let answers = u.records.lock().unwrap().get(&name).cloned();
+                        let reply = match answers {
+                            Some(a) if q.question.qtype == dns::TYPE_A => {
+                                dns::build_response(&q, dns::NOERROR, &a, 1232)
+                            }
+                            Some(_) => dns::build_response(&q, dns::NOERROR, &[], 1232),
+                            None => dns::build_response(&q, dns::NXDOMAIN, &[], 1232),
+                        };
+                        let _ = sock.send_to(&reply, src);
+                    }
+                });
+                up
+            })
+            .clone();
+        *up.records.lock().unwrap() = records
+            .into_iter()
+            .map(|(n, a)| (n.to_owned(), a))
+            .collect();
+        up.asked.lock().unwrap().clear();
+        up
+    }
+}
+
+/// `probe <target> <result>` lines the guest printed after console offset `from`, for
+/// each of `targets`, waiting for them (a dropped probe takes 5 s).
+#[cfg(target_os = "linux")]
+fn probes(orb: &Path, from: usize, targets: &[&str]) -> std::collections::HashMap<String, String> {
+    let deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+        let text = console(orb);
+        let new = text.get(from..).unwrap_or_default();
+        let found: std::collections::HashMap<String, String> = targets
+            .iter()
+            .filter_map(|t| {
+                new.lines().rev().find_map(|l| {
+                    l.strip_prefix(&format!("probe {t} "))
+                        .map(|r| (t.to_string(), r.trim().to_owned()))
+                })
+            })
+            .collect();
+        if found.len() == targets.len() {
+            for (t, r) in &found {
+                eprintln!("guest probe {t}: {r}");
+            }
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the guest did not probe {targets:?}; console tail:\n{}",
+            tail(&text)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Restricted egress (an orb type's `egress`): the orb's DNS is the agent's proxy, which
+/// resolves only allowlisted names (a CNAME chain as returned for one too, and answers
+/// too big for UDP over TCP) and never asks upstream about the rest; the orb reaches
+/// what they resolved to on the policy's ports and its `allow` rules, nothing else: not
+/// other internet addresses, not DNS servers directly, and not private, link-local or
+/// metadata addresses even when an allowlisted name resolves to one, not an opened
+/// address on a port the policy does not list (TCP or UDP), and no IPv6. The flow log
+/// shows each connection with the restricted verdict. An unrestricted orb beside it does
+/// not reach the DNS proxy; another restricted orb does not reach the first one's
+/// addresses. An agent restart keeps the orbs restricted with their open addresses, and
+/// an edit of the orb type's list reaches the orb at its next launch.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+fn restricted_egress_reaches_only_its_allowlist() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("NOTICE: restricted egress needs Linux VM orbs: skipped");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use upstream::{a, cname};
+        let private = private_targets()
+            .first()
+            .map(|t| t.trim_end_matches(":1").to_owned());
+        let private_ip: [u8; 4] = private
+            .as_deref()
+            .unwrap_or("10.255.255.1")
+            .parse::<std::net::Ipv4Addr>()
+            .unwrap()
+            .octets();
+        let many: Vec<_> = (1..=40)
+            .map(|i| a("many.orbd.test", [104, 16, 0, i]))
+            .collect();
+        let up = upstream::start(vec![
+            (
+                "allowed.orbd.test",
+                vec![a("allowed.orbd.test", [1, 0, 0, 1])],
+            ),
+            (
+                "www.cdn.orbd.test",
+                vec![
+                    cname("www.cdn.orbd.test", "edge.elsewhere.test"),
+                    a("edge.elsewhere.test", [8, 8, 4, 4]),
+                ],
+            ),
+            (
+                "private.orbd.test",
+                vec![a("private.orbd.test", private_ip)],
+            ),
+            (
+                "meta.orbd.test",
+                vec![a("meta.orbd.test", [169, 254, 169, 254])],
+            ),
+            (
+                "denied.orbd.test",
+                vec![a("denied.orbd.test", [1, 1, 1, 1])],
+            ),
+            ("many.orbd.test", many),
+        ]);
+
+        let mut c = cluster(3);
+        let _vms = Vms(c.root().to_owned());
+        // The cluster's offering, restricted, and the same without `egress` (`plain`).
+        let path = c.root().join("coordinator.yaml");
+        let yaml = std::fs::read_to_string(&path).unwrap();
+        let (head, block) = yaml.split_once("offerings:\n").unwrap();
+        let (head, block) = (head.to_owned(), block.trim_end().to_owned());
+        let plain = block.replace(&format!("id: {}", c.offering), "id: plain");
+        let set_egress = |policy: &str| {
+            std::fs::write(
+                &path,
+                format!("{head}offerings:\n{block}\n    egress: {policy}\n{plain}\n"),
+            )
+            .unwrap();
+        };
+        set_egress(
+            r#"{ domains: [allowed.orbd.test, "*.cdn.orbd.test", private.orbd.test, meta.orbd.test, many.orbd.test], ports: ["tcp:443", "tcp:1"], allow: ["tcp:9.9.9.9:443"] }"#,
+        );
+        for (k, v) in [
+            ("ORBD_DNS", upstream::ADDR),
+            ("ORBD_FLOW_LOG", "true"),
+            ("ORBD_LOG_JSON", "true"),
+        ] {
+            c.agent_env.push((k.into(), v.into()));
+        }
+        c.start_all();
+        let mut targets = vec![
+            "allowed.orbd.test:443",
+            "www.cdn.orbd.test:443",
+            "9.9.9.9:443",
+            "1.1.1.1:443",
+            "1.1.1.1:53",
+            "allowed.orbd.test:80",
+            "denied.orbd.test:443",
+            "meta.orbd.test:443",
+            "private.orbd.test:1",
+        ];
+        let direct = private.as_ref().map(|p| format!("{p}:1"));
+        if let Some(d) = &direct {
+            targets.push(d);
+        } else {
+            eprintln!("NOTICE: no private address answers this agent: rebinding only by name");
+        }
+        let spawn = |c: &Cluster, orb: &str, env: &[(&str, &str)]| {
+            let mut e: Vec<(&str, &str)> = env.to_vec();
+            e.push((
+                "ORB_ENVS",
+                "AMP_URL ORB_TOKEN AMP_THREAD_ID AMP_SANDBOX_ID E2E_PROBE E2E_RESOLVE E2E_UDP E2E_PROBE6",
+            ));
+            assert_ok(&c.dispatch("spawn", orb, &e), orb);
+        };
+        let probe_all = targets.join(" ");
+        spawn(
+            &c,
+            "amp-1",
+            &[
+                ("E2E_PROBE", &probe_all),
+                ("E2E_RESOLVE", "many.orbd.test"),
+                ("E2E_UDP", "1.1.1.1:53 allowed.orbd.test:443"),
+                ("E2E_PROBE6", "2606:4700:4700::1111/443"),
+            ],
+        );
+        let orb = orb_dir(&c);
+        let got = probes(&orb, 0, &targets);
+        let want = |t: &str| -> &str {
+            match t {
+                "allowed.orbd.test:443" | "www.cdn.orbd.test:443" | "9.9.9.9:443" => "open",
+                "denied.orbd.test:443" | "meta.orbd.test:443" | "private.orbd.test:1" => {
+                    "unresolved"
+                }
+                _ => "dropped",
+            }
+        };
+        for t in &targets {
+            assert_eq!(
+                got[*t],
+                want(t),
+                "{t}; console tail:\n{}",
+                tail(&console(&orb))
+            );
+        }
+        // 40 addresses do not fit a UDP answer: the guest asked again over TCP.
+        let line = |prefix: &str| {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Some(l) = console(&orb)
+                    .lines()
+                    .rev()
+                    .find_map(|l| l.strip_prefix(prefix).map(str::to_owned))
+                {
+                    break l;
+                }
+                assert!(Instant::now() < deadline, "no {prefix:?} in the console");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        };
+        let resolved = line("resolve many.orbd.test ");
+        assert_eq!(resolved.split_whitespace().count(), 40, "{resolved}");
+        // No IPv6 at all.
+        let v6 = line("probe6 2606:4700:4700::1111/443 ");
+        assert_ne!(v6.trim(), "open", "IPv6 reached the internet");
+        eprintln!("guest probe6: {v6}");
+        line("udp allowed.orbd.test:443 ");
+        // Never asked upstream about names off the list; asked about the listed ones
+        // whatever they resolve to.
+        let asked = up.asked.lock().unwrap().clone();
+        assert!(!asked.iter().any(|n| n == "denied.orbd.test"), "{asked:?}");
+        for n in ["allowed.orbd.test", "private.orbd.test", "meta.orbd.test"] {
+            assert!(asked.iter().any(|a| a == n), "{n}: {asked:?}");
+        }
+
+        // The flow log: every connection the orb started, with the restricted verdict
+        // (UDP too, and to the agent itself); none to the addresses no name opened.
+        let log = c.root().join("agent-agent-a.log");
+        let flows = |dst: &str, proto: &str| -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|v| v["target"] == "orbd::flow" && v["fields"]["message"] == "orb flow")
+                .filter(|v| v["fields"]["dst"] == dst && v["fields"]["proto"] == proto)
+                .collect()
+        };
+        let mut expect = vec![
+            ("1.0.0.1:443", "tcp", "accept"),
+            ("8.8.4.4:443", "tcp", "accept"),
+            ("9.9.9.9:443", "tcp", "accept"),
+            ("1.1.1.1:443", "tcp", "drop"),
+            ("1.1.1.1:53", "tcp", "drop"),
+            ("1.1.1.1:53", "udp", "drop"),
+            ("1.0.0.1:80", "tcp", "drop"),
+            ("1.0.0.1:443", "udp", "drop"),
+        ];
+        if let Some(d) = &direct {
+            expect.push((d, "tcp", "drop"));
+        }
+        wait_until(Duration::from_secs(10), "flow events", || {
+            expect.iter().all(|(d, p, _)| !flows(d, p).is_empty())
+        });
+        for (dst, proto, verdict) in &expect {
+            let f = &flows(dst, proto)[0]["fields"];
+            assert_eq!(f["verdict"], *verdict, "{dst}: {f}");
+            assert_eq!(f["egress"], "restricted", "{dst}: {f}");
+            assert_eq!(f["amp_orb_id"], "amp-1", "{f}");
+            eprintln!("flow: {f}");
+        }
+        assert!(flows("169.254.169.254:443", "tcp").is_empty());
+        if let Some(p) = &private {
+            assert!(
+                flows(&format!("{p}:1"), "tcp").len() <= 1,
+                "only the direct probe reached the filter"
+            );
+        }
+        let refused = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("not on the orb type's egress list");
+        assert!(refused, "the agent logs refused names");
+
+        // Other orbs on the agent: an unrestricted one reaches the internet as always,
+        // not the DNS proxy; another restricted one none of the first one's addresses.
+        let before = orb_dirs(&c);
+        let restricted_offering = std::mem::replace(&mut c.offering, "plain".into());
+        spawn(&c, "amp-2", &[("E2E_PROBE", "169.254.0.1:53 1.1.1.1:443")]);
+        let plain_orb = orb_dirs(&c)
+            .into_iter()
+            .find(|d| !before.contains(d))
+            .unwrap();
+        c.offering = restricted_offering;
+        let before = orb_dirs(&c);
+        spawn(
+            &c,
+            "amp-3",
+            &[("E2E_PROBE", "1.0.0.1:443 8.8.4.4:443 9.9.9.9:443")],
+        );
+        let other = orb_dirs(&c)
+            .into_iter()
+            .find(|d| !before.contains(d))
+            .unwrap();
+        let got = probes(&plain_orb, 0, &["169.254.0.1:53", "1.1.1.1:443"]);
+        assert_eq!(
+            got["169.254.0.1:53"], "dropped",
+            "an unrestricted orb reached the proxy"
+        );
+        assert_eq!(
+            got["1.1.1.1:443"], "open",
+            "unrestricted orbs reach the internet"
+        );
+        let got = probes(&other, 0, &["1.0.0.1:443", "8.8.4.4:443", "9.9.9.9:443"]);
+        assert_eq!(
+            got["1.0.0.1:443"], "dropped",
+            "another orb's opened address"
+        );
+        assert_eq!(
+            got["8.8.4.4:443"], "dropped",
+            "another orb's opened address"
+        );
+        assert_eq!(got["9.9.9.9:443"], "open", "its own allow rule");
+
+        // An agent killed outright leaves the table as it was; the next one renders the
+        // orbs' chains again from their recorded policies before anything else, with
+        // the addresses they had open: the running orbs are never unrestricted.
+        let table = || {
+            let out = std::process::Command::new("nft")
+                .args(["list", "table", "inet", "orbd"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert!(table().contains(": goto egress"), "{}", table());
+        c.kill_agent("agent-a");
+        assert!(table().contains(": goto egress"), "{}", table());
+        start_again(&mut c, "");
+        let t = table();
+        assert_eq!(t.matches(": goto egress").count(), 2, "{t}");
+        assert!(t.contains("1.0.0.1 timeout"), "opened addresses kept: {t}");
+        let from = console(&orb).len();
+        spawn(
+            &c,
+            "amp-1",
+            &[("E2E_PROBE", "1.1.1.1:443 allowed.orbd.test:443")],
+        );
+        let got = probes(&orb, from, &["1.1.1.1:443", "allowed.orbd.test:443"]);
+        assert_eq!(got["1.1.1.1:443"], "dropped");
+        assert_eq!(got["allowed.orbd.test:443"], "open");
+
+        // The operator edits the list: the sleeping orb keeps its policy until its next
+        // launch (here a memory restore), which applies the new one.
+        assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
+        set_egress(
+            r#"{ domains: [denied.orbd.test, "*.cdn.orbd.test"], allow: ["tcp:9.9.9.9:443"] }"#,
+        );
+        c.kill_coordinator();
+        c.start_coordinator("");
+        c.wait_connected(1);
+        let recorded = || std::fs::read_to_string(orb.join("egress.json")).unwrap();
+        assert!(recorded().contains("allowed.orbd.test"), "{}", recorded());
+        let from = console(&orb).len();
+        spawn(
+            &c,
+            "amp-1",
+            &[(
+                "E2E_PROBE",
+                "denied.orbd.test:443 allowed.orbd.test:443 www.cdn.orbd.test:443",
+            )],
+        );
+        let got = probes(
+            &orb,
+            from,
+            &[
+                "denied.orbd.test:443",
+                "allowed.orbd.test:443",
+                "www.cdn.orbd.test:443",
+            ],
+        );
+        assert_eq!(got["denied.orbd.test:443"], "open", "now listed");
+        assert_eq!(
+            got["allowed.orbd.test:443"], "unresolved",
+            "no longer listed"
+        );
+        assert_eq!(got["www.cdn.orbd.test:443"], "open");
+        assert!(recorded().contains("denied.orbd.test"), "{}", recorded());
+        for o in ["amp-1", "amp-2", "amp-3"] {
+            assert_ok(&c.dispatch("delete", o, &[]), "delete");
+        }
+        assert!(!table().contains(": goto egress"), "{}", table());
+    }
 }

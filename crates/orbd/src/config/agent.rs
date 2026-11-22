@@ -349,117 +349,7 @@ impl Egress {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EgressProto {
-    Tcp,
-    Udp,
-    /// Every protocol; with ports, TCP or UDP to them.
-    Any,
-}
-
-/// One allowed destination: `<proto>:<address or CIDR>[:<ports>]`, e.g.
-/// `udp:192.168.2.201:41641` (Tailscale to a LAN host), `tcp:10.0.0.0/8:8000-8100`,
-/// `any:192.168.2.0/24` (every protocol and port). `proto` is tcp, udp or any; ports are
-/// one port or a range, every port without them. Prefixes shorter than /8 (and `*`) are
-/// refused, as is link-local: `ORBD_ALLOW_PRIVATE_EGRESS` allows everything private.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EgressRule {
-    pub proto: EgressProto,
-    pub net: Ipv4Addr,
-    pub prefix: u8,
-    /// Inclusive range; `None` for every port.
-    pub ports: Option<(u16, u16)>,
-}
-
-impl std::fmt::Display for EgressRule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let proto = match self.proto {
-            EgressProto::Tcp => "tcp",
-            EgressProto::Udp => "udp",
-            EgressProto::Any => "any",
-        };
-        write!(f, "{proto}:")?;
-        match self.prefix {
-            32 => write!(f, "{}", self.net)?,
-            p => write!(f, "{}/{p}", self.net)?,
-        }
-        match self.ports {
-            None => Ok(()),
-            Some((a, b)) if a == b => write!(f, ":{a}"),
-            Some((a, b)) => write!(f, ":{a}-{b}"),
-        }
-    }
-}
-
-impl std::str::FromStr for EgressRule {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        let bad = |why: &str| {
-            format!(
-                "{s:?}: {why} (expected <tcp|udp|any>:<address or CIDR>[:<port or range>], \
-                 e.g. udp:192.168.2.201:41641)"
-            )
-        };
-        let mut parts = s.trim().split(':');
-        let (Some(proto), Some(addr), ports, None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(bad("wrong number of parts"));
-        };
-        let proto = match proto.to_ascii_lowercase().as_str() {
-            "tcp" => EgressProto::Tcp,
-            "udp" => EgressProto::Udp,
-            "any" => EgressProto::Any,
-            _ => return Err(bad("protocol must be tcp, udp or any")),
-        };
-        if addr == "*" {
-            return Err(bad(
-                "`*` would allow every private destination: ORBD_ALLOW_PRIVATE_EGRESS does that",
-            ));
-        }
-        let (ip, prefix) = match addr.split_once('/') {
-            Some((ip, p)) => (ip, p.parse::<u8>().map_err(|_| bad("bad prefix"))?),
-            None => (addr, 32),
-        };
-        let net: Ipv4Addr = ip.parse().map_err(|_| bad("bad IPv4 address"))?;
-        if prefix > 32 {
-            return Err(bad("prefix above /32"));
-        }
-        if prefix < 8 {
-            return Err(bad(
-                "prefixes shorter than /8 are refused: ORBD_ALLOW_PRIVATE_EGRESS allows every \
-                 private destination",
-            ));
-        }
-        if u32::from(net) & !GuestNetwork::mask(prefix) != 0 {
-            return Err(bad("host bits are set"));
-        }
-        let link_local = Ipv4Addr::new(169, 254, 0, 0);
-        let mask = GuestNetwork::mask(prefix.min(16));
-        if u32::from(net) & mask == u32::from(link_local) & mask {
-            return Err(bad("link-local (cloud metadata) is never allowed"));
-        }
-        let ports = match ports {
-            None | Some("") | Some("*") => None,
-            Some(p) => {
-                let (a, b) = p.split_once('-').unwrap_or((p, p));
-                let a: u16 = a.parse().map_err(|_| bad("bad port"))?;
-                let b: u16 = b.parse().map_err(|_| bad("bad port"))?;
-                if a == 0 || a > b {
-                    return Err(bad("ports must be 1-65535, low to high"));
-                }
-                Some((a, b))
-            }
-        };
-        Ok(Self {
-            proto,
-            net,
-            prefix,
-            ports,
-        })
-    }
-}
+pub use crate::model::egress::{EgressProto, EgressRule};
 
 /// Which images an agent prepares and runs (`ORBD_IMAGE_ALLOW`), checked on the agent
 /// before an image is resolved or pulled, for every spawn of a new disk and every
@@ -859,6 +749,10 @@ pub struct FakeRuntimeConfig {
     /// placement by architecture.
     #[serde(default)]
     pub arch: crate::model::Arch,
+    /// Advertise restricted egress (enforcing nothing), to test placement and refusal of
+    /// orb types with `egress`. Off by default.
+    #[serde(default)]
+    pub egress_policy: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

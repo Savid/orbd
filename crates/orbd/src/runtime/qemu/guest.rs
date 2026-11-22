@@ -19,16 +19,18 @@ impl QemuRuntime {
 
     fn guest_of<'a>(
         &self,
-        orb: OrbId,
+        orb: &OrbDefinition,
         connector: &'a VirtioSerialConnector,
         console_log: &'a std::path::Path,
     ) -> Result<Guest<'a>, GuestError> {
         let recipe = self
-            .read_recipe(orb)
+            .read_recipe(orb.id)
             .map_err(|e| GuestError::Unreachable(e.to_string()))?;
+        let dir = self.orb_paths(orb.id).dir;
+        let dns = crate::runtime::vm::guest_dns(orb, &dir, &recipe.net, &self.config.dns_servers);
         Ok(Guest {
             connector,
-            network: recipe.net.guest_config(&self.config.dns_servers),
+            network: recipe.net.guest_config(&dns),
             console_log,
         })
     }
@@ -39,7 +41,7 @@ impl GuestControl for QemuRuntime {
     async fn resync(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), GuestError> {
         let connector = self.connector(orb.id);
         let console = self.orb_paths(orb.id).console_log;
-        guest::resync(self.guest_of(orb.id, &connector, &console)?, ctx).await
+        guest::resync(self.guest_of(orb, &connector, &console)?, ctx).await
     }
 
     async fn bootstrap(
@@ -58,12 +60,6 @@ impl GuestControl for QemuRuntime {
         }
         let connector = self.connector(orb.id);
         let console = self.orb_paths(orb.id).console_log;
-        guest::bootstrap(
-            self.guest_of(orb.id, &connector, &console)?,
-            orb,
-            request,
-            ctx,
-        )
-        .await
+        guest::bootstrap(self.guest_of(orb, &connector, &console)?, orb, request, ctx).await
     }
 }

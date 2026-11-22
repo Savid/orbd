@@ -5,6 +5,8 @@
 
 pub mod checkpoints;
 pub mod disktools;
+pub mod dns;
+pub mod egress;
 pub mod flowlog;
 pub mod guest;
 pub mod images;
@@ -54,17 +56,39 @@ pub fn last_used(dir: &Path) -> std::io::Result<std::time::SystemTime> {
     )
 }
 
-/// Makes sure the orb's host network exists before a launch (repaired after a host
-/// reboot; its TAP owned by `owner` for a jailed VMM).
+/// Makes sure `orb`'s host network exists before a launch (repaired after a host
+/// reboot; its TAP owned by `owner` for a jailed VMM), restricted to the egress policy
+/// it launches with, if any (see [`egress`]; `orb_dir` holds its policy file).
 pub async fn adopt_net(
+    orb: &crate::model::OrbDefinition,
+    orb_dir: &Path,
     net: &net::NetAttachment,
     owner: Option<jail::Ids>,
 ) -> Result<(), RuntimeError> {
-    let net = net.clone();
-    tokio::task::spawn_blocking(move || net.adopt(owner))
+    let restricted = egress::restricted(orb, orb_dir, net);
+    if restricted && !net.is_tap() {
+        return Err(RuntimeError::Unsupported(super::EGRESS_REFUSED.into()));
+    }
+    let n = net.clone();
+    tokio::task::spawn_blocking(move || n.adopt(owner, restricted))
         .await
         .map_err(|e| RuntimeError::Other(e.to_string()))?
-        .map_err(|e| RuntimeError::Other(format!("network: {e}")))
+        .map_err(|e| RuntimeError::Other(format!("network: {e}")))?;
+    egress::apply(orb, orb_dir, net).await
+}
+
+/// The DNS servers `orb`'s guest uses: the agent's (`ORBD_DNS`), or, for an orb with
+/// restricted egress, its gateway, which leads to the agent's DNS proxy.
+pub fn guest_dns(
+    orb: &crate::model::OrbDefinition,
+    orb_dir: &Path,
+    net: &net::NetAttachment,
+    dns_servers: &[String],
+) -> Vec<String> {
+    match egress::restricted(orb, orb_dir, net) {
+        true => egress::guest_dns(net),
+        false => dns_servers.to_vec(),
+    }
 }
 
 /// Runs a host tool with fixed arguments, bounded by the context; killed if cancelled

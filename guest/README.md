@@ -2,13 +2,15 @@
 
 - `kernel/`: `build.sh` builds the pinned Linux 7.3 guest kernel (`bzImage`, final
   `config`, `bzImage.sha256`, `manifest.txt`) from `orbd.config`. Everything is built in:
-  no modules, no initrd. `ARCH=arm64` builds an `Image` for macOS agents.
+  no modules, no initrd. Its security modules are Landlock and Yama (README, "Inside an
+  orb"). `ARCH=arm64` builds an `Image` for macOS agents.
 - `builder/`: the container macOS agents build orb images in.
 - `rootfs/`: files the image pipeline (`crates/orbd/src/image/`) adds to Amp's image as
-  one extra layer, next to the static `orbd-guest` binary (`/usr/local/sbin/orbd-guest`),
-  an empty `/etc/machine-id`, a mask for `serial-getty@ttyS0.service` (without udev it
-  would hold boot for 90 s) and linger for `user` (`/var/lib/systemd/linger/user`), so
-  its systemd user manager runs and `systemd-run --user` works.
+  one extra layer (units, and the hardening sysctls in `etc/sysctl.d`), next to the
+  static `orbd-guest` binary (`/usr/local/sbin/orbd-guest`), an empty `/etc/machine-id`,
+  a mask for `serial-getty@ttyS0.service` (without udev it would hold boot for 90 s) and
+  linger for `user` (`/var/lib/systemd/linger/user`), so its systemd user manager runs
+  and `systemd-run --user` works.
 
 ## Host contract
 

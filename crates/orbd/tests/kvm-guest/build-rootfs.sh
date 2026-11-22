@@ -7,6 +7,8 @@
 #   orbd-test-blob     with `orbd.blob=<MiB>` on the kernel command line: dirty RAM
 #   orbd-test-marker   `marker created|present <id>`: a disk's identity, kept by snapshots
 #   orbd-test-dns      `stale-dns: ...`: leaves resolv.conf as a killed tailscaled would
+#   orbd-test-security `security: <name>=<value>`: LSMs, hardening sysctls, and what an
+#                      unprivileged process may do (ptrace, dmesg, user namespaces)
 #
 #   build-rootfs.sh ORBD_GUEST_BINARY GUEST_KERNEL OUT.ext4 [GUEST_ROOTFS_DIR]
 #   ARCH=arm64 build-rootfs.sh ...   (for macOS agents: no nested guest; run on arm64)
@@ -35,7 +37,7 @@ work=$(mktemp -d)
 chmod 0755 "$work"   # read by the unprivileged namespace root
 trap 'rm -rf "$work"' EXIT
 
-units="orbd-guest.service amp-headless-bootstrap.service orbd-test-counter.service orbd-test-blob.service orbd-test-marker.service orbd-test-dns.service"
+units="orbd-guest.service amp-headless-bootstrap.service orbd-test-counter.service orbd-test-blob.service orbd-test-marker.service orbd-test-dns.service orbd-test-security.service"
 nested_hooks=()
 if [ "$nested" = 1 ]; then
     # Nested (L2) guest: the same kernel (built without initrd support) booting a tiny

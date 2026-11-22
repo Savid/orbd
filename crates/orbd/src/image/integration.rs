@@ -35,6 +35,13 @@ const FILES: &[(&str, u32, &str)] = &[
         0o644,
         include_str!("../../../../guest/rootfs/etc/udev/rules.d/60-orbd-kvm.rules"),
     ),
+    // Kernel hardening sysctls (Yama, kptr/dmesg restriction, no unprivileged eBPF),
+    // applied by systemd-sysctl at boot.
+    (
+        "etc/sysctl.d/60-orbd-hardening.conf",
+        0o644,
+        include_str!("../../../../guest/rootfs/etc/sysctl.d/60-orbd-hardening.conf"),
+    ),
     // Empty: systemd generates a machine id on each new orb's first boot instead of
     // every orb sharing the one baked into the image.
     ("etc/machine-id", 0o444, ""),
@@ -68,7 +75,9 @@ pub const GUEST_HELPER_PATH: &str = "usr/local/sbin/orbd-guest";
 /// reach orbs of existing projects: their project snapshots, which keep what they were
 /// built with, are then passed over once for the image (see [`super::lineage`]). Not
 /// the layer's digest, which changes with every orbd build.
-pub const GUEST_LINEAGE: u32 = 1;
+///
+/// 2: the hardening sysctls (`etc/sysctl.d/60-orbd-hardening.conf`).
+pub const GUEST_LINEAGE: u32 = 2;
 
 /// The integration layer (uncompressed tar) and its digest (`sha256:<hex>`).
 pub struct IntegrationLayer {

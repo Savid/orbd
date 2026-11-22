@@ -9,6 +9,11 @@
 //! orb_types:                      # named as orb types in Amp; the first is the default
 //!   - { id: 2vcpu-4gb, vcpus: 2, memory_mib: 4096, disk_gib: 40 }
 //!   - { id: kvm-4vcpu-8gb, vcpus: 4, memory_mib: 8192, disk_gib: 40, kvm: true }
+//!   - id: untrusted-4vcpu-8gb       # restricted egress: only what `egress` lists
+//!     vcpus: 4
+//!     memory_mib: 8192
+//!     disk_gib: 40
+//!     egress: { domains: [ampcode.com, "*.ampcode.com"], allow: ["tcp:140.82.112.0/20:22"] }
 //! ```
 //!
 //! Without `config_version` (v1) the file lists `offerings`, each pinned to a runtime,
@@ -158,6 +163,13 @@ pub struct OrbTypeConfig {
     /// Amp's amp-orb image becomes amp-orb-arm64 there.
     #[serde(default = "default_archs", deserialize_with = "one_or_many")]
     pub arch: Vec<Arch>,
+    /// Restricted egress: the orb reaches only names matching `domains` (resolved by its
+    /// agent's DNS proxy) on `ports` (default `[tcp:443]`), the destinations `allow`
+    /// names (private ones only where the agent's own `ORBD_EGRESS_ALLOW` allows them
+    /// too), and nothing else. Runs only on agents that enforce it (Linux VM runtimes),
+    /// never on Boat. See [`crate::model::egress`].
+    #[serde(default)]
+    pub egress: Option<crate::model::EgressPolicy>,
 }
 
 fn default_archs() -> Vec<Arch> {
@@ -338,6 +350,9 @@ pub struct OfferingConfig {
     /// take them. arm64 orbs run in QEMU, without `/dev/kvm`.
     #[serde(default)]
     pub arch: Arch,
+    /// Restricted egress, as an orb type's `egress` (QEMU, Firecracker and fake only).
+    #[serde(default)]
+    pub egress: Option<crate::model::EgressPolicy>,
 }
 
 impl OfferingConfig {
@@ -359,6 +374,19 @@ impl OfferingConfig {
             return Err(ConfigError::Invalid(format!(
                 "offering {}: arm64 orbs run in QEMU (runtime: qemu)",
                 self.id
+            )));
+        }
+        if self.egress.is_some()
+            && !matches!(
+                self.runtime,
+                OfferingRuntime::Qemu | OfferingRuntime::Firecracker | OfferingRuntime::Fake
+            )
+        {
+            return Err(ConfigError::Invalid(format!(
+                "offering {}: egress is enforced only for VM orbs on the agents (runtime: qemu \
+                 or firecracker), not {}",
+                self.id,
+                self.runtime.as_str()
             )));
         }
         // Hypervisor.framework does not nest: arm64 orbs get no /dev/kvm.
@@ -401,6 +429,7 @@ impl OfferingConfig {
                     nested_kvm,
                     project_snapshots: SnapshotRequirement::NotRequired,
                     arch: self.arch,
+                    egress: self.egress.clone(),
                 },
                 pause_policy,
             },
@@ -409,7 +438,8 @@ impl OfferingConfig {
 }
 
 /// Why an orb of `from` cannot run as `to`, or None if `to` is like-for-like: `/dev/kvm`
-/// in the orb on both or neither, and at least as much compute. Sleep may differ: an
+/// in the orb on both or neither, the same egress policy, and at least as much compute.
+/// Sleep may differ: an
 /// orb spilled to Boat keeps its disk across a pause but not its processes. So may the
 /// architecture: a new orb has none yet.
 fn unlike(from: &SpecTemplate, to: &SpecTemplate) -> Option<String> {
@@ -421,6 +451,8 @@ fn unlike(from: &SpecTemplate, to: &SpecTemplate) -> Option<String> {
             if kvm(from) { "kvm" } else { "no kvm" },
             if kvm(to) { "kvm" } else { "no kvm" }
         ))
+    } else if from.requirements.egress != to.requirements.egress {
+        Some("their egress policies differ".into())
     } else if b.vcpus < a.vcpus || b.memory_bytes < a.memory_bytes {
         Some(format!(
             "it is smaller ({} vCPUs / {} MiB vs {} / {})",
@@ -481,6 +513,9 @@ impl CoordinatorConfig {
         };
         for t in &self.orb_types {
             let bad = |m: &str| Err(ConfigError::Invalid(format!("orb type {}: {m}", t.id)));
+            if let Some(Err(e)) = t.egress.as_ref().map(|p| p.check_config()) {
+                return bad(&e);
+            }
             let archs = &t.arch;
             if archs.is_empty()
                 || archs
@@ -493,8 +528,9 @@ impl CoordinatorConfig {
             if t.kvm && archs.contains(&Arch::Arm64) {
                 return bad("kvm orbs are amd64 only (Apple Silicon does not nest)");
             }
-            // Boat runs amd64 orbs without kvm, in its own sizes.
+            // Boat runs amd64 orbs without kvm and restricted egress, in its own sizes.
             let boat = !t.kvm
+                && t.egress.is_none()
                 && archs.contains(&Arch::Amd64)
                 && self.boat.is_some()
                 && crate::backend::boat::size_for(t.vcpus, t.memory_mib).is_some();
@@ -513,7 +549,8 @@ impl CoordinatorConfig {
             }
             if places.is_empty() {
                 return bad(&format!(
-                    "nowhere in prefer can run it (Boat runs no kvm, no arm64 and only {})",
+                    "nowhere in prefer can run it (Boat runs no kvm, no arm64, no egress and \
+                     only {})",
                     crate::backend::boat::describe_sizes()
                 ));
             }
@@ -542,6 +579,7 @@ impl CoordinatorConfig {
                         _ => vec![],
                     },
                     arch,
+                    egress: t.egress.clone(),
                 });
             }
         }
@@ -597,6 +635,9 @@ impl CoordinatorConfig {
                 return inv(format!("offering {}: resources must be non-zero", o.id));
             }
             o.to_offering()?;
+            if let Some(Err(e)) = o.egress.as_ref().map(|p| p.check_config()) {
+                return inv(format!("offering {}: {e}", o.id));
+            }
             if o.runtime == OfferingRuntime::Boat && self.boat.is_none() {
                 return inv(format!(
                     "offering {}: runtime boat needs a `boat:` section",
@@ -729,6 +770,7 @@ mod tests {
             },
             spill_to: vec![],
             arch: Arch::Amd64,
+            egress: None,
         }
         .to_offering()
         .unwrap()
@@ -911,6 +953,118 @@ mod tests {
             );
             assert!(load_str(&yaml).is_err(), "{bad}");
         }
+    }
+
+    /// An orb type's `egress` is validated when the file is loaded and recorded in the
+    /// specs of all its offerings; it keeps the orb type off Boat (and v1 offerings out
+    /// of Docker and Boat), spill targets must have the same policy, and unrestricted
+    /// orb types' specs are as before.
+    #[test]
+    fn v2_orb_type_egress() {
+        let yaml = format!(
+            "{V2}orb_types:\n\
+             \x20 - id: untrusted\n    vcpus: 2\n    memory_mib: 4096\n    disk_gib: 20\n    \
+             arch: [amd64, arm64]\n    egress:\n      domains: [ampcode.com, \"*.ampcode.com\"]\n      \
+             allow: [\"tcp:203.0.113.0/24:443\"]\n\
+             \x20 - {{ id: open, vcpus: 2, memory_mib: 4096, disk_gib: 20 }}\n"
+        );
+        let c = load_str(&yaml).unwrap();
+        let got: Vec<_> = c
+            .offerings
+            .iter()
+            .map(|o| {
+                let spill: Vec<_> = o.spill_to.iter().map(|s| s.as_str()).collect();
+                (o.id.as_str(), o.runtime, spill)
+            })
+            .collect();
+        use OfferingRuntime::*;
+        assert_eq!(
+            got,
+            vec![
+                ("untrusted", Firecracker, vec!["untrusted@arm64"]),
+                ("untrusted@arm64", Qemu, vec![]),
+                ("open", Firecracker, vec!["open@boat"]),
+                ("open@boat", Boat, vec![]),
+            ]
+        );
+        let req = |id: &str| {
+            c.offering(id)
+                .unwrap()
+                .to_offering()
+                .unwrap()
+                .spec
+                .requirements
+        };
+        let policy = req("untrusted").egress.unwrap();
+        assert_eq!(req("untrusted@arm64").egress.as_ref(), Some(&policy));
+        let (domains, ports, allow) = policy.parts();
+        assert_eq!(domains, ["ampcode.com", "*.ampcode.com"]);
+        assert_eq!(ports, ["tcp:443"], "the default");
+        assert_eq!(allow, ["tcp:203.0.113.0/24:443"]);
+        assert_eq!(req("open").egress, None);
+        let json = serde_json::to_string(&req("open")).unwrap();
+        assert!(!json.contains("egress"), "{json}");
+
+        let bad = |egress: &str, prefer: &str, want: &str| {
+            let yaml = format!(
+                "{V2}{prefer}orb_types:\n  - {{ id: a, vcpus: 2, memory_mib: 4096, disk_gib: 20, \
+                 egress: {egress} }}\n"
+            );
+            let e = load_str(&yaml).expect_err(egress);
+            assert!(e.contains(want), "{egress}: {e}");
+        };
+        bad("{ domains: [\"*\"] }", "", "egress.domains");
+        bad("{ domains: [\"*.com\"] }", "", "wildcard");
+        bad("{ domains: [\"*.co.uk\"] }", "", "anyone can have names");
+        bad(
+            "{ domains: [\"*.ts.net\"] }",
+            "",
+            "orb type a: egress.domains",
+        );
+        bad("{ domains: [a.com, A.com] }", "", "twice");
+        bad("{ domains: [a.com], ports: [] }", "", "ports is empty");
+        bad(
+            "{ domains: [a.com], ports: [\"icmp:1\"] }",
+            "",
+            "egress.ports",
+        );
+        bad("{ allow: [\"tcp:169.254.169.254\"] }", "", "link-local");
+        bad("{ domain: [a.com] }", "", "unknown field");
+        bad(
+            "{ domains: [a.com] }",
+            "prefer: [boat]\n",
+            "nowhere in prefer",
+        );
+        // `egress: {}` reaches nothing but the proxy, which answers nothing.
+        let yaml = format!(
+            "{V2}orb_types:\n  - {{ id: a, vcpus: 2, memory_mib: 4096, disk_gib: 20, egress: {{}} }}\n"
+        );
+        let c = load_str(&yaml).unwrap();
+        let p = c.offerings[0].egress.as_ref().unwrap();
+        assert!(p.domains.is_empty() && p.allow.is_empty());
+
+        // v1: VM runtimes only, and spill targets with the same policy.
+        let v1 = |runtime: &str, egress: &str, spill: &str| {
+            load_str(&format!(
+                "public_url: https://c.example:7443\n\
+                 boat: {{ api_key_file: /t/boat, capacity: {{ vcpus: 8, memory_mib: 16384 }} }}\n\
+                 offerings:\n\
+                 \x20 - {{ id: a, runtime: {runtime}, resources: {{ vcpus: 2, memory_mib: 4096, disk_gib: 20 }}, \
+                 egress: {{ domains: [a.com] }}, spill_to: [{spill}] }}\n\
+                 \x20 - {{ id: b, runtime: firecracker, resources: {{ vcpus: 2, memory_mib: 4096, disk_gib: 20 }}{egress} }}\n"
+            ))
+        };
+        assert!(v1("firecracker", ", egress: { domains: [a.com] }", "b").is_ok());
+        assert!(v1("qemu", "", "").is_ok());
+        assert!(v1("fake", "", "").is_ok());
+        for runtime in ["docker", "boat"] {
+            let e = v1(runtime, "", "").unwrap_err();
+            assert!(e.contains("egress is enforced only"), "{runtime}: {e}");
+        }
+        let e = v1("firecracker", "", "b").unwrap_err();
+        assert!(e.contains("egress policies differ"), "{e}");
+        let e = v1("firecracker", ", egress: { domains: [b.com] }", "b").unwrap_err();
+        assert!(e.contains("egress policies differ"), "{e}");
     }
 
     #[test]

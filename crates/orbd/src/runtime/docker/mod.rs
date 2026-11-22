@@ -243,6 +243,8 @@ impl Runtime for DockerRuntime {
             nested_state_qualified: false,
             project_snapshots: true,
             arch: crate::model::Arch::HOST,
+            // Containers on Docker's network: nothing orbd filters.
+            egress_policy: false,
         }
     }
 
@@ -256,6 +258,9 @@ impl Runtime for DockerRuntime {
         source: StartSource,
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
+        if orb.egress_policy().is_some() {
+            return Err(RuntimeError::Unsupported(super::EGRESS_REFUSED.into()));
+        }
         let image = match source {
             StartSource::NewDisk(InitialDiskSource::Image { image_ref }) => Some(image_ref),
             StartSource::NewDisk(InitialDiskSource::ProjectSnapshot { snapshot: r, .. }) => {

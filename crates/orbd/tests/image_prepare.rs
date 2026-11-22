@@ -130,6 +130,12 @@ async fn prepares_amp_image_with_guest_integration() {
         linger.contains("Type: regular") && linger.contains("User:     0"),
         "{linger}"
     );
+    // Hardening sysctls, applied by systemd-sysctl at boot.
+    assert_eq!(
+        debugfs(fs, "cat /etc/sysctl.d/60-orbd-hardening.conf"),
+        include_bytes!("../../../guest/rootfs/etc/sysctl.d/60-orbd-hardening.conf"),
+        "hardening sysctls installed verbatim"
+    );
     // Ownership from the image survives unpacking (root-owned setuid sudo, user's home).
     let sudo = stat(fs, "/usr/bin/sudo");
     assert!(

@@ -14,6 +14,9 @@
 //!   `ORBD_CHECKPOINT_MAX_AGE_HOURS` (they cold-boot on their next wake).
 //! * The egress flow log (`ORBD_FLOW_LOG`, [`crate::runtime::vm::flowlog`]) runs on a
 //!   thread of its own, naming orbs from the network index and this agent's records.
+//! * On a Linux VM agent, the DNS proxy of orbs with restricted egress
+//!   ([`crate::runtime::vm::egress`]) also runs on a thread of its own, started with
+//!   the first VM runtime.
 //!
 //! Crash points (feature `failpoints`, `FAILPOINTS="<name>=return"` aborts):
 //! `agent::accepted_committed` (receipt durable, Accepted not yet sent),
