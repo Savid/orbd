@@ -2,11 +2,12 @@
 //! orbd's guest integration installed.
 //!
 //! Pipeline (never mounts or executes untrusted guest content on the host):
-//! resolve `ORB_IMAGE` to its linux/amd64 manifest digest (linux/arm64 on Apple Silicon,
-//! see [`platform_ref`]) → stream blobs into a shared blob cache (oci-client, one blob
-//! at a time into a file) → OCI layout → append the guest integration layer and unpack
-//! as root with a pinned `umoci` → `mkfs.ext4 -d` into a sparse raw file → publish
-//! atomically under `images/<cache key>/`.
+//! check `ORB_IMAGE` against `ORBD_IMAGE_ALLOW` → resolve it to its linux/amd64
+//! manifest digest (linux/arm64 on Apple Silicon, see [`platform_ref`]) → stream blobs
+//! into a shared blob cache (oci-client, one blob at a time into a file) → OCI layout →
+//! append the guest integration layer and unpack with a pinned `umoci`, as root of a
+//! user namespace (`sandbox.rs`) → `mkfs.ext4 -d` into a sparse raw file (sandboxed too)
+//! → publish atomically under `images/<cache key>/`.
 //!
 //! Cache key: platform manifest digest + recipe version + guest integration digest.
 //! A cache miss starts preparation in the background and the caller fails with
@@ -26,6 +27,7 @@
 mod integration;
 mod registry;
 mod rootfs;
+mod sandbox;
 
 pub use integration::IntegrationLayer;
 pub(crate) use rootfs::DOCKER_RUN;
@@ -196,6 +198,27 @@ impl ImageStore {
     /// `config.prewarm` in the background. Must be called inside a tokio runtime.
     pub fn open(config: &ImagesConfig, state_dir: &Path) -> Result<Self, ImageError> {
         let failed = |e: String| ImageError::Failed(e);
+        let mut config = config.clone();
+        config.prewarm.retain(|r| match config.allow.check(r) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(image_ref = %r, "not prewarming: {e}");
+                false
+            }
+        });
+        let config = &config;
+        if config.builder.is_none() && cfg!(target_os = "linux") {
+            match config.sandbox.uid_base() {
+                Some(base) => tracing::info!(
+                    uids = %format!("{base}-{}", base + (crate::config::agent::IMAGE_SANDBOX_IDS - 1)),
+                    "image tools run sandboxed (ORBD_IMAGE_SANDBOX)"
+                ),
+                None => tracing::warn!(
+                    "ORBD_IMAGE_SANDBOX=off: image tools run as real root over image content \
+                     (unsafe: whoever sets an orb's image reaches them)"
+                ),
+            }
+        }
         let integration = IntegrationLayer::build(&config.guest_helper)
             .map_err(|e| failed(format!("guest integration: {e}")))?;
         let images = state_dir.join("images");
@@ -206,6 +229,16 @@ impl ImageStore {
             staging.clone(),
         ] {
             std::fs::create_dir_all(&d).map_err(|e| failed(format!("{}: {e}", d.display())))?;
+        }
+        // Linux builds in progress hold image content (setuid files included) owned by
+        // the sandbox's uids: no other user on the host may reach them. (A macOS builder
+        // container shares the directory instead.)
+        if cfg!(target_os = "linux") && config.builder.is_none() {
+            std::fs::set_permissions(
+                &staging,
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .map_err(|e| failed(format!("{}: {e}", staging.display())))?;
         }
         let store = Self {
             inner: Arc::new(Inner {
@@ -255,8 +288,14 @@ impl ImageStore {
 
     /// The prepared image for `image_ref`, without waiting. On a miss, starts (or reports
     /// the progress of) background preparation and returns `NotReady`; after a failed
-    /// attempt returns `Failed` until the retry delay has passed.
+    /// attempt returns `Failed` until the retry delay has passed. An image
+    /// `ORBD_IMAGE_ALLOW` does not allow fails at once, before anything is resolved.
     pub fn get(&self, image_ref: &str) -> Result<PreparedImage, ImageError> {
+        self.inner
+            .config
+            .allow
+            .check(image_ref)
+            .map_err(ImageError::Failed)?;
         let image_ref = &*platform_ref(image_ref);
         let record = self.read_ref(image_ref);
         let ready = record
@@ -282,6 +321,11 @@ impl ImageStore {
     ///
     /// [`get`]: Self::get
     pub async fn prepare(&self, image_ref: &str) -> Result<PreparedImage, ImageError> {
+        self.inner
+            .config
+            .allow
+            .check(image_ref)
+            .map_err(ImageError::Failed)?;
         let image_ref = &*platform_ref(image_ref);
         let status = Arc::new(Mutex::new(String::new()));
         self.prepare_inner(image_ref, &status)
@@ -487,6 +531,23 @@ impl ImageStore {
             .ok_or_else(|| format!("image {key} vanished after publication"))
     }
 
+    /// Runs `umoci --version` in the image sandbox (Linux, sandbox on, no builder), so an
+    /// agent that cannot build one (e.g. one not running as root) fails when it starts,
+    /// not at its first image.
+    pub async fn check_sandbox(&self) -> Result<(), String> {
+        let config = &self.inner.config;
+        let Some(base) = config.sandbox.uid_base() else {
+            return Ok(());
+        };
+        if config.builder.is_some() || !cfg!(target_os = "linux") {
+            return Ok(());
+        }
+        sandbox::Sandbox::new(base)
+            .run(&config.umoci, &[std::ffi::OsStr::new("--version")], &[])
+            .await
+            .map(|_| ())
+    }
+
     async fn build(
         &self,
         resolved: &registry::Resolved,
@@ -497,6 +558,12 @@ impl ImageStore {
             umoci: self.inner.config.umoci.clone(),
             mkfs_ext4: self.inner.config.mkfs_ext4.clone(),
             builder: self.inner.config.builder.clone(),
+            sandbox: self
+                .inner
+                .config
+                .sandbox
+                .uid_base()
+                .map(sandbox::Sandbox::new),
         };
         rootfs::umoci_version(&tools).await?;
         let total = resolved.compressed_bytes();

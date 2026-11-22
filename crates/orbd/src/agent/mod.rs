@@ -12,6 +12,8 @@
 //! * [`gc`]: deletes project snapshots and prepared images no orb is built on.
 //! * [`checkpoint_age`]: opt-in, drops the memory checkpoints of orbs asleep longer than
 //!   `ORBD_CHECKPOINT_MAX_AGE_HOURS` (they cold-boot on their next wake).
+//! * The egress flow log (`ORBD_FLOW_LOG`, [`crate::runtime::vm::flowlog`]) runs on a
+//!   thread of its own, naming orbs from the network index and this agent's records.
 //!
 //! Crash points (feature `failpoints`, `FAILPOINTS="<name>=return"` aborts):
 //! `agent::accepted_committed` (receipt durable, Accepted not yet sent),
@@ -279,7 +281,35 @@ pub async fn run(
     else {
         return Ok(());
     };
+    #[cfg(target_os = "linux")]
+    let flow_log = flow_log_socket(&mut config.agent);
     detect::runtime(&mut config).await?;
+    // Only orbs in orbd's network namespaces are logged: Firecracker's, and QEMU's on an
+    // agent running as root (QEMU orbs created before that keep QEMU's user network).
+    #[cfg(target_os = "linux")]
+    let flow_log = flow_log.filter(|_| {
+        config.runtime.firecracker.is_some()
+            || (config.runtime.qemu.is_some() && nix::unistd::geteuid().is_root())
+    });
+    let allow = config.agent.image_allow.clone();
+    if allow.is_empty() {
+        tracing::info!("ORBD_IMAGE_ALLOW is empty: any image may be prepared and run");
+    } else {
+        tracing::info!(%allow, "only images ORBD_IMAGE_ALLOW lists are prepared and run");
+    }
+    if let Some(i) = config.images.as_mut() {
+        i.allow = allow.clone();
+        i.sandbox = config.agent.image_sandbox;
+    }
+    if let Some(d) = config.runtime.docker.as_mut() {
+        d.prewarm_images.retain(|r| match allow.check(r) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(image_ref = %r, "not prewarming: {e}");
+                false
+            }
+        });
+    }
     let capacity = detect::capacity(&config).await?;
     let disk_reserve = match config.agent.capacity.disk_reserve_gib {
         Some(g) => g.saturating_mul(GIB),
@@ -318,6 +348,7 @@ pub async fn run(
             Some(i) => {
                 let store = crate::image::ImageStore::open(i, &config.agent.state_dir)
                     .map_err(|e| anyhow::anyhow!("image store: {e}"))?;
+                store.check_sandbox().await.map_err(anyhow::Error::msg)?;
                 image_store = Some(store.clone());
                 Arc::new(store)
             }
@@ -380,6 +411,10 @@ pub async fn run(
         orb_deleted: tokio::sync::Notify::new(),
     });
     tracing::info!(agent = %shared.identity.agent_id, boot_id = %shared.boot_id, "agent starting");
+    #[cfg(target_os = "linux")]
+    if let Some(socket) = flow_log {
+        start_flow_log(&shared, socket);
+    }
 
     // Ready (Hello) only after interrupted work is requeued and drained orbs restored.
     executor::recover(&shared).await?;
@@ -422,6 +457,64 @@ pub async fn run(
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     Ok(())
+}
+
+/// The egress flow log's socket, bound before the runtimes get `agent.egress` and
+/// install orbd's nftables table, which logs to it only when this worked.
+#[cfg(target_os = "linux")]
+fn flow_log_socket(
+    agent: &mut crate::config::agent::AgentSection,
+) -> Option<crate::runtime::vm::flowlog::Socket> {
+    use crate::runtime::vm::flowlog;
+    if !agent.egress.flow_log {
+        return None;
+    }
+    match flowlog::Socket::open(flowlog::GROUP) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            agent.egress.flow_log = false;
+            tracing::error!(error = %e, "egress flow log off: cannot read NFLOG");
+            None
+        }
+    }
+}
+
+/// Reads the flow log on its own thread until the agent stops, naming each orb by its
+/// network index and its Amp orb id from this agent's records.
+#[cfg(target_os = "linux")]
+fn start_flow_log(sh: &Arc<Shared>, socket: crate::runtime::vm::flowlog::Socket) {
+    use crate::runtime::vm::{flowlog, net};
+    let state_dir = sh.config.agent.state_dir.clone();
+    let agent_db = sh.db.clone();
+    let handle = tokio::runtime::Handle::current();
+    let mut amp_ids: HashMap<crate::model::OrbId, String> = HashMap::new();
+    let resolve = move |index: u32| {
+        let orb = net::owner(&state_dir, index)?;
+        if amp_ids.len() >= 4096 {
+            amp_ids.clear();
+        }
+        let amp_orb_id = match amp_ids.get(&orb) {
+            Some(a) => Some(a.clone()),
+            None => {
+                let found = handle
+                    .block_on(agent_db.call(move |c| db::get_orb_definition(c, orb)))
+                    .ok()
+                    .flatten()
+                    .map(|d| d.identity.amp_orb_id.0);
+                if let Some(a) = &found {
+                    amp_ids.insert(orb, a.clone());
+                }
+                found
+            }
+        };
+        Some(flowlog::FlowOrb {
+            orb: orb.to_string(),
+            amp_orb_id,
+        })
+    };
+    if let Err(e) = flowlog::spawn(socket, resolve, net::flow_log_unlogged, sh.shutdown.clone()) {
+        tracing::error!(error = %e, "egress flow log off: starting its thread");
+    }
 }
 
 #[cfg(test)]

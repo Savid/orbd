@@ -6,6 +6,10 @@
 //! orbs because detection changed. A QEMU agent also runs Firecracker orbs when
 //! `firecracker` works (it does in orbd's image); an agent whose orbs need a runtime it
 //! no longer has refuses to start (see `executor::recover`).
+//!
+//! A VM-only agent (`ORBD_VM_ONLY`) never uses Docker: detection then fails unless QEMU
+//! is usable, and a configured or recorded Docker runtime is refused, so an agent meant
+//! to isolate orbs in VMs never falls back to containers sharing the host's kernel.
 
 use crate::config::agent::{
     AgentConfig, DockerRuntimeConfig, FirecrackerRuntimeConfig, QemuRuntimeConfig,
@@ -63,13 +67,29 @@ async fn usable(kind: RuntimeKind) -> Result<(), String> {
 
 /// Fills in a runtime when the config names none, and the agent's DNS servers.
 pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
+    let vm_only = config.agent.vm_only;
     let r = &mut config.runtime;
+    if vm_only && r.docker.is_some() {
+        bail!(
+            "ORBD_VM_ONLY is set but the agent config enables the Docker runtime \
+             (runtime.docker): remove it, or unset ORBD_VM_ONLY"
+        );
+    }
     if r.fake.is_none() && r.docker.is_none() && r.qemu.is_none() && r.firecracker.is_none() {
         let record = config.agent.state_dir.join("runtime");
         let kind = match std::fs::read_to_string(&record) {
             Ok(s) => {
                 let kind = parse_kind(s.trim())
                     .with_context(|| format!("unrecognised runtime in {}", record.display()))?;
+                if vm_only && kind == RuntimeKind::Docker {
+                    bail!(
+                        "ORBD_VM_ONLY is set but this agent runs Docker orbs ({} records \
+                         docker): it never switches runtime, so its orbs would be lost; \
+                         unset ORBD_VM_ONLY, or delete its orbs and start it with a new \
+                         state directory",
+                        record.display()
+                    );
+                }
                 if let Err(why) = usable(kind).await {
                     bail!(
                         "this agent runs {} orbs but {} is not usable: {why}",
@@ -80,7 +100,7 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
                 kind
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let kind = detect().await?;
+                let kind = detect(qemu_usable(), vm_only, || usable(RuntimeKind::Docker)).await?;
                 crate::pki::write_private(&record, kind.as_str().as_bytes())?;
                 kind
             }
@@ -102,29 +122,42 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
         }
     }
     let r = &mut config.runtime;
+    let jail = if r.qemu.is_some() || r.firecracker.is_some() {
+        crate::runtime::vm::jail::settings(config.agent.vmm_jail, config.agent.vmm_jail_uid_base)
+            .map_err(anyhow::Error::msg)?
+    } else {
+        None
+    };
     if let Some(d) = &mut r.docker {
         d.dns_servers = config.agent.dns_servers.clone();
     }
     if let Some(q) = &mut r.qemu {
         q.dns_servers = config.agent.dns_servers.clone();
         q.guest_network = config.agent.guest_network;
+        q.egress = config.agent.egress.clone();
+        q.jail = jail;
+        q.refuse_nested_kvm = config.agent.refuse_nested_kvm;
+        q.allow_unfenced_egress = config.agent.allow_unfenced_egress;
     }
     if let Some(f) = &mut r.firecracker {
         f.dns_servers = config.agent.dns_servers.clone();
         f.guest_network = config.agent.guest_network;
         f.egress = config.agent.egress.clone();
+        f.jail = jail;
     }
-    // orbd filters only Firecracker orbs' traffic (their own network namespaces).
-    if r.firecracker.is_none() && config.agent.egress != Default::default() {
+    // orbd filters the traffic of VM orbs in their own network namespaces: every VM orb
+    // on Linux (macOS orbs are fenced by pf instead).
+    let filtered = r.firecracker.is_some() || (cfg!(target_os = "linux") && r.qemu.is_some());
+    if !filtered && config.agent.egress != Default::default() {
         tracing::warn!(
-            "ORBD_EGRESS_ALLOW / ORBD_ALLOW_PRIVATE_EGRESS have no effect: this agent has no \
-             Firecracker runtime"
+            "ORBD_EGRESS_ALLOW / ORBD_ALLOW_PRIVATE_EGRESS / ORBD_FLOW_LOG have no effect: \
+             this agent's orbs have no network namespaces of their own"
         );
     }
-    if cfg!(target_os = "linux") && r.qemu.is_some() {
-        tracing::warn!(
-            "QEMU orbs (orb types with kvm) are not filtered by orbd: their user-mode network \
-             reaches whatever this agent can, its LAN included; use host firewall rules"
+    if config.agent.refuse_nested_kvm {
+        tracing::info!(
+            "ORBD_NESTED_KVM=false: this agent advertises no nested KVM and starts no orb whose \
+             type has kvm"
         );
     }
     Ok(())
@@ -136,12 +169,28 @@ fn parse_kind(s: &str) -> Option<RuntimeKind> {
         .find(|k| k.as_str() == s)
 }
 
-async fn detect() -> Result<RuntimeKind> {
-    let qemu = qemu_usable();
+/// QEMU when `qemu` says it is usable, else (unless `vm_only`) Docker if `docker` finds
+/// it usable.
+async fn detect<F>(
+    qemu: Result<(), String>,
+    vm_only: bool,
+    docker: impl FnOnce() -> F,
+) -> Result<RuntimeKind>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
     if qemu.is_ok() {
         return Ok(RuntimeKind::Qemu);
     }
-    match usable(RuntimeKind::Docker).await {
+    if vm_only {
+        bail!(
+            "no usable VM runtime and ORBD_VM_ONLY refuses Docker: QEMU needs {} and {} ({})",
+            crate::doctor::ACCEL_NAME,
+            orbd_qemu::probe::QEMU_SYSTEM,
+            qemu.err().unwrap_or_default()
+        );
+    }
+    match docker().await {
         Ok(()) => Ok(RuntimeKind::Docker),
         Err(docker) => bail!(
             "no usable runtime: QEMU needs {} and {} ({}); Docker needs \
@@ -280,4 +329,76 @@ fn local_memory() -> Result<u64> {
     .filter_map(|p| std::fs::read_to_string(p).ok())
     .find_map(|v| v.trim().parse::<u64>().ok());
     Ok(limit.map_or(total, |l| l.min(total)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::agent::AgentSection;
+
+    fn vm_only_config(dir: &std::path::Path) -> AgentConfig {
+        let mut agent = AgentSection::new(dir.to_owned());
+        agent.vm_only = true;
+        AgentConfig {
+            agent,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn vm_only_refuses_a_configured_docker_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = vm_only_config(dir.path());
+        config.runtime.docker = Some(DockerRuntimeConfig::default());
+        let e = runtime(&mut config).await.unwrap_err().to_string();
+        assert!(
+            e.contains("ORBD_VM_ONLY") && e.contains("runtime.docker"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vm_only_refuses_a_recorded_docker_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("runtime"), "docker").unwrap();
+        let mut config = vm_only_config(dir.path());
+        let e = runtime(&mut config).await.unwrap_err().to_string();
+        assert!(
+            e.contains("ORBD_VM_ONLY") && e.contains("Docker orbs"),
+            "{e}"
+        );
+        assert!(config.runtime.docker.is_none());
+    }
+
+    #[tokio::test]
+    async fn detection_falls_back_to_docker_only_when_allowed() {
+        let unusable = || Err::<(), String>("no /dev/kvm".into());
+        let docker_ok = || async { Ok(()) };
+        assert_eq!(
+            detect(Ok(()), true, docker_ok).await.unwrap(),
+            RuntimeKind::Qemu
+        );
+        assert_eq!(
+            detect(unusable(), false, docker_ok).await.unwrap(),
+            RuntimeKind::Docker
+        );
+        let probed = std::cell::Cell::new(false);
+        let e = detect(unusable(), true, || async {
+            probed.set(true);
+            Ok(())
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("ORBD_VM_ONLY") && e.contains("no /dev/kvm"),
+            "{e}"
+        );
+        assert!(!probed.get(), "a VM-only agent never probes Docker");
+        let e = detect(unusable(), false, || async { Err("no socket".into()) })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no socket"), "{e}");
+    }
 }

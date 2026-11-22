@@ -1,15 +1,19 @@
-//! Image preparation against a real registry image (opt-in: needs network, root or
-//! `sudo -n`, umoci, e2fsprogs incl. debugfs, and ~15 GB of disk).
+//! Image preparation against a real registry image (opt-in: needs network, root (the
+//! image sandbox needs CAP_SYS_ADMIN, CAP_SETUID and CAP_SETGID, e.g. a privileged
+//! container), umoci, e2fsprogs incl. debugfs, and ~15 GB of disk).
 //!
 //! ```sh
 //! ORBD_TEST_GUEST_HELPER=target/x86_64-unknown-linux-musl/release/orbd-guest \
 //!   cargo test -p orbd --test image_prepare -- --ignored --nocapture
 //! ```
-//! `ORBD_TEST_IMAGE` overrides the image (default: Amp's orb image). On macOS also set
-//! `ORBD_TEST_IMAGE_BUILDER` (the image built from `guest/builder`) and
+//! `ORBD_TEST_IMAGE` overrides the image (default: Amp's orb image);
+//! `ORBD_TEST_IMAGE_SANDBOX=off` builds it as real root instead (root or `sudo -n`);
+//! `ORBD_TEST_KEEP_ROOTFS=<path>` keeps the prepared disk there (a hard link, so on the
+//! filesystem of `ORBD_TEST_DIR`, default `/var/tmp`), e.g. to compare both pipelines. On
+//! macOS also set `ORBD_TEST_IMAGE_BUILDER` (the image built from `guest/builder`) and
 //! `ORBD_TEST_DEBUGFS` (Homebrew's `debugfs`, which is not on PATH).
 
-use orbd::config::agent::ImagesConfig;
+use orbd::config::agent::{ImageSandbox, ImagesConfig};
 use orbd::image::{ImageError, ImageStore};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,6 +55,12 @@ async fn prepares_amp_image_with_guest_integration() {
         prewarm: vec![],
         refresh_interval_secs: 3600,
         static_images: vec![],
+        allow: Default::default(),
+        sandbox: if std::env::var("ORBD_TEST_IMAGE_SANDBOX").as_deref() == Ok("off") {
+            ImageSandbox::Off
+        } else {
+            ImageSandbox::default()
+        },
     };
     let store = ImageStore::open(&config, state.path()).unwrap();
 
@@ -70,6 +80,9 @@ async fn prepares_amp_image_with_guest_integration() {
         }
     };
     println!("prepared in {:?}: {prepared:?}", t0.elapsed());
+    if let Ok(keep) = std::env::var("ORBD_TEST_KEEP_ROOTFS") {
+        std::fs::hard_link(&prepared.rootfs, &keep).unwrap();
+    }
     assert!(prepared.manifest_digest.starts_with("sha256:"));
     assert_eq!(
         std::fs::metadata(&prepared.rootfs).unwrap().len(),

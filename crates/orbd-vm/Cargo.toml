@@ -18,6 +18,9 @@ sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 # `fail` failpoints for crash-recovery tests (see `process::spawn`). Never in releases.
 failpoints = ["fail/failpoints"]

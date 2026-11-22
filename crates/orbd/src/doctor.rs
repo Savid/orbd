@@ -136,6 +136,24 @@ fn kvm() -> Result<String, String> {
     Ok(format!("API 12, {nested}"))
 }
 
+/// macOS: pf blocks QEMU's network group (`runtime::qemu::fence`), probed as the agent
+/// does before starting a QEMU orb.
+fn egress_fence(group: Option<&str>) -> Result<String, String> {
+    use crate::runtime::qemu::{GROUP_EXEC, check_network_group, fence};
+    let group = group.ok_or(
+        "runtime.qemu.network_group is not set (pass the agent config with -c): nothing keeps \
+         QEMU orbs off the LAN",
+    )?;
+    let exec = crate::runtime::vm::on_path(Path::new(GROUP_EXEC))
+        .ok_or_else(|| format!("{GROUP_EXEC} is not on PATH"))?;
+    check_network_group(&exec, group)?;
+    fence::probe_for(&exec, group)?.run()?;
+    Ok(format!(
+        "pf blocks group {group} from 127.0.0.1 ({} setgid {group})",
+        exec.display()
+    ))
+}
+
 fn kernel(path: &Path) -> Result<String, String> {
     let mut header = [0u8; 0x206];
     std::fs::File::open(path)
@@ -190,6 +208,7 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     let mut firecracker = PathBuf::from("firecracker");
     let mut builder =
         cfg!(target_os = "macos").then(|| crate::config::agent::DEFAULT_IMAGE_BUILDER.to_owned());
+    let mut network_group = None;
     if let Some(config) = &opts.config {
         let text = std::fs::read_to_string(config)?;
         let v: serde_json::Value = serde_saphyr::from_str(&text)?;
@@ -207,6 +226,7 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
         qemu = get(&["runtime", "qemu"], "qemu").unwrap_or(qemu);
         qemu_img = get(&["runtime", "qemu"], "qemu_img").unwrap_or(qemu_img);
         firecracker = get(&["runtime", "firecracker"], "firecracker").unwrap_or(firecracker);
+        network_group = get(&["runtime", "qemu"], "network_group").map(|g| g.display().to_string());
         if let Some(b) = get(&["images"], "builder") {
             builder = Some(b.display().to_string());
         }
@@ -227,17 +247,29 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
         .and_then(|l| orbd_qemu::probe::check_qemu_version(&l).map(|()| l));
     r.line(qemu_check, orbd_qemu::probe::QEMU_SYSTEM, true);
     r.line(first_line(&qemu_img, &["--version"]), "qemu-img", true);
-    // Firecracker orbs only (and their networking), which are Linux-only.
+    // Linux only: Firecracker, and the per-orb network namespaces that Firecracker orbs
+    // and (on an agent running as root) QEMU orbs get, which need `ip` and `nft`.
     if cfg!(target_os = "linux") {
         r.line(
             first_line(&firecracker, &["--version"]),
             "firecracker",
             false,
         );
-        r.line(first_line(Path::new("ip"), &["-V"]), "ip", false);
-        r.line(first_line(Path::new("nft"), &["--version"]), "nft", false);
+        let root = nix::unistd::geteuid().is_root();
+        r.line(first_line(Path::new("ip"), &["-V"]), "ip", root);
+        r.line(first_line(Path::new("nft"), &["--version"]), "nft", root);
     }
     r.line(accel(), ACCEL_NAME, true);
+    if cfg!(target_os = "macos") {
+        // Required unless the agent runs QEMU orbs unfenced on purpose.
+        // As the agent's flag reads it: `true` (it refuses anything but true or false).
+        let unfenced = std::env::var("ORBD_ALLOW_UNFENCED_EGRESS").is_ok_and(|v| v == "true");
+        r.line(
+            egress_fence(network_group.as_deref()),
+            "egress fence",
+            !unfenced,
+        );
+    }
     r.line(kernel(&kernel_path), "guest kernel", true);
     let umoci_version = |l: String| {
         if l == format!("umoci version {UMOCI_VERSION}") {

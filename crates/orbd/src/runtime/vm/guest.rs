@@ -40,38 +40,44 @@ pub trait GuestConnector: Send + Sync {
     async fn connect(&self) -> std::io::Result<Box<dyn ByteStream>>;
 }
 
-/// QEMU virtio-serial: the chardev socket QEMU listens on.
+/// QEMU virtio-serial: the chardev socket QEMU listens on, served by `server_uid`
+/// (QEMU's; checked before anything is sent, see [`orbd_vm::process::connect_unix`]).
 pub struct VirtioSerialConnector {
     pub socket: PathBuf,
+    pub server_uid: u32,
 }
 
 #[async_trait]
 impl GuestConnector for VirtioSerialConnector {
     async fn connect(&self) -> std::io::Result<Box<dyn ByteStream>> {
         Ok(Box::new(
-            tokio::net::UnixStream::connect(&self.socket).await?,
+            orbd_vm::process::connect_unix(&self.socket, self.server_uid).await?,
         ))
     }
 }
 
-/// Firecracker vsock: its unix socket, then `CONNECT <port>\n` → `OK <host port>\n`.
+/// Firecracker vsock: its unix socket (served by `server_uid`, Firecracker's), then
+/// `CONNECT <port>\n` → `OK <host port>\n`.
 pub struct FirecrackerVsockConnector {
     pub socket: PathBuf,
     pub port: u32,
+    pub server_uid: u32,
 }
 
 #[async_trait]
 impl GuestConnector for FirecrackerVsockConnector {
     async fn connect(&self) -> std::io::Result<Box<dyn ByteStream>> {
-        let mut stream =
-            tokio::io::BufReader::new(tokio::net::UnixStream::connect(&self.socket).await?);
+        let mut stream = tokio::io::BufReader::new(
+            orbd_vm::process::connect_unix(&self.socket, self.server_uid).await?,
+        );
         stream
             .get_mut()
             .write_all(format!("CONNECT {}\n", self.port).as_bytes())
             .await?;
-        // The guest says nothing before Hello, so the buffer holds only this line.
+        // The guest says nothing before Hello, so the buffer holds only this line (a
+        // short one: `OK <port>`).
         let mut line = String::new();
-        stream.read_line(&mut line).await?;
+        (&mut stream).take(64).read_line(&mut line).await?;
         if !line.starts_with("OK ") {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,

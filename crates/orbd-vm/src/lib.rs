@@ -6,12 +6,15 @@
 //!   launch record, and adopting it again after the supervisor restarts.
 //! * [`checkpoint`]: a directory of named checkpoints, each built in `<name>.tmp/` and
 //!   published by one fsynced rename.
+//! * [`jail`]: an unprivileged identity and a private mount namespace holding only what
+//!   one VMM needs (Linux), entered by the launcher.
 //!
 //! Failpoint (feature `failpoints`): `vm::launch::after_exec` aborts the process right
 //! after the VMM was exec'd, before its pid is recorded.
 
 pub mod checkpoint;
 pub mod fsutil;
+pub mod jail;
 pub mod process;
 #[cfg(target_os = "macos")]
 pub mod sysctl;

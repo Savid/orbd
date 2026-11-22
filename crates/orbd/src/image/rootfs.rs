@@ -1,7 +1,15 @@
 //! OCI layout → raw ext4: `umoci raw add-layer` (guest integration), `umoci raw unpack`
-//! as root (ownership, modes, xattrs and device nodes preserved), `mkfs.ext4 -d` into a
-//! sparse file. Guest content is only ever read by these tools: nothing is mounted or
-//! executed on the host.
+//! as root (ownership, modes, xattrs and file capabilities preserved), `mkfs.ext4 -d`
+//! into a sparse file. Guest content is only ever read by these tools: nothing is
+//! mounted or executed on the host.
+//!
+//! On Linux each tool runs as root of its own user namespace with nothing of the host but
+//! the tools and the paths it works on ([`super::sandbox`]): the image's content never
+//! meets real root. The sandbox owns what it writes (the layout, `rootfs/`, the output
+//! file while mkfs writes it); orbd's own work directory stays root's, and the output
+//! file is handed back before it is published. `ORBD_IMAGE_SANDBOX=off` runs the tools
+//! as real root instead (`sudo -n` when orbd is not root), which also unpacks device
+//! nodes the sandbox refuses.
 //!
 //! With a builder image (macOS, which has neither umoci nor a filesystem that keeps
 //! Linux ownership and device nodes) the same steps run in one `docker run` of that
@@ -10,6 +18,7 @@
 
 use super::integration::IntegrationLayer;
 use super::registry::{BlobCache, Resolved};
+use super::sandbox::{Bind, Sandbox, ro, rw};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -27,6 +36,45 @@ pub struct Tools {
     pub mkfs_ext4: PathBuf,
     /// Docker image with umoci, e2fsprogs and GNU coreutils; set, every step runs in it.
     pub builder: Option<String>,
+    /// Without a builder: the sandbox every step runs in; None runs them as real root.
+    pub sandbox: Option<Sandbox>,
+}
+
+impl Tools {
+    /// One step over image content: in the sandbox (which sees only `binds`), or as root
+    /// when `privileged` (else as orbd).
+    async fn step(
+        &self,
+        privileged: bool,
+        program: &Path,
+        args: &[&OsStr],
+        binds: &[Bind<'_>],
+    ) -> Result<String, String> {
+        match &self.sandbox {
+            Some(sandbox) => sandbox.run(program, args, binds).await.map_err(explain),
+            None => run(privileged, program, args).await,
+        }
+    }
+}
+
+/// Names the image property behind umoci errors the sandbox causes (see
+/// [`super::sandbox`]): a user namespace cannot create device nodes, set xattrs only
+/// host root may set, or own files beyond its 65536 ids.
+fn explain(e: String) -> String {
+    let why = if e.contains("mknod: operation not permitted") {
+        "the image has a device node, which only real root can create"
+    } else if e.contains("restore xattr metadata") && e.contains("operation not permitted") {
+        "the image sets an xattr only real root can set (trusted.*, or security.* other \
+         than security.capability)"
+    } else if e.contains("restore chown metadata") && e.contains("invalid argument") {
+        "the image has a file owned by a uid or gid above 65535"
+    } else {
+        return e;
+    };
+    format!(
+        "{e}\n{why}: the image sandbox does not build it (ORBD_IMAGE_SANDBOX=off would, \
+         unsafely, as real root)"
+    )
 }
 
 /// The pipeline inside a builder container: `$1` work dir, `$2` OCI layout, `$3` output.
@@ -206,20 +254,92 @@ fn os_identity(os_release: &str) -> Option<String> {
     Some(format!("{id} {version}"))
 }
 
-/// [`os_identity`] of the first of `candidates` that is a regular file (a symlink in an
-/// image is not followed on the host).
-fn read_os_identity(candidates: &[PathBuf]) -> Option<String> {
-    candidates.iter().find_map(|p| {
-        if !std::fs::symlink_metadata(p).ok()?.is_file() {
+/// [`os_identity`] of the first of `candidates` (relative to `root`) that is a regular
+/// file reached through directories only: symlinks in an image are never followed on the
+/// host, and at most 64 KiB is read.
+fn read_os_identity(root: &Path, candidates: &[&str]) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    candidates.iter().find_map(|c| {
+        let mut path = root.to_owned();
+        let parts: Vec<_> = Path::new(c).components().collect();
+        for (i, part) in parts.iter().enumerate() {
+            path.push(part);
+            let m = std::fs::symlink_metadata(&path).ok()?;
+            let last = i + 1 == parts.len();
+            if (last && !m.is_file()) || (!last && !m.is_dir()) {
+                return None;
+            }
+        }
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(&path)
+            .ok()?;
+        if !f.metadata().ok()?.is_file() {
             return None;
         }
-        os_identity(&std::fs::read_to_string(p).ok()?)
+        let mut text = String::new();
+        f.take(64 * 1024).read_to_string(&mut text).ok()?;
+        os_identity(&text)
     })
 }
 
+/// Hands the sandbox what it writes: the layout's directories and orbd's own files in
+/// it (umoci adds a layer, rewriting the index), and the empty rootfs directory umoci
+/// unpacks into. Blobs hard-linked from the cache stay root's, and readable.
+fn give_to_sandbox(
+    sandbox: &Sandbox,
+    layout: &Path,
+    rootfs: &Path,
+    layer: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let id = sandbox.host_id(0);
+    let chown = |p: &Path| {
+        std::os::unix::fs::lchown(p, Some(id), Some(id)).map_err(|e| {
+            format!(
+                "image sandbox: chown {}: {e} ({})",
+                p.display(),
+                super::sandbox::HINT
+            )
+        })
+    };
+    let readable = |p: &Path, m: &std::fs::Metadata| {
+        let mode = m.permissions().mode() & 0o7777;
+        if mode & 0o444 == 0o444 {
+            return Ok(());
+        }
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode | 0o444))
+            .map_err(|e| format!("{}: {e}", p.display()))
+    };
+    let mut dirs = vec![layout.to_owned()];
+    while let Some(dir) = dirs.pop() {
+        chown(&dir)?;
+        for e in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            let p = e.map_err(|e| e.to_string())?.path();
+            let m = std::fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            if m.is_dir() {
+                dirs.push(p);
+            } else if m.nlink() > 1 {
+                readable(&p, &m)?;
+            } else {
+                chown(&p)?;
+            }
+        }
+    }
+    let m = std::fs::metadata(layer).map_err(|e| e.to_string())?;
+    readable(layer, &m)?;
+    std::fs::create_dir(rootfs).map_err(|e| format!("{}: {e}", rootfs.display()))?;
+    std::fs::set_permissions(rootfs, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| e.to_string())?;
+    chown(rootfs)
+}
+
 /// Builds `out` (raw ext4) from the layout plus the integration layer. `work` is a
-/// scratch directory that the caller removes (its rootfs is root-owned). Returns the
-/// image's size and its distribution ([`os_identity`]) when it has an os-release.
+/// scratch directory that the caller removes (as root: its rootfs is root's or the
+/// sandbox's). Returns the image's size and its distribution ([`os_identity`]) when it
+/// has an os-release.
 pub async fn build(
     tools: &Tools,
     layout: &Path,
@@ -253,64 +373,73 @@ pub async fn build(
             .rev()
             .find_map(|l| l.strip_prefix("size ")?.trim().parse().ok())
             .ok_or_else(|| format!("builder printed no size: {stdout:?}"))?;
-        return Ok((size, read_os_identity(&[work.join(OS_RELEASE)])));
+        return Ok((size, read_os_identity(work, &[OS_RELEASE])));
     }
     let base = format!("{}:{BASE_TAG}", layout.display());
-    status("adding guest integration layer");
-    run(
-        false,
-        &tools.umoci,
-        &[
-            "raw".as_ref(),
-            "add-layer".as_ref(),
-            "--image".as_ref(),
-            base.as_ref(),
-            "--tag".as_ref(),
-            ORBD_TAG.as_ref(),
-            "--no-history".as_ref(),
-            layer.as_os_str(),
-        ],
-    )
-    .await?;
-
     let rootfs = work.join("rootfs");
+    if let Some(sandbox) = &tools.sandbox {
+        give_to_sandbox(sandbox, layout, &rootfs, &layer)?;
+    }
+    status("adding guest integration layer");
+    tools
+        .step(
+            false,
+            &tools.umoci,
+            &[
+                "raw".as_ref(),
+                "add-layer".as_ref(),
+                "--image".as_ref(),
+                base.as_ref(),
+                "--tag".as_ref(),
+                ORBD_TAG.as_ref(),
+                "--no-history".as_ref(),
+                layer.as_os_str(),
+            ],
+            &[rw(layout), ro(&layer)],
+        )
+        .await?;
+
     let image = format!("{}:{ORBD_TAG}", layout.display());
     status("unpacking layers");
-    run(
-        true,
-        &tools.umoci,
-        &[
-            "raw".as_ref(),
-            "unpack".as_ref(),
-            "--image".as_ref(),
-            image.as_ref(),
-            rootfs.as_os_str(),
-        ],
-    )
-    .await?;
+    tools
+        .step(
+            true,
+            &tools.umoci,
+            &[
+                "raw".as_ref(),
+                "unpack".as_ref(),
+                "--image".as_ref(),
+                image.as_ref(),
+                rootfs.as_os_str(),
+            ],
+            &[ro(layout), rw(&rootfs)],
+        )
+        .await?;
 
     status("sizing root filesystem");
     let du = |flag: &'static str| {
         let rootfs = rootfs.clone();
         async move {
-            let out = run(
-                true,
-                Path::new("du"),
-                &[
-                    "-s".as_ref(),
-                    "-x".as_ref(),
-                    flag.as_ref(),
-                    rootfs.as_os_str(),
-                ],
-            )
-            .await?;
+            let out = tools
+                .step(
+                    true,
+                    Path::new("du"),
+                    &[
+                        "-s".as_ref(),
+                        "-x".as_ref(),
+                        flag.as_ref(),
+                        rootfs.as_os_str(),
+                    ],
+                    &[ro(&rootfs)],
+                )
+                .await?;
             out.split_whitespace()
                 .next()
                 .and_then(|n| n.parse::<u64>().ok())
                 .ok_or_else(|| format!("unexpected du output {out:?}"))
         }
     };
-    let os = read_os_identity(&["usr/lib/os-release", "etc/os-release"].map(|p| rootfs.join(p)));
+    let os = read_os_identity(&rootfs, &["usr/lib/os-release", "etc/os-release"]);
     let used = du("--block-size=1").await?;
     let files = du("--inodes").await?;
     let (inodes, size) = sizing(used, files);
@@ -320,34 +449,84 @@ pub async fn build(
         used / MIB,
         size / MIB
     ));
-    // Created by orbd so the published file is owned by the agent user, not root.
+    // Created by orbd so the published file is owned by the agent user, not root (and
+    // lent to the sandbox while mkfs writes it).
     let f = std::fs::File::create(out).map_err(|e| format!("{}: {e}", out.display()))?;
     f.set_len(size).map_err(|e| e.to_string())?;
+    let created = lend(tools.sandbox.as_ref(), &f, out)?;
     drop(f);
     let inodes = inodes.to_string();
     let size_kib = format!("{}k", size / 1024);
-    run(
-        true,
-        &tools.mkfs_ext4,
-        &[
-            "-q".as_ref(),
-            "-F".as_ref(),
-            "-t".as_ref(),
-            "ext4".as_ref(),
-            "-L".as_ref(),
-            "orbd-root".as_ref(),
-            "-N".as_ref(),
-            inodes.as_ref(),
-            "-E".as_ref(),
-            "nodiscard".as_ref(),
-            "-d".as_ref(),
-            rootfs.as_os_str(),
-            out.as_os_str(),
-            size_kib.as_ref(),
-        ],
-    )
-    .await?;
+    tools
+        .step(
+            true,
+            &tools.mkfs_ext4,
+            &[
+                "-q".as_ref(),
+                "-F".as_ref(),
+                "-t".as_ref(),
+                "ext4".as_ref(),
+                "-L".as_ref(),
+                "orbd-root".as_ref(),
+                "-N".as_ref(),
+                inodes.as_ref(),
+                "-E".as_ref(),
+                "nodiscard".as_ref(),
+                "-d".as_ref(),
+                rootfs.as_os_str(),
+                out.as_os_str(),
+                size_kib.as_ref(),
+            ],
+            &[ro(&rootfs), rw(out)],
+        )
+        .await?;
+    if tools.sandbox.is_some() {
+        take_back(out, created, size)?;
+    }
     Ok((size, os))
+}
+
+/// Lends the output file to the sandbox (its root's, writable by it only); returns its
+/// identity.
+fn lend(sandbox: Option<&Sandbox>, f: &std::fs::File, out: &Path) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let m = f.metadata().map_err(|e| e.to_string())?;
+    if let Some(sandbox) = sandbox {
+        let id = sandbox.host_id(0);
+        std::os::unix::fs::fchown(f, Some(id), Some(id)).map_err(|e| {
+            format!(
+                "image sandbox: chown {}: {e} ({})",
+                out.display(),
+                super::sandbox::HINT
+            )
+        })?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok((m.dev(), m.ino()))
+}
+
+/// Takes the output file back from the sandbox: still the file orbd created, of the
+/// size it gave it, owned by orbd again.
+fn take_back(out: &Path, created: (u64, u64), size: u64) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(out)
+        .map_err(|e| format!("{}: {e}", out.display()))?;
+    let m = f.metadata().map_err(|e| e.to_string())?;
+    if !m.is_file() || (m.dev(), m.ino()) != created || m.len() != size {
+        return Err(format!("{}: changed while mkfs.ext4 ran", out.display()));
+    }
+    std::os::unix::fs::fchown(
+        &f,
+        Some(nix::unistd::geteuid().as_raw()),
+        Some(nix::unistd::getegid().as_raw()),
+    )
+    .map_err(|e| format!("{}: {e}", out.display()))?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o644))
+        .map_err(|e| e.to_string())
 }
 
 /// Removes a staging directory whose contents may be root-owned.
@@ -435,17 +614,49 @@ mod tests {
         assert_eq!(os_identity(""), None);
 
         let tmp = tempfile::tempdir().unwrap();
-        let (link, file) = (tmp.path().join("link"), tmp.path().join("file"));
-        std::fs::write(&file, trixie).unwrap();
-        std::os::unix::fs::symlink(&file, &link).unwrap();
-        let missing = tmp.path().join("missing");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("real/lib")).unwrap();
+        std::fs::write(root.join("real/lib/os-release"), trixie).unwrap();
+        std::os::unix::fs::symlink("real/lib/os-release", root.join("link")).unwrap();
+        // A symlinked directory on the way (an image's `usr` -> `/` would reach the host).
+        std::os::unix::fs::symlink("real", root.join("usr")).unwrap();
+        std::fs::create_dir(root.join("fifo-dir")).unwrap();
+        nix::unistd::mkfifo(
+            &root.join("fifo-dir/os-release"),
+            nix::sys::stat::Mode::S_IRWXU,
+        )
+        .unwrap();
+        for not_followed in [
+            "link",
+            "usr/lib/os-release",
+            "fifo-dir/os-release",
+            "missing",
+        ] {
+            assert_eq!(
+                read_os_identity(root, &[not_followed]),
+                None,
+                "{not_followed}"
+            );
+        }
         assert_eq!(
-            read_os_identity(std::slice::from_ref(&link)),
-            None,
-            "symlinks are not followed"
+            read_os_identity(
+                root,
+                &[
+                    "missing",
+                    "link",
+                    "usr/lib/os-release",
+                    "real/lib/os-release"
+                ]
+            )
+            .as_deref(),
+            Some("debian 13")
         );
+        // Only the start of a huge file is read.
+        let mut big = trixie.as_bytes().to_vec();
+        big.resize(1 << 20, b'#');
+        std::fs::write(root.join("real/big"), &big).unwrap();
         assert_eq!(
-            read_os_identity(&[missing, link, file]).as_deref(),
+            read_os_identity(root, &["real/big"]).as_deref(),
             Some("debian 13")
         );
     }
@@ -475,5 +686,366 @@ mod tests {
                 format!("{inodes} {size}")
             );
         }
+    }
+
+    /// One tar entry of a test layer, with PAX xattrs.
+    struct Entry<'a> {
+        path: &'a str,
+        kind: tar::EntryType,
+        mode: u32,
+        owner: (u64, u64),
+        data: &'a [u8],
+        link: &'a str,
+        xattrs: &'a [(&'a str, &'a [u8])],
+    }
+
+    fn entry<'a>(path: &'a str, kind: tar::EntryType, mode: u32) -> Entry<'a> {
+        Entry {
+            path,
+            kind,
+            mode,
+            owner: (0, 0),
+            data: b"",
+            link: "",
+            xattrs: &[],
+        }
+    }
+
+    fn layer(entries: &[Entry<'_>]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for e in entries {
+            if !e.xattrs.is_empty() {
+                let mut pax = Vec::new();
+                for (k, v) in e.xattrs {
+                    let body = format!(" SCHILY.xattr.{k}=").len() + v.len() + 1;
+                    let mut len = body + 1;
+                    while len.to_string().len() + body != len {
+                        len = len.to_string().len() + body;
+                    }
+                    pax.extend(format!("{len} SCHILY.xattr.{k}=").as_bytes());
+                    pax.extend(*v);
+                    pax.push(b'\n');
+                }
+                let mut h = tar::Header::new_ustar();
+                h.set_entry_type(tar::EntryType::XHeader);
+                h.set_mode(0o644);
+                h.set_size(pax.len() as u64);
+                b.append_data(&mut h, format!("PaxHeaders/{}", e.path), &pax[..])
+                    .unwrap();
+            }
+            let mut h = tar::Header::new_ustar();
+            h.set_entry_type(e.kind);
+            h.set_mode(e.mode);
+            h.set_uid(e.owner.0);
+            h.set_gid(e.owner.1);
+            h.set_mtime(1_700_000_000);
+            if e.kind == tar::EntryType::Char {
+                h.set_device_major(1).unwrap();
+                h.set_device_minor(3).unwrap();
+            }
+            h.set_size(e.data.len() as u64);
+            if e.link.is_empty() {
+                b.append_data(&mut h, e.path, e.data).unwrap();
+            } else {
+                h.set_size(0);
+                b.append_link(&mut h, e.path, e.link).unwrap();
+            }
+        }
+        b.into_inner().unwrap()
+    }
+
+    fn sh(script: &str) {
+        let s = std::process::Command::new("sh")
+            .args(["-ec", script])
+            .status()
+            .unwrap();
+        assert!(s.success(), "{script}");
+    }
+
+    fn debugfs(image: &Path, request: &str) -> String {
+        let out = std::process::Command::new("debugfs")
+            .args(["-R", request])
+            .arg(image)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "debugfs -R {request:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Every path of an ext4 image with its type and mode, owner, size, link count,
+    /// symlink target and xattrs (from debugfs: nothing is mounted).
+    fn listing(image: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut dirs = vec![String::new()];
+        while let Some(dir) = dirs.pop() {
+            let ls = debugfs(image, &format!("ls -p \"{dir}/\""));
+            for line in ls.lines() {
+                // /inode/mode/uid/gid/name/size/
+                let f: Vec<&str> = line.split('/').collect();
+                if f.len() < 7
+                    || [".", ".."].contains(&f[5])
+                    || (dir.is_empty() && f[5] == "lost+found")
+                {
+                    continue;
+                }
+                let path = format!("{dir}/{}", f[5]);
+                let stat = debugfs(image, &format!("stat \"{path}\""));
+                let links = stat
+                    .split("Links: ")
+                    .nth(1)
+                    .and_then(|l| l.split_whitespace().next())
+                    .unwrap_or("?");
+                let target = stat
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("Fast link dest: "))
+                    .unwrap_or("");
+                let xattrs: Vec<&str> = stat
+                    .split("Extended attributes:\n")
+                    .nth(1)
+                    .unwrap_or("")
+                    .lines()
+                    .take_while(|l| l.starts_with("  "))
+                    .map(str::trim)
+                    .filter(|l| !l.starts_with("system.data"))
+                    .collect();
+                out.push(format!(
+                    "{path} mode={} uid={} gid={} size={} links={links} {target} [{}]",
+                    f[2],
+                    f[3],
+                    f[4],
+                    f[6],
+                    xattrs.join("; ")
+                ));
+                if f[2].starts_with("04") {
+                    dirs.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The sandboxed pipeline builds what real root's builds: owners, modes (setuid,
+    /// setgid, sticky), sizes, hard links, symlinks, FIFOs, whiteouts, xattrs and file
+    /// capabilities (v2 as v2, namespaced v3 as v3); and refuses what a user namespace
+    /// cannot reproduce (a device node, a `trusted.*` xattr, an owner above 65535) where
+    /// root builds it. Needs root, umoci and e2fsprogs (e.g. orbd's container image):
+    ///
+    /// ```sh
+    /// cargo test -p orbd --lib image::rootfs -- --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs root, umoci and e2fsprogs"]
+    async fn sandbox_builds_what_root_builds() {
+        use tar::EntryType as T;
+        let tmp = tempfile::tempdir_in(std::env::var("ORBD_TEST_DIR").unwrap_or("/var/tmp".into()))
+            .unwrap();
+        let helper = tmp.path().join("orbd-guest");
+        std::fs::write(&helper, b"\x7fELF test helper").unwrap();
+        let integration = IntegrationLayer::build(&helper).unwrap();
+
+        // cap_net_raw+ep: v2, and v3 for uid 1000 of a user namespace.
+        let v2 = [
+            1, 0, 0, 2, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut v3 = vec![1, 0, 0, 3];
+        v3.extend_from_slice(&v2[4..]);
+        v3.extend_from_slice(&1000u32.to_le_bytes());
+        let caps_v2: [(&str, &[u8]); 1] = [("security.capability", &v2)];
+        let caps_v3: [(&str, &[u8]); 1] = [("security.capability", &v3)];
+        let owned = |mut e: Entry<'static>, uid, gid| {
+            e.owner = (uid, gid);
+            e
+        };
+        let base: Vec<Entry<'_>> = vec![
+            entry("etc/", T::Directory, 0o755),
+            entry("usr/", T::Directory, 0o755),
+            entry("usr/bin/", T::Directory, 0o755),
+            Entry {
+                data: b"suid",
+                ..entry("usr/bin/sudoish", T::Regular, 0o4755)
+            },
+            owned(
+                Entry {
+                    data: b"sgid",
+                    ..entry("usr/bin/sgid", T::Regular, 0o2755)
+                },
+                0,
+                42,
+            ),
+            Entry {
+                data: b"ping",
+                xattrs: &caps_v2,
+                ..entry("usr/bin/pingish", T::Regular, 0o755)
+            },
+            Entry {
+                data: b"ns",
+                xattrs: &caps_v3,
+                ..entry("usr/bin/nscap", T::Regular, 0o755)
+            },
+            entry("home/", T::Directory, 0o755),
+            owned(entry("home/user/", T::Directory, 0o750), 1000, 1000),
+            owned(
+                Entry {
+                    data: b"hello",
+                    xattrs: &[("user.note", b"kept")],
+                    ..entry("home/user/file", T::Regular, 0o640)
+                },
+                1000,
+                1000,
+            ),
+            Entry {
+                link: "home/user/file",
+                ..entry("home/user/hardlink", T::Link, 0o640)
+            },
+            Entry {
+                link: "../usr/bin/sudoish",
+                ..entry("etc/link", T::Symlink, 0o777)
+            },
+            Entry {
+                link: "/nowhere",
+                ..entry("etc/abs", T::Symlink, 0o777)
+            },
+            entry("etc/fifo", T::Fifo, 0o600),
+            owned(
+                Entry {
+                    data: b"x",
+                    ..entry("etc/nobody", T::Regular, 0o644)
+                },
+                65534,
+                65534,
+            ),
+            Entry {
+                data: b"gone",
+                ..entry("etc/old", T::Regular, 0o644)
+            },
+            entry("tmp/", T::Directory, 0o1777),
+            entry("var/", T::Directory, 0o755),
+            entry("var/empty/", T::Directory, 0o555),
+        ];
+        let upper = vec![
+            entry("etc/.wh.old", T::Regular, 0o644),
+            owned(
+                Entry {
+                    data: b"new",
+                    ..entry("etc/new", T::Regular, 0o600)
+                },
+                1000,
+                1001,
+            ),
+        ];
+        // Each refused by the sandbox only.
+        let device = vec![
+            entry("etc/", T::Directory, 0o755),
+            entry("etc/null", T::Char, 0o666),
+        ];
+        let trusted = vec![Entry {
+            xattrs: &[("trusted.note", b"x")],
+            ..entry("trusted", T::Regular, 0o644)
+        }];
+        let big_uid = vec![owned(entry("big", T::Regular, 0o644), 70000, 0)];
+
+        let make_layout = |name: &str, layers: &[&[Entry<'_>]]| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            let l = dir.join("oci");
+            sh(&format!(
+                "umoci init --layout {l}; umoci new --image {l}:base",
+                l = l.display()
+            ));
+            for (i, entries) in layers.iter().enumerate() {
+                let tar = dir.join(format!("layer{i}.tar"));
+                std::fs::write(&tar, layer(entries)).unwrap();
+                sh(&format!(
+                    "umoci raw add-layer --image {l}:base --tag base --no-history {t} 2>/dev/null",
+                    l = l.display(),
+                    t = tar.display()
+                ));
+            }
+            dir
+        };
+        let build_in = |dir: PathBuf, sandboxed: bool| {
+            let integration = &integration;
+            let work = dir.join(if sandboxed {
+                "work-sandbox"
+            } else {
+                "work-root"
+            });
+            async move {
+                std::fs::create_dir_all(work.join("out")).unwrap();
+                sh(&format!(
+                    "cp -a {}/oci {}/oci",
+                    dir.display(),
+                    work.display()
+                ));
+                let tools = Tools {
+                    umoci: "umoci".into(),
+                    mkfs_ext4: "mkfs.ext4".into(),
+                    builder: None,
+                    sandbox: sandboxed.then(|| {
+                        Sandbox::new(crate::config::agent::DEFAULT_IMAGE_SANDBOX_UID_BASE)
+                    }),
+                };
+                let out = work.join("out/rootfs.ext4");
+                let r = build(&tools, &work.join("oci"), integration, &work, &out, &|_| {}).await;
+                r.map(|(size, _)| (size, out))
+            }
+        };
+
+        let dir = make_layout("image", &[&base, &upper]);
+        let (root_size, root_image) = build_in(dir.clone(), false).await.unwrap();
+        let (sb_size, sb_image) = build_in(dir, true).await.unwrap();
+        assert_eq!(root_size, sb_size);
+        let (root_list, sb_list) = (listing(&root_image), listing(&sb_image));
+        println!("{}", root_list.join("\n"));
+        assert_eq!(root_list, sb_list, "the sandbox built something else");
+        for want in [
+            "/usr/bin/sudoish mode=104755 uid=0 gid=0",
+            "/usr/bin/sgid mode=102755 uid=0 gid=42",
+            "/home/user/file mode=100640 uid=1000 gid=1000 size=5 links=2",
+            "/tmp mode=041777",
+            "/etc/fifo mode=010600",
+            "/etc/nobody mode=100644 uid=65534 gid=65534",
+            "/etc/new mode=100600 uid=1000 gid=1001",
+            "/etc/link mode=120777 uid=0 gid=0 size=18 links=1 \"../usr/bin/sudoish\"",
+            "user.note (4) = \"kept\"",
+            "security.capability (20) = 01 00 00 02 00 20 00 00",
+            "security.capability (24) = 01 00 00 03 00 20 00 00 00 00 00 00 00 00 00 00 00 00 00 00 e8 03 00 00",
+        ] {
+            assert!(
+                sb_list.iter().any(|l| l.contains(want)),
+                "no {want:?} in\n{}",
+                sb_list.join("\n")
+            );
+        }
+        assert!(
+            !sb_list.iter().any(|l| l.starts_with("/etc/old ")),
+            "whiteout applied"
+        );
+        // Handed back to orbd; the work tree stays the sandbox's for removal.
+        let m = std::fs::metadata(&sb_image).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            (m.uid(), m.mode() & 0o777),
+            (nix::unistd::geteuid().as_raw(), 0o644)
+        );
+
+        for (name, layers, why) in [
+            ("device", &device, "device node"),
+            ("trusted", &trusted, "xattr only real root"),
+            ("big-uid", &big_uid, "above 65535"),
+        ] {
+            let dir = make_layout(name, &[layers]);
+            build_in(dir.clone(), false)
+                .await
+                .unwrap_or_else(|e| panic!("{name} as root: {e}"));
+            let err = build_in(dir, true).await.unwrap_err();
+            println!("{name}: {err}");
+            assert!(
+                err.contains(why) && err.contains("ORBD_IMAGE_SANDBOX=off"),
+                "{name}: {err}"
+            );
+        }
+        sh(&format!("rm -rf {}", tmp.path().display()));
     }
 }

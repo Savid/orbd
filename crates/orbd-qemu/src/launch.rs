@@ -7,6 +7,7 @@
 //! `query-name` reports, so a QMP socket is known to belong to this launch.
 
 use crate::qmp::Qmp;
+use orbd_vm::jail::Jail;
 use orbd_vm::process::{self, CpuIdentity, KernelIdentity, LaunchKind, Process, VmmIdentity};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,10 @@ use std::time::{Duration, Instant};
 /// to hosts with the same CPU. A named model (e.g. `EPYC-Rome-v4`) restores on any host
 /// that can provide it.
 pub const DEFAULT_CPU_MODEL: &str = "host";
+
+/// [`DEFAULT_CPU_MODEL`] without hardware virtualization (x86: VMX and SVM hidden), for
+/// guests that must not run nested KVM guests.
+pub const NO_NESTED_CPU_MODEL: &str = "host,vmx=off,svm=off";
 
 /// Name of the virtio-serial port the guest agent serves; its host end is
 /// [`HostFiles::guest_sock`].
@@ -204,12 +209,15 @@ pub struct Launch<'a> {
     pub netns: Option<PathBuf>,
     pub sandbox: Sandbox<'a>,
     /// A setgid program QEMU is started through (`orbd-netgroup`), so its sockets carry
-    /// that group.
+    /// that group. Not with a jail (jailed processes gain no group by exec).
     pub group_exec: Option<&'a Path>,
+    /// The jail QEMU runs in (Linux): everything it opens must be bound in it.
+    pub jail: Option<Jail>,
 }
 
 /// What QEMU may use on macOS besides its installation, the system and the kernel: the
-/// Seatbelt profile (`qemu.sb`) denies everything else. Linux QEMU gets `-sandbox`.
+/// Seatbelt profile (`qemu.sb`) denies everything else. Linux QEMU gets `-sandbox`
+/// (seccomp) and, unless the caller opts out, [`Launch::jail`].
 pub struct Sandbox<'a> {
     /// Read and written: the orb's directory and the launch's run directory.
     pub orb_dir: &'a Path,
@@ -235,6 +243,11 @@ pub fn spawn(l: Launch<'_>) -> std::io::Result<(Process, LaunchRecord)> {
     ));
     argv.extend(l.record.config.machine_args.iter().cloned());
     if let Some(exec) = l.group_exec {
+        if l.jail.is_some() {
+            return Err(std::io::Error::other(
+                "a jailed QEMU cannot be started through a setgid program",
+            ));
+        }
         argv.insert(0, exec.display().to_string());
     }
     let args = argv.split_off(1);
@@ -247,6 +260,7 @@ pub fn spawn(l: Launch<'_>) -> std::io::Result<(Process, LaunchRecord)> {
         record: l.record,
         cgroup: l.cgroup,
         netns: l.netns,
+        jail: l.jail,
     })
 }
 
@@ -280,11 +294,12 @@ pub enum ReadyError {
     Timeout,
 }
 
-/// Waits until QEMU's monitor at `qmp` answers as the launch `name`, polling every
-/// `poll`. Does not kill the process on failure.
+/// Waits until QEMU's monitor at `qmp`, served by `server_uid` (QEMU's), answers as the
+/// launch `name`, polling every `poll`. Does not kill the process on failure.
 pub async fn wait_ready(
     proc: &Process,
     qmp: &Path,
+    server_uid: Option<u32>,
     name: &str,
     timeout: Duration,
     poll: Duration,
@@ -294,7 +309,7 @@ pub async fn wait_ready(
         if !proc.is_alive() {
             return Err(ReadyError::Exited);
         }
-        if let Ok(q) = Qmp::connect(qmp, Duration::from_secs(1)).await
+        if let Ok(q) = Qmp::connect(qmp, server_uid, Duration::from_secs(1)).await
             && q.name().await.ok().flatten().as_deref() == Some(name)
         {
             return Ok(());

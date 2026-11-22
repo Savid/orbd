@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # End to end check of orbd's container image as deployed (see the README): a coordinator
-# container and a privileged, zero-config agent container joined with `orbd join-token`,
-# jobs sent through the coordinator's dispatch socket with `orbd dispatch` (as `amp orb
-# provider` runs them), then a real `docker stop` / `docker start` of the agent with a
-# running QEMU orb and a running Firecracker orb.
+# container and a zero-config agent container (the README's flags, not --privileged)
+# joined with `orbd join-token`, jobs sent through the coordinator's dispatch socket with
+# `orbd dispatch` (as `amp orb provider` runs them), then a real `docker stop` / `docker
+# start` of the agent with a running QEMU orb and a running Firecracker orb.
 #
 #   container-e2e.sh IMAGE ROOTFS
 #
 # ROOTFS is the KVM test root disk (kvm-guest/build-rootfs.sh), served through the
 # agent's `images.static_images`. Its counter process prints `counter pid=<pid> n=<n>`
 # every second; it must keep its pid and count through pause/wake and through the agent
-# container's restart. Its stand-in bootstrap probes the TCP targets in `E2E_PROBE`: the
-# Firecracker orb must reach the internet but not the agent's namespace, and of private
-# addresses only what ORBD_EGRESS_ALLOW allows (the coordinator's 7443). The agent sets a
-# non-default ORBD_GUEST_NETWORK, which both orbs must be addressed in. Needs Docker,
-# /dev/kvm and the internet; nested virtualization is not needed.
+# container's restart. Its stand-in bootstrap probes the TCP targets in `E2E_PROBE`: each
+# orb must reach the internet but not the agent's namespace, and of private addresses
+# only what ORBD_EGRESS_ALLOW allows (the coordinator's 7443). The agent sets a
+# non-default ORBD_GUEST_NETWORK, which both orbs must be addressed in. Every VMM runs
+# jailed, as an unprivileged uid of its own. Needs Docker, /dev/kvm and the internet;
+# nested virtualization is not needed.
 set -euo pipefail
 image=$1
 rootfs=$(realpath "$2")
@@ -133,7 +134,10 @@ docker run -d --name "$coord" --network "$id" -v "$coord:/var/lib/orbd" \
 wait_for 30 "the dispatch socket" docker exec "$coord" test -S /var/lib/orbd/dispatch.sock
 coord_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$coord")
 token=$(docker exec "$coord" orbd join-token agent-1)
-docker run -d --name "$agent" --network "$id" --privileged --stop-timeout 300 \
+# Exactly the documented agent flags (README): no --privileged.
+docker run -d --name "$agent" --network "$id" --stop-timeout 300 \
+    --cap-add SYS_ADMIN --cap-add NET_ADMIN --device /dev/kvm --device /dev/net/tun \
+    --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
     -v "$agent:/var/lib/orbd" -v "$work/agent.yaml:/etc/orbd/agent.yaml:ro" \
     -v "$rootfs:/fixture/rootfs.ext4:ro" -e "ORBD_JOIN=$token" -e ORBD_DISK_RESERVE_GIB=2 \
     -e ORBD_AGENT_CONFIG=/etc/orbd/agent.yaml -e ORBD_GUEST_NETWORK=10.200.0.0/24 \
@@ -150,30 +154,34 @@ for rt in $runtimes; do
     echo "== $rt counter pid=${pid[$rt]} n=${n[$rt]}"
 done
 
-# Firecracker orbs reach the internet through NAT, never the agent's own namespace.
-# Probes run in order, each dropped one taking 5 s: wait for the last.
-probed() { [ -n "$(probe firecracker "$coord_ip:9")" ]; }
-wait_for 30 "the Firecracker orb's network probes" probed
-egress=$(probe firecracker 1.1.1.1:53) inward=$(probe firecracker "$agent_ip:9")
-echo "== firecracker orb: internet $egress, agent namespace $inward"
-[ "$egress" = open ] || fail "the Firecracker orb cannot reach the internet ($egress)"
-[ "$inward" = dropped ] || fail "the Firecracker orb reaches the agent's namespace ($inward)"
-# The coordinator is private (Docker's network): only its allowed port is reachable.
-allowed=$(probe firecracker "$coord_ip:7443") private=$(probe firecracker "$coord_ip:9")
-echo "== firecracker orb: allowed private $allowed, other private $private"
-[ "$allowed" = open ] || fail "the Firecracker orb cannot reach an allowed address ($allowed)"
-[ "$private" = dropped ] || fail "the Firecracker orb reaches a private address ($private)"
+# VM orbs reach the internet through NAT, never the agent's own namespace. Probes run in
+# order, each dropped one taking 5 s: wait for the last.
+for rt in $runtimes; do
+    probed() { [ -n "$(probe "$rt" "$coord_ip:9")" ]; }
+    wait_for 30 "the $rt orb's network probes" probed
+    egress=$(probe "$rt" 1.1.1.1:53) inward=$(probe "$rt" "$agent_ip:9")
+    echo "== $rt orb: internet $egress, agent namespace $inward"
+    [ "$egress" = open ] || fail "the $rt orb cannot reach the internet ($egress)"
+    [ "$inward" = dropped ] || fail "the $rt orb reaches the agent's namespace ($inward)"
+    # The coordinator is private (Docker's network): only its allowed port is reachable.
+    allowed=$(probe "$rt" "$coord_ip:7443") private=$(probe "$rt" "$coord_ip:9")
+    echo "== $rt orb: allowed private $allowed, other private $private"
+    [ "$allowed" = open ] || fail "the $rt orb cannot reach an allowed address ($allowed)"
+    [ "$private" = dropped ] || fail "the $rt orb reaches a private address ($private)"
+done
 console firecracker | has -F '/dev/kvm is missing' || fail "the Firecracker orb has /dev/kvm"
+# Each VMM runs jailed, under its orb's own unprivileged uid.
+uids=$(docker top "$agent" -eo pid,uid,args | awk '/[q]emu-system|[f]irecracker --api-sock/ { print $2 }' | sort -u)
+echo "== VMM uids:" $uids
+[ "$(echo "$uids" | wc -w)" = 2 ] || fail "the two VMMs do not run as two uids: $uids"
+for u in $uids; do
+    [ "$u" -gt 1300000000 ] || fail "a VMM runs as uid $u, not a jail's"
+done
 # Both orbs use the agent's guest network: addressed in it, and out through its gateway.
 for rt in $runtimes; do
     console "$rt" | has -F '10.200.0.15/24 via 10.200.0.2' ||
         fail "the $rt orb is not addressed in ORBD_GUEST_NETWORK"
 done
-qemu_probed() { [ -n "$(probe qemu "$coord_ip:9")" ]; }
-wait_for 30 "the QEMU orb's network probes" qemu_probed
-[ "$(probe qemu 1.1.1.1:53)" = open ] || fail "the QEMU orb cannot reach the internet"
-# Not filtered by orbd (QEMU's user-mode network): recorded, not required.
-echo "== qemu orb: private $(probe qemu "$coord_ip:9") (orbd does not filter QEMU orbs)"
 
 for rt in $runtimes; do dispatch pause "$rt"; done
 [ "$(vmms)" = 0 ] || fail "a paused orb still has a VMM process"

@@ -31,7 +31,12 @@ pub enum ApiError {
 
 pub struct Api {
     socket: PathBuf,
+    /// Firecracker's uid, which must serve the socket.
+    server_uid: u32,
 }
+
+/// Longest response body read: the answers orbd asks for are small JSON objects.
+const MAX_BODY: usize = 1 << 20;
 
 /// `GET /` (InstanceInfo).
 #[derive(Debug, Deserialize)]
@@ -103,8 +108,9 @@ pub struct SnapshotLoad<'a> {
 }
 
 impl Api {
-    pub fn new(socket: PathBuf) -> Self {
-        Self { socket }
+    /// The API at `socket`, which `server_uid` (Firecracker's) must serve.
+    pub fn new(socket: PathBuf, server_uid: u32) -> Self {
+        Self { socket, server_uid }
     }
 
     async fn call(
@@ -116,7 +122,7 @@ impl Api {
     ) -> Result<Bytes, ApiError> {
         let what = format!("{method} {path}");
         let fut = async {
-            let stream = tokio::net::UnixStream::connect(&self.socket).await?;
+            let stream = orbd_vm::process::connect_unix(&self.socket, self.server_uid).await?;
             let (mut sender, conn) =
                 hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
             let conn = tokio::spawn(conn);
@@ -135,7 +141,13 @@ impl Api {
             let out = async {
                 let res = res?;
                 let status = res.status();
-                let bytes = res.into_body().collect().await?.to_bytes();
+                let bytes = http_body_util::Limited::new(res.into_body(), MAX_BODY)
+                    .collect()
+                    .await
+                    .map_err(|e| {
+                        ApiError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                    })?
+                    .to_bytes();
                 if status.is_success() {
                     Ok(bytes)
                 } else {

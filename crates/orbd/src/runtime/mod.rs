@@ -44,6 +44,15 @@ pub(crate) fn orb_hostname(orb: &OrbDefinition) -> String {
     if h.is_empty() { "orb".into() } else { h.into() }
 }
 
+/// Why an agent started with `ORBD_NESTED_KVM=false` does not start an orb.
+pub(crate) const NESTED_KVM_REFUSED: &str = "this agent runs no orbs with /dev/kvm \
+     (ORBD_NESTED_KVM=false) and this orb's type has kvm";
+
+/// Whether `orb` gets `/dev/kvm` inside it (its type has `kvm`).
+pub(crate) fn needs_nested_kvm(orb: &OrbDefinition) -> bool {
+    orb.spec.template.requirements.nested_kvm != crate::model::NestedKvmRequirement::NotRequired
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
     pub kind: RuntimeKind,

@@ -45,7 +45,8 @@ pub struct SavedFile {
 }
 
 /// Has a stopped, configured QEMU write its state into `memory`, which must not exist
-/// yet (it is created 0600; QEMU reopens and writes it in place), polling every `poll`.
+/// yet (it is created 0600, owned by `owner` if given, e.g. a jailed QEMU's uid and gid;
+/// QEMU reopens and writes it in place), polling every `poll`.
 /// `progress` sees each poll while the save runs and may abort it by returning an
 /// error (the caller then cancels the migration). On success QEMU is in `postmigrate`
 /// and the file is fsynced.
@@ -53,6 +54,7 @@ pub async fn save_to_file(
     qmp: &Qmp,
     memory: &Path,
     poll: Duration,
+    owner: Option<(u32, u32)>,
     mut progress: impl FnMut(&MigrationInfo) -> Result<(), String>,
 ) -> Result<SavedFile, MigrationError> {
     let file = {
@@ -64,6 +66,9 @@ pub async fn save_to_file(
             .open(memory)
             .map_err(MigrationError::Io)?
     };
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::fchown(&file, Some(uid), Some(gid)).map_err(MigrationError::Io)?;
+    }
     qmp.migrate_to_file(memory).await?;
     fail::fail_point!("qemu::save::after_migrate", |_| std::process::abort());
     let info = loop {

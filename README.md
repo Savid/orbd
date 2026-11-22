@@ -115,9 +115,25 @@ Static binaries for x86_64 and aarch64 are attached to each release.
 3. **Agents** (x86_64), one token each:
 
    ```sh
-   docker run -d --privileged --stop-timeout 300 -v orbd-agent:/var/lib/orbd \
-     -e ORBD_JOIN=<token> ghcr.io/samcm/orbd agent
+   docker run -d --stop-timeout 300 \
+     --cap-add SYS_ADMIN --cap-add NET_ADMIN --device /dev/kvm --device /dev/net/tun \
+     --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
+     -v orbd-agent:/var/lib/orbd -e ORBD_JOIN=<token> ghcr.io/samcm/orbd agent
    ```
+
+   The agent needs no `--privileged`. On top of Docker's default capabilities it needs
+   `CAP_SYS_ADMIN` (namespaces and mounts for VMM jails, image sandboxes and orb
+   networks) and `CAP_NET_ADMIN` (taps, nftables); `/dev/kvm` and `/dev/net/tun`;
+   AppArmor not confining it (its default profile denies mounts; ignored where AppArmor
+   is off); and a writable `/proc/sys` (`systempaths=unconfined`) for forwarding in its
+   own and each orb's network namespace. Docker's other defaults stay: its seccomp
+   profile (orbd falls back from `pivot_root`, which it refuses), no other devices, and
+   the capability set, of which orbd also uses `CAP_SETUID`, `CAP_SETGID`, `CAP_CHOWN`,
+   `CAP_FOWNER`, `CAP_DAC_OVERRIDE` and `CAP_KILL`. Outside Docker, e.g. under systemd,
+   run it as root with that capability set (`CapabilityBoundingSet=`), those devices
+   (`DeviceAllow=`), `ReadWritePaths=/var/lib/orbd /run/netns` and `KillMode=process`
+   (VMMs outlive a restart and are adopted). Docker's user-namespace remapping is
+   unsupported: jails and image sandboxes use host uids from 1300000000 up.
 
 Threads you create on that provider in Amp then run on your hosts.
 
@@ -136,7 +152,7 @@ its gateway `.2`); if workloads in orbs use that subnet, e.g. Docker Compose net
 set another with `ORBD_GUEST_NETWORK` (e.g. `10.200.0.0/24`). It applies to orbs created
 afterwards; existing orbs keep theirs.
 
-Firecracker orbs reach the internet, not the host's LAN. Their traffic to private and
+VM orbs on Linux reach the internet, not the host's LAN. Their traffic to private and
 other non-global addresses (`10/8`, `172.16/12`, `192.168/16`, a tailnet's `100.64/10`,
 loopback, documentation, multicast and reserved ranges) is dropped, and so are IPv6, cloud
 metadata endpoints (link-local, Azure's `168.63.129.16`, Alibaba's `100.100.100.200`) and
@@ -148,9 +164,71 @@ range>]` entries, e.g. `udp:192.168.2.201:41641` (direct Tailscale to a LAN host
 0.2: **upgrading from 0.1 cuts running orbs off the LAN** (their open connections to it
 too), so list what they need first. The agent's own traffic is not affected, other
 firewalls on the host still apply, and the host's public addresses are internet
-addresses to orbs (keep services there firewalled). QEMU orbs (orb types with `kvm`) use
-QEMU's user-mode network, which orbd does not filter: on Linux they reach what the agent
-reaches, so fence them with host firewall rules (on macOS, see below).
+addresses to orbs (keep services there firewalled). An orb cannot pass as another: its
+traffic must come from its own guest subnet and veth. Linux QEMU orbs (orb types with
+`kvm`) created by orbd 0.2.8 or earlier used QEMU's unfiltered user-mode network and are
+refused: delete them (`orbd orb delete`) and Amp starts new ones. On macOS, see below.
+
+On Linux each VMM (QEMU, Firecracker) runs jailed: as its orb's own uid and gid
+(`ORBD_VMM_JAIL_UID_BASE`, default 1300000000, plus a per-orb index, up to 2^24 of them;
+nothing else on the host may use these uids, so two agents on one host need bases 2^24
+apart, clear of `/etc/subuid` ranges), with no capabilities and `no_new_privs`, in a
+mount namespace holding only its orb's disk, logs, checkpoints and sockets, the VMM and
+its libraries, the kernel, QEMU's backing image and `/dev/{kvm,net/tun,null,urandom}`:
+no `/proc`, `/sys`, agent state or other orbs. A VMM escape is an unprivileged process
+that sees one orb: the agent talks only to sockets its VMM's uid serves, kills whatever
+else still runs as that uid before each start and at the delete, and never hands the uid
+to another orb. Making a project snapshot reads the orb's disk in its jail too
+(`qemu-img` through the orb's own base only, `e2fsck`, `resize2fs`). A Linux agent with
+VM runtimes must run as root (it refuses to start otherwise) and launches no VMM its
+jail cannot hold. `ORBD_VMM_JAIL=off` runs VMMs unjailed as the agent's user: unsafe,
+for development only. Firecracker orbs of older agents, sleeping and running ones
+included, move into their jail on their next start; a VMM an older agent left running is
+adopted as before and runs unjailed until then. Downgrade only after a drain (`docker
+stop` checkpoints running orbs): an older agent cannot put to sleep a jailed VMM this
+one left running.
+
+`ORBD_FLOW_LOG=true` logs every new connection an orb in its own network namespace
+(every Linux VM orb) starts as one event
+(target `orbd::flow`, a JSON line with `ORBD_LOG_JSON`): `orb`, `amp_orb_id` and
+`thread_id`, `proto`, `dst` (address and port), `src_port`, and `verdict`, `accept` or
+`drop` by the rules above (connections to the agent itself are dropped). The kernel
+sends each connection's first packets to NFLOG group 4731 (the agent needs
+`CAP_NET_ADMIN`, as for its nftables table, and the host kernel's `nfnetlink_log`), and
+the agent reads them on a thread of its own, so orb traffic never waits for the log.
+Retransmissions of a connection are one event. Past 50 events a second for an orb
+(bursts of 200) or 500 for all orbs, connections are counted instead and reported every
+10 s; past 200 new connections a second for an orb (bursts of 400) or 2000 for all orbs
+the kernel only counts them, so one busy orb cannot crowd out the others' log, as it
+does messages that did not fit the agent's buffer (metrics `orbd_flow_log_events_total`,
+`orbd_flow_log_suppressed_total`, `orbd_flow_log_lost_total`). Without the setting the
+agent's nftables table logs nothing.
+
+Agents pull and prepare each orb's image (Amp's `ORB_IMAGE`) themselves, whatever image
+an Amp project names. `ORBD_IMAGE_ALLOW` limits them to comma-separated patterns:
+`<repository>` (any tag or digest), `<repository>:<tag>`, `<repository>@<digest>` or
+`<registry>/<prefix>*`, e.g. `us-central1-docker.pkg.dev/amp-prod-0/amp-orb/*`, compared
+in full (`debian` is `docker.io/library/debian:latest`). The agent checks it before
+resolving or pulling anything, whatever the coordinator sends: a spawn of another image
+fails with `image <ref> is not allowed on this agent (ORBD_IMAGE_ALLOW)`, and prewarmed
+images it does not list are skipped. Disks that exist already are not checked: orbs
+keep running, and a project snapshot on the agent built from an image the list no longer
+allows is still used while its image lineage (Debian release) matches the spawn's.
+Unset (the default) allows any image; the agent logs which applies when it starts.
+
+On Linux, umoci, `du` and `mkfs.ext4` handle the image's files in a sandbox
+(`ORBD_IMAGE_SANDBOX=on`, the default): as root of a user namespace whose ids 0-65535
+are the host's 1400000000-1400065535 (`ORBD_IMAGE_SANDBOX_UID_BASE`; nothing on the host
+may use them), without network and seeing only the tools and the build's own files.
+Owners, modes, xattrs and file capabilities come out as before; an image with device
+nodes, `trusted.*` xattrs or owners above 65535 fails to build instead (common images
+have none: in a container `/dev` is the runtime's). The agent tries the sandbox when it
+starts and refuses to start without one: it needs to run as root with `CAP_SYS_ADMIN`,
+`CAP_SETUID`, `CAP_SETGID` and `CAP_CHOWN`, as the agent flags above give it.
+`ORBD_IMAGE_SANDBOX=off` runs the tools as real root (through `sudo -n` for an agent not
+running as root), as orbd did before: unsafe, since whoever can set an Amp project's
+image then feeds root-run tar and ext4 tooling on every agent. An agent with
+`images.builder` (macOS) builds in that container instead.
 
 `orbd agent list` and `orbd agent remove <id>`
 manage agents; a removed agent's orbs stay on it, unavailable. `orbd agent list` shows
@@ -295,8 +373,17 @@ version is never run again; the next release gets its own probation. A broken re
 therefore costs a couple of failed spawns, which Amp retries, instead of an outage.
 
 Agents use QEMU and Firecracker when `/dev/kvm` works, otherwise Docker (mount
-`/var/run/docker.sock`). On `docker stop` an agent saves its running VM orbs and restores
-them when it starts again,
+`/var/run/docker.sock`), and keep the runtime they started with. Docker orbs are
+containers sharing the host's kernel; `ORBD_VM_ONLY=true` keeps an agent from ever using
+Docker: it starts only when a VM runtime works, and refuses an agent config with
+`runtime.docker` or a state directory set up for Docker orbs. Nested virtualization
+exposes more of the host's KVM to orbs: an agent started with `ORBD_NESTED_KVM=false`
+advertises none, so the coordinator places no orb type with `kvm` on it, and refuses to
+start such an orb itself (one created there earlier, or one a coordinator sends anyway);
+it still pauses and deletes them. A QEMU orb whose type has no `kvm`, or any on such an
+agent, sees no VMX or SVM from its next cold boot (a sleeping orb wakes with the CPU it
+slept with). On `docker stop` an agent saves its running VM orbs and
+restores them when it starts again,
 so give it time (`--stop-timeout 300`; under systemd, `KillMode=mixed` and
 `TimeoutStopSec=300`). When the host shuts down, systemd stops `docker.service` itself,
 which by default it kills after 90 s, cutting saves short whatever `--stop-timeout` says:
@@ -305,13 +392,12 @@ raise it too, e.g. a drop-in `/etc/systemd/system/docker.service.d/orbd.conf` wi
 (~5 GiB).
 
 The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Linux 7.3
-guest kernel; an agent run outside it needs QEMU 9.0 or newer, and for Firecracker
-`ip` and `nft` (`orbd doctor` checks). Firecracker orbs run in their own network
-namespace behind NAT and cannot reach the agent itself, each other or private networks
-(see above). A sleeping orb wakes only on the
-VMM build and CPU it slept on, so after an upgrade it cold-boots once; the agent deletes
-such memory checkpoints when it starts, as it deletes every checkpoint that was restored
-or superseded.
+guest kernel; an agent run outside it needs QEMU 9.0 or newer, and `ip` and `nft`
+(`orbd doctor` checks). VM orbs run in their own network namespace behind NAT and cannot
+reach the agent itself, each other or private networks (see above). A sleeping orb wakes
+only on the VMM build and CPU it slept on, so after an upgrade it cold-boots once; the
+agent deletes such memory checkpoints when it starts, as it deletes every checkpoint that
+was restored or superseded.
 
 ### macOS agents
 
@@ -329,6 +415,7 @@ memory as on Linux, even while the Mac is locked. On the Mac:
   `images.guest_helper`). To build them: `cargo build --release -p orbd`, and
   `ARCH=arm64 guest/kernel/build.sh` and `orbd-guest` in a linux/arm64 container.
 - Run `orbd agent` as your user, e.g. from a LaunchAgent; `orbd doctor` checks the setup.
+- Fence orbs off your LAN with pf (below): without that QEMU orbs do not start.
 
 QEMU runs in a Seatbelt sandbox (`sandbox-exec`, where Linux uses seccomp): it reads
 only the system, its installation and its orb's kernel and disks, writes only its orb's
@@ -336,11 +423,38 @@ files, runs no other program, and sends no ICMP and nothing to `localhost`.
 
 macOS has no network namespaces: orbs use QEMU's user-mode network and otherwise reach
 whatever the Mac can, its LAN included. To fence them in, set
-`runtime.qemu.network_group`, install the release's `orbd-netgroup` setgid to that group
-on the agent's `PATH` (`sudo install -o root -g <group> -m 2755 orbd-netgroup
-/usr/local/bin/`; the agent checks it on every launch), and block the group with pf
-`group` rules. pf must not skip `lo0`, and on tunnel interfaces (e.g. Tailscale's) sees
-only inbound replies, so drop those too.
+`runtime.qemu.network_group` (a group of its own, e.g. `_orbdvm` created with `dscl`),
+install the release's `orbd-netgroup` setgid to that group on the agent's `PATH` (`sudo
+install -o root -g <group> -m 2755 orbd-netgroup /usr/local/bin/`; the agent checks it on
+every launch), and block the group with pf `group` rules, e.g. in an anchor that
+`/etc/pf.conf` evaluates (`com.apple/orbd` is, through its `anchor "com.apple/*"`):
+
+```
+table <orbd_blocked> const { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, \
+    169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/4, 240.0.0.0/4 }
+block return out quick inet proto { tcp, udp } from any to <orbd_blocked> group _orbdvm
+block drop in quick inet proto { tcp, udp } from <orbd_blocked> to any group _orbdvm
+block return out quick inet6 proto { tcp, udp } from any to any group _orbdvm
+```
+
+QEMU maps the orb's gateway to the Mac's `127.0.0.1`, so pf must not skip `lo0`; on
+tunnel interfaces (e.g. Tailscale's) pf sees only inbound replies, hence the `in` rule.
+Reboots, network changes and other software can disable pf or flush rules: keep them
+loaded with a root LaunchDaemon (e.g. every 30 s: `pfctl -a com.apple/orbd -f <file>` when
+the anchor is empty, `pfctl -E` when pf is disabled).
+
+QEMU orbs start only while this fence verifiably holds. The agent cannot read pf's state
+(that needs root), so it tests it: it connects to a listener of its own on `127.0.0.1`,
+then has `orbd-netgroup` run `orbd fence-probe`, the same connection with the group. A
+QEMU orb starts only when pf blocks that one and not the agent's; a passing test counts
+for 30 s, and the agent repeats it every 30 s, logging when the fence comes or goes
+(metric `orbd_egress_fence_verified`). Otherwise, or without `network_group`, spawns and
+wakes fail with the reason (orbs already running keep running); earlier versions started
+them unfenced. `orbd doctor -c <agent config>` runs the same test. It proves that pf
+blocks the group from the Mac itself; that your rules also cover the LAN and tailnet is
+yours to check, as is UDP (the test connects over TCP; block both, as above):
+`orbd-netgroup nc -z -G 3 <LAN host> <port>` connects as an orb would, and must fail.
+`ORBD_ALLOW_UNFENCED_EGRESS=true` starts QEMU orbs without a fence.
 
 ## Boat
 
