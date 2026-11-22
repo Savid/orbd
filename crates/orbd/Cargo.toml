@@ -47,6 +47,7 @@ zeroize.workspace = true
 fail.workspace = true
 nix.workspace = true
 x509-parser.workspace = true
+psl.workspace = true
 oci-client.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

@@ -76,6 +76,9 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # QMP client. Passively maintained: pinned exactly and wrapped narrowly (crates/orbd-qemu/src/qmp.rs).
 qapi = { version = "=0.15.0", features = ["qmp", "async-tokio-all"] }
 x509-parser = "0.18"
+# The Public Suffix List, compiled in (no dependencies but its types): orb types' egress
+# wildcards over a public suffix are refused.
+psl = "2.1.261"
 
 [profile.release]
 lto = "thin"

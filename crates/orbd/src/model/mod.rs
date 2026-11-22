@@ -4,6 +4,7 @@
 pub mod artifact;
 pub mod capability;
 pub mod command;
+pub mod egress;
 pub mod identity;
 pub mod placement;
 pub mod spec;
@@ -13,6 +14,7 @@ pub mod wire;
 pub use artifact::*;
 pub use capability::*;
 pub use command::*;
+pub use egress::EgressPolicy;
 pub use identity::*;
 pub use placement::*;
 pub use spec::*;

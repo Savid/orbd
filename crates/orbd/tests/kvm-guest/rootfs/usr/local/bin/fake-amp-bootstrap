@@ -6,11 +6,55 @@ echo "guest lsm: $(cat /sys/kernel/security/lsm 2>&1)"
 # Landlock ABI version: landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION),
 # syscall 444 on x86_64 and arm64 (perl-base is essential, so always present).
 echo "guest landlock abi: $(perl -e 'print syscall(444, 0, 0, 1)' 2>&1)"
+# E2E_RESOLVE="name ...": what each name resolves to (`resolve <name> <address ...>`, or
+# `unresolved`). Three tries: right after boot resolv.conf can still be orbd-test-dns's.
+resolve() {
+    local try a
+    for try in 1 2 3; do
+        a=$(timeout 6 getent ahostsv4 "$1" | while read -r addr kind _; do
+            [ "$kind" = STREAM ] && printf '%s ' "$addr"
+        done)
+        [ -n "$a" ] && break
+        sleep 1
+    done
+    printf '%s' "$a"
+}
+for name in $E2E_RESOLVE; do
+    a=$(resolve "$name")
+    echo "resolve $name ${a:-unresolved}"
+done
 # E2E_PROBE="host:port ...": which TCP destinations this orb reaches (open: accepted;
-# refused: reachable, nothing listening; dropped: filtered).
+# refused: reachable, nothing listening; dropped: filtered; unresolved: a name that
+# does not resolve).
 for target in $E2E_PROBE; do
-    timeout 5 bash -c "exec 3<>/dev/tcp/${target%:*}/${target##*:}" 2>/dev/null
+    host=${target%:*}
+    if [[ ! $host =~ ^[0-9.]+$ ]] && [ -z "$(resolve "$host")" ]; then
+        echo "probe $target unresolved"
+        continue
+    fi
+    timeout 5 bash -c "exec 3<>/dev/tcp/$host/${target##*:}" 2>/dev/null
     case $? in 0) r=open ;; 124) r=dropped ;; *) r=refused ;; esac
     echo "probe $target $r"
+done
+# E2E_UDP="host:port ...": one UDP datagram to each (whether it passed shows only in the
+# agent's flow log).
+for target in $E2E_UDP; do
+    host=${target%:*}
+    if [[ ! $host =~ ^[0-9.]+$ ]]; then
+        a=$(resolve "$host")
+        if [ -z "$a" ]; then
+            echo "udp $target unresolved"
+            continue
+        fi
+        host=${a%% *}
+    fi
+    echo probe 2>/dev/null >"/dev/udp/$host/${target##*:}"
+    echo "udp $target sent"
+done
+# E2E_PROBE6="address/port ...": TCP to IPv6 destinations, as E2E_PROBE.
+for target in $E2E_PROBE6; do
+    timeout 5 bash -c "exec 3<>/dev/tcp/${target%/*}/${target##*/}" 2>/dev/null
+    case $? in 0) r=open ;; 124) r=dropped ;; *) r=refused ;; esac
+    echo "probe6 $target $r"
 done
 exec sleep infinity

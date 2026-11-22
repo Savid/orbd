@@ -53,6 +53,10 @@ pub(crate) fn needs_nested_kvm(orb: &OrbDefinition) -> bool {
     orb.spec.template.requirements.nested_kvm != crate::model::NestedKvmRequirement::NotRequired
 }
 
+/// Why an agent does not start an orb whose type restricts egress.
+pub(crate) const EGRESS_REFUSED: &str = "this agent cannot enforce restricted egress \
+     (the orb type's `egress`) for this runtime; it runs such orbs only in Linux VMs";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
     pub kind: RuntimeKind,
@@ -64,6 +68,9 @@ pub struct RuntimeCapabilities {
     pub project_snapshots: bool,
     /// CPU architecture of the orbs it runs: the host's.
     pub arch: Arch,
+    /// Enforces restricted egress (an orb type's `egress`): the Linux VM runtimes, with
+    /// their DNS proxy running.
+    pub egress_policy: bool,
 }
 
 /// How to start an orb. Distinct cases, no boolean soup.

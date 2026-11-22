@@ -836,6 +836,18 @@ impl Core {
                         "the orb's host is unavailable",
                     )));
                 };
+                // An orb with restricted egress never starts where it would run open
+                // (e.g. its agent was downgraded); its agent refuses it as well.
+                if matches!(head.action, ReqAction::Spawn { .. })
+                    && template.requirements.egress.is_some()
+                    && cand.capabilities.egress_policy != crate::model::Support::Supported
+                {
+                    return Ok(Err(refuse(
+                        FailureCode::UnsupportedCapability,
+                        "the orb's host does not enforce restricted egress, which its orb type \
+                         has (egress)",
+                    )));
+                }
                 if matches!(head.action, ReqAction::Spawn { .. }) {
                     let demand = self.demand(template);
                     // A running orb already holds its reservation; re-spawning it (a
@@ -1148,6 +1160,7 @@ impl Core {
                 offering_id: orb.offering_id.clone(),
                 spec: orb.spec.clone(),
                 spec_digest: orb.spec_digest.clone(),
+                egress: current_egress(&self.offerings, &orb),
             },
             location: orb.location.clone(),
             secrets,
@@ -2074,6 +2087,23 @@ fn limiting(refusals: &[(String, Vec<(FailureCode, String)>)]) -> FailureCode {
         .unwrap_or(FailureCode::BackendUnavailable)
 }
 
+/// A restricted orb's policy as its orb type (the offering it records, wherever it was
+/// placed or spilled) has it now, which its agent applies from the orb's next launch on.
+/// None for an unrestricted orb, and for one whose orb type is gone (renamed) or no
+/// longer has `egress`: its agent then keeps the policy it last applied.
+fn current_egress(
+    offerings: &HashMap<OfferingId, Offering>,
+    orb: &OrbRecord,
+) -> Option<crate::model::EgressPolicy> {
+    orb.spec.template.requirements.egress.as_ref()?;
+    offerings
+        .get(&orb.offering_id)?
+        .spec
+        .requirements
+        .egress
+        .clone()
+}
+
 /// Digest over the immutable command contents, including the identity (keyed
 /// fingerprint) of the secret payload.
 fn command_digest(plan: &CreatePlan, spec_digest: &SpecDigest) -> String {
@@ -2093,6 +2123,84 @@ fn command_digest(plan: &CreatePlan, spec_digest: &SpecDigest) -> String {
 mod tests {
     use super::*;
     use crate::model::{AgentId, BackendId, DiskReport, MemoryReport, RuntimeKind};
+
+    /// The current policy of a restricted orb's type goes with its commands: an edited
+    /// one, the type's own for an orb spilled to another place, none for a type that
+    /// lost `egress` or is gone (the agent keeps what it applied last) and none for an
+    /// unrestricted orb, whatever its type has now.
+    #[test]
+    fn current_egress_follows_the_orb_type() {
+        let yaml = |egress: &str| {
+            format!(
+                "config_version: v2\npublic_url: https://c.example:7443\n\
+                 provider: {{ token_file: /t/p }}\n\
+                 orb_types:\n  - {{ id: t, vcpus: 2, memory_mib: 2048, disk_gib: 4, \
+                 arch: [amd64, arm64]{egress} }}\n  - {{ id: u, vcpus: 2, memory_mib: 2048, disk_gib: 4 }}\n"
+            )
+        };
+        let offerings = |egress: &str| -> HashMap<OfferingId, Offering> {
+            let mut c: crate::config::coordinator::CoordinatorConfig =
+                serde_saphyr::from_str(&yaml(egress)).unwrap();
+            c.normalize().unwrap();
+            c.validate().unwrap();
+            c.offerings
+                .iter()
+                .map(|o| (o.id.clone(), o.to_offering().unwrap()))
+                .collect()
+        };
+        let created = offerings(", egress: { domains: [a.example] }");
+        let orb = |offering: &str, spec_from: &str| {
+            let template = created[&OfferingId::new(spec_from)].spec.clone();
+            let spec = OrbSpec {
+                template,
+                initial_disk: InitialDiskSource::Image {
+                    image_ref: "i".into(),
+                },
+            };
+            OrbRecord {
+                id: OrbId::generate(),
+                identity: OrbIdentity {
+                    amp_endpoint: AmpEndpointId::new("amp"),
+                    amp_orb_id: AmpOrbId::new("amp-1"),
+                },
+                offering_id: OfferingId::new(offering),
+                spec_digest: spec.digest(),
+                spec,
+                location: Location::Fleet {
+                    backend_id: BackendId::new("fleet"),
+                    agent_id: AgentId::new("a".to_owned()),
+                },
+                last_issued_generation: 1,
+                observation: VersionedObservation {
+                    state: OrbState::known(StableOrbState::Running),
+                    generation: 1,
+                    observed_at_unix_ms: 0,
+                },
+            }
+        };
+        let domains = |p: Option<crate::model::EgressPolicy>| p.map(|p| p.parts().0);
+        let restricted = orb("t", "t");
+        // Spilled to t@arm64: the orb records its type, t.
+        let spilled = orb("t", "t@arm64");
+        let edited = offerings(", egress: { domains: [a.example, b.example] }");
+        for o in [&restricted, &spilled] {
+            assert_eq!(
+                domains(current_egress(&created, o)),
+                Some(vec!["a.example".to_owned()])
+            );
+            assert_eq!(
+                domains(current_egress(&edited, o)),
+                Some(vec!["a.example".to_owned(), "b.example".to_owned()])
+            );
+            assert_eq!(current_egress(&offerings(""), o), None, "egress removed");
+        }
+        let mut renamed = restricted.clone();
+        renamed.offering_id = OfferingId::new("gone");
+        assert_eq!(current_egress(&edited, &renamed), None);
+        // An unrestricted orb of a type that gained egress stays unrestricted.
+        let plain = orb("t", "u");
+        assert_eq!(current_egress(&edited, &plain), None);
+    }
 
     #[test]
     fn memory_fits_overcommitted_capacity_only_while_the_host_has_it() {

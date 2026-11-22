@@ -95,4 +95,22 @@ pub struct OrbDefinition {
     pub offering_id: OfferingId,
     pub spec: OrbSpec,
     pub spec_digest: SpecDigest,
+    /// For an orb whose spec restricts egress: its orb type's policy as the coordinator
+    /// has it now, which the agent applies at the orb's next launch (an operator's edit
+    /// of the list reaches existing orbs then). None (the type lost `egress` or is gone):
+    /// the agent keeps the policy the orb last launched with. Not sent for an
+    /// unrestricted spec, which no later setting restricts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<super::EgressPolicy>,
+}
+
+impl OrbDefinition {
+    /// Whether the orb's spec restricts its egress, and with what as far as this
+    /// definition knows: its orb type's current policy, else the one in its spec. (An
+    /// agent prefers the policy the orb last launched with to the spec's, and also
+    /// restricts orbs its own records say are restricted: see `runtime::vm::egress`.)
+    pub fn egress_policy(&self) -> Option<&super::EgressPolicy> {
+        let recorded = self.spec.template.requirements.egress.as_ref()?;
+        Some(self.egress.as_ref().unwrap_or(recorded))
+    }
 }

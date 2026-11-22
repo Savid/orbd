@@ -381,7 +381,7 @@ impl QemuRuntime {
             None => None,
         };
         if cfg!(target_os = "linux") {
-            net::prepare_host(&config.egress, &config.dns_servers)
+            super::vm::egress::prepare(state_dir, &config.egress, &config.dns_servers)
                 .map_err(|e| other("network", &e))?;
         }
         let cpu = CpuIdentity::host();
@@ -867,7 +867,7 @@ impl QemuRuntime {
         self.verify_base(&recipe)?;
         self.check_net(&recipe.net)?;
         let ids = self.jail_ids(orb.id)?;
-        adopt_net(&recipe.net, ids).await?;
+        adopt_net(orb, &self.orb_paths(orb.id).dir, &recipe.net, ids).await?;
         let nested =
             super::needs_nested_kvm(orb) && self.nested_kvm && !self.config.refuse_nested_kvm;
         let config = self.boot_config(&recipe, nested)?;
@@ -938,8 +938,11 @@ impl QemuRuntime {
         let net = if cfg!(target_os = "linux") {
             let ids = self.jail_ids(orb.id)?;
             let (id, state, network) = (orb.id, self.state_dir.clone(), self.config.guest_network);
-            match tokio::task::spawn_blocking(move || NetAttachment::tap(id, &state, network, ids))
-                .await
+            let restricted = orb.egress_policy().is_some();
+            match tokio::task::spawn_blocking(move || {
+                NetAttachment::tap(id, &state, network, ids, restricted)
+            })
+            .await
             {
                 Ok(Ok(net)) => net,
                 Ok(Err(e)) => {
@@ -1240,7 +1243,7 @@ impl QemuRuntime {
         self.verify_base(&recipe)?;
         self.check_net(&recipe.net)?;
         let ids = self.jail_ids(orb.id)?;
-        adopt_net(&recipe.net, ids).await?;
+        adopt_net(orb, &self.orb_paths(orb.id).dir, &recipe.net, ids).await?;
         let started = Instant::now();
         let proc = self
             .launch(
@@ -1358,6 +1361,9 @@ impl Runtime for QemuRuntime {
             nested_state_qualified: false,
             project_snapshots: true,
             arch: crate::model::Arch::HOST,
+            // Linux orbs have their own filtered network namespaces; macOS orbs QEMU's
+            // user network.
+            egress_policy: cfg!(target_os = "linux") && super::vm::egress::enforced(),
         }
     }
 
@@ -1388,6 +1394,11 @@ impl Runtime for QemuRuntime {
         // policy.
         if self.config.refuse_nested_kvm && super::needs_nested_kvm(orb) {
             return Err(RuntimeError::Unsupported(super::NESTED_KVM_REFUSED.into()));
+        }
+        if orb.egress_policy().is_some()
+            && !(cfg!(target_os = "linux") && super::vm::egress::enforced())
+        {
+            return Err(RuntimeError::Unsupported(super::EGRESS_REFUSED.into()));
         }
         let fence = self.fence.clone();
         tokio::task::spawn_blocking(move || fence.check())

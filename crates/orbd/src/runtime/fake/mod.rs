@@ -116,6 +116,7 @@ pub struct FakeRuntime {
     state_dir: PathBuf,
     memory_preserving: bool,
     arch: crate::model::Arch,
+    egress_policy: bool,
     /// Serializes read-modify-write of state files (held only for sync file IO).
     lock: Mutex<()>,
 }
@@ -127,6 +128,7 @@ impl FakeRuntime {
             state_dir,
             memory_preserving: config.memory_preserving_sleep,
             arch: config.arch,
+            egress_policy: config.egress_policy,
             lock: Mutex::new(()),
         }
     }
@@ -202,6 +204,7 @@ impl Runtime for FakeRuntime {
             nested_state_qualified: false,
             project_snapshots: true,
             arch: self.arch,
+            egress_policy: self.egress_policy,
         }
     }
 
@@ -232,6 +235,9 @@ impl Runtime for FakeRuntime {
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
         check_ctx(ctx)?;
+        if orb.egress_policy().is_some() && !self.egress_policy {
+            return Err(RuntimeError::Unsupported(super::EGRESS_REFUSED.into()));
+        }
         delay("fake::start::delay", ctx).await?;
         fail::fail_point!("fake::start", |a| Err(RuntimeError::Other(injected(a))));
         self.update(orb.id, |st| {

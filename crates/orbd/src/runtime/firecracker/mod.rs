@@ -282,7 +282,8 @@ impl FirecrackerRuntime {
             path,
             version,
         };
-        net::prepare_host(&config.egress, &config.dns_servers).map_err(|e| other("network", &e))?;
+        super::vm::egress::prepare(state_dir, &config.egress, &config.dns_servers)
+            .map_err(|e| other("network", &e))?;
         let jail = match config.jail {
             Some(s) => {
                 let j = Jailer::new(s, state_dir, run_dir).map_err(|e| other("jail", &e))?;
@@ -689,7 +690,7 @@ impl FirecrackerRuntime {
     async fn boot(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), RuntimeError> {
         let recipe = self.read_recipe(orb.id)?;
         let ids = self.jail_ids(orb.id)?;
-        adopt_net(&recipe.net, ids).await?;
+        adopt_net(orb, &self.orb_paths(orb.id).dir, &recipe.net, ids).await?;
         let machine = self.machine(&recipe)?;
         let proc = self
             .launch(orb.id, LaunchKind::Boot, machine.clone(), &recipe.net, ctx)
@@ -840,25 +841,27 @@ impl FirecrackerRuntime {
         // anything is built.
         let ids = self.jail_ids(orb.id)?;
         let (id, state, network) = (orb.id, self.state_dir.clone(), self.config.guest_network);
+        let restricted = orb.egress_policy().is_some();
         let staging = self.state_dir.join("staging").join(format!(
             "orb-{}-{}",
             orb.id,
             uuid::Uuid::new_v4().simple()
         ));
-        let net =
-            match tokio::task::spawn_blocking(move || NetAttachment::tap(id, &state, network, ids))
-                .await
-            {
-                Ok(Ok(net)) => net,
-                Ok(Err(e)) => {
-                    self.undo_create(orb.id, &staging);
-                    return Err(RuntimeError::Other(format!("network: {e}")));
-                }
-                Err(e) => {
-                    self.undo_create(orb.id, &staging);
-                    return Err(RuntimeError::Other(e.to_string()));
-                }
-            };
+        let net = match tokio::task::spawn_blocking(move || {
+            NetAttachment::tap(id, &state, network, ids, restricted)
+        })
+        .await
+        {
+            Ok(Ok(net)) => net,
+            Ok(Err(e)) => {
+                self.undo_create(orb.id, &staging);
+                return Err(RuntimeError::Other(format!("network: {e}")));
+            }
+            Err(e) => {
+                self.undo_create(orb.id, &staging);
+                return Err(RuntimeError::Other(e.to_string()));
+            }
+        };
         let recipe = VmRecipe {
             orb: orb.id,
             vcpus: res.vcpus,
@@ -1130,7 +1133,7 @@ impl FirecrackerRuntime {
         let manifest = self.restorable(orb.id, g)?;
         let recipe = self.read_recipe(orb.id)?;
         let ids = self.jail_ids(orb.id)?;
-        adopt_net(&recipe.net, ids).await?;
+        adopt_net(orb, &self.orb_paths(orb.id).dir, &recipe.net, ids).await?;
         let dir = self.checkpoints(orb.id).published(g);
         let started = Instant::now();
         let proc = self
@@ -1226,6 +1229,7 @@ impl Runtime for FirecrackerRuntime {
             nested_state_qualified: false,
             project_snapshots: true,
             arch: crate::model::Arch::HOST,
+            egress_policy: super::vm::egress::enforced(),
         }
     }
 
@@ -1244,6 +1248,10 @@ impl Runtime for FirecrackerRuntime {
         source: StartSource,
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
+        // Also when the coordinator asks for it anyway: never started open.
+        if orb.egress_policy().is_some() && !super::vm::egress::enforced() {
+            return Err(RuntimeError::Unsupported(super::EGRESS_REFUSED.into()));
+        }
         let _g = bounded(ctx, self.locks.lock(orb.id)).await?;
         match source {
             StartSource::NewDisk(src) => {

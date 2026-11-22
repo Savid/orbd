@@ -149,6 +149,8 @@ fn capabilities() -> BackendCapabilities {
             compute: SleepingCompute::Released,
         },
         nested_kvm: Support::Supported,
+        // Boat's network is its own.
+        egress_policy: Support::Unsupported,
         project_snapshots: SnapshotCapability::Unsupported,
         capacity: CapacityModel::QuotaLimited,
         resume_locality: ResumeLocality::BackendManaged,

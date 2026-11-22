@@ -1,0 +1,33 @@
+#!/bin/sh
+# The guest's kernel hardening as `security: <name>=<value>` lines: the active LSMs, the
+# sysctls guest/rootfs/etc/sysctl.d sets, and what an unprivileged process (`user`, no
+# capabilities) may do. Printed three times, because kernel messages can garble a single
+# line on the serial console.
+sysctls="kernel.yama.ptrace_scope kernel.kptr_restrict kernel.dmesg_restrict
+    kernel.unprivileged_bpf_disabled net.core.bpf_jit_harden fs.suid_dumpable
+    dev.tty.legacy_tiocsti vm.mmap_min_addr"
+as_user() { setpriv --reuid=user --regid=user --init-groups --reset-env sh -c "$1"; }
+probe() { if "$@" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
+
+lines() {
+    echo "lsm=$(cat /sys/kernel/security/lsm 2>&1)"
+    for s in $sysctls; do
+        echo "$s=$(cat "/proc/sys/$(echo "$s" | tr . /)" 2>&1)"
+    done
+    echo "root-dmesg=$(probe dmesg)"
+    as_user '
+        probe() { if "$@" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
+        # Memory of a non-descendant (the shell that started it), then of its own child.
+        echo "user-mem-parent=$(probe sh -c "exec 3</proc/\$PPID/mem")"
+        echo "user-mem-child=$(probe sh -c "sleep 30 >/dev/null 2>&1 & c=\$!; exec 3</proc/\$c/mem; kill \$c")"
+        # Yama checks attach access only: the environment of the parent stays readable.
+        echo "user-environ-parent=$(probe sh -c "cat /proc/\$PPID/environ")"
+        echo "user-dmesg=$(probe dmesg)"
+        echo "user-userns=$(probe unshare --user --map-root-user true)"
+    '
+}
+
+for _ in 1 2 3; do
+    lines | sed 's/^/security: /'
+    sleep 5
+done

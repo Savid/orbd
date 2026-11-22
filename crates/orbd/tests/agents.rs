@@ -266,3 +266,72 @@ fn agents_refuse_images_their_allowlist_does_not_name() {
             .contains("only images ORBD_IMAGE_ALLOW lists are prepared and run")
     );
 }
+
+/// An orb type with restricted egress (`egress`) goes only to agents that enforce it
+/// (here a fake runtime with `egress_policy`), never to one that does not (as Docker and
+/// macOS agents, and fake runtimes by default), and an orb of it does not wake on its
+/// host once that host no longer enforces it. Orb types without `egress` go anywhere.
+#[test]
+fn restricted_egress_goes_only_to_agents_that_enforce_it() {
+    let mut c = Cluster::new(&["open"], 4);
+    let path = c.root().join("coordinator.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let head = yaml.split("offerings:").next().unwrap();
+    let fake = "runtime: fake\n    resources: { vcpus: 2, memory_mib: 2048, disk_gib: 4 }";
+    std::fs::write(
+        &path,
+        format!(
+            "{head}offerings:\n  - id: {OFFERING}\n    {fake}\n    \
+             egress: {{ domains: [ampcode.com, \"*.ampcode.com\"], allow: [\"tcp:203.0.113.0/24:443\"] }}\n\
+             \x20 - id: plain\n    {fake}\n"
+        ),
+    )
+    .unwrap();
+    let agent_yaml = |enforces: bool| {
+        format!(
+            "runtime:\n  fake:\n    memory_preserving_sleep: true\n    egress_policy: {enforces}\n    \
+             disk: {{ free_gib: 1000, total_gib: 2000 }}\n"
+        )
+    };
+    c.set_agent_yaml("open", &agent_yaml(false));
+    c.start_all();
+
+    let refused = c.dispatch("spawn", "amp-1", &[]);
+    assert_ne!(
+        refused.code, 0,
+        "a restricted orb went to an agent that does not enforce it"
+    );
+    assert!(c.fake_orbs("open").is_empty());
+    c.offering = "plain".into();
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "unrestricted");
+    assert_eq!(c.fake_orbs("open").len(), 1);
+
+    c.set_agent_yaml("strict", &agent_yaml(true));
+    c.start_agent("strict", "");
+    c.wait_connected(2);
+    wait_until(Duration::from_secs(20), "strict reported its disk", || {
+        c.metrics()
+            .unwrap_or_default()
+            .contains("orbd_agent_disk_free_bytes{agent=\"strict\"}")
+    });
+    c.offering = OFFERING.into();
+    assert_ok(&c.dispatch("spawn", "amp-3", &[]), "restricted");
+    assert_eq!(c.fake_orbs("strict").len(), 1, "the agent that enforces it");
+    assert_eq!(c.fake_orbs("open").len(), 1, "only the unrestricted orb");
+
+    // Its host stops enforcing it (e.g. downgraded): it stays asleep there.
+    assert_ok(&c.dispatch("pause", "amp-3", &[]), "pause");
+    c.kill_agent("strict");
+    c.set_agent_yaml("strict", &agent_yaml(false));
+    c.start_agent("strict", "");
+    c.wait_connected(2);
+    let job = c.dispatch("spawn", "amp-3", &[]);
+    assert_ne!(
+        job.code, 0,
+        "a restricted orb woke on a host that does not enforce it"
+    );
+    let out = format!("{}{}", job.stdout, job.stderr);
+    assert!(out.contains("restricted egress"), "{out}");
+    assert!(!c.only_orb("strict").running);
+    assert_ok(&c.dispatch("delete", "amp-3", &[]), "delete");
+}

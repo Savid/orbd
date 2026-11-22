@@ -92,7 +92,7 @@ pub enum SnapshotRequirement {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CapabilityRequirements {
     /// Paused orbs must not hold compute (host RAM / billed compute).
     pub release_compute_when_paused: bool,
@@ -102,6 +102,13 @@ pub struct CapabilityRequirements {
     /// specs recorded before it existed serialize (and digest) unchanged.
     #[serde(default, skip_serializing_if = "Arch::is_amd64")]
     pub arch: Arch,
+    /// Restricted egress (the orb type's `egress`): the orb reaches only what the policy
+    /// lists, on an agent that enforces it. Recorded when the orb is created, so it is
+    /// restricted for life; the policy an agent applies at each launch is the orb type's
+    /// current one ([`super::OrbDefinition::egress`]). Left out when unrestricted, so
+    /// such specs serialize (and digest) as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<super::EgressPolicy>,
 }
 
 /// CPU architecture of an orb and of the hosts that can run it.
