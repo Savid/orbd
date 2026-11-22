@@ -106,6 +106,15 @@ enum Command {
         #[arg(long)]
         kernel: Option<PathBuf>,
     },
+    /// Connects to ADDR with this process's credentials: the agent's egress fence probe,
+    /// run through `orbd-netgroup` (internal).
+    #[command(hide = true)]
+    FenceProbe {
+        addr: std::net::SocketAddr,
+        /// The group it must run with.
+        #[arg(long)]
+        gid: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -238,7 +247,7 @@ struct AgentArgs {
     /// that is not always on (orbs stay on the agent they were created on).
     #[arg(long, env = "ORBD_OVERFLOW")]
     overflow: bool,
-    /// Private destinations Firecracker orbs may reach, comma-separated
+    /// Private destinations VM orbs may reach, comma-separated
     /// `<tcp|udp|any>:<address or CIDR>[:<port or range>]`, e.g.
     /// `udp:192.168.2.201:41641,tcp:10.0.0.0/8:8000-8100`. Otherwise they reach the
     /// internet only: the LAN, a tailnet's 100.64.0.0/10, loopback, multicast,
@@ -246,10 +255,61 @@ struct AgentArgs {
     /// is. Their DNS servers are allowed on port 53.
     #[arg(long, env = "ORBD_EGRESS_ALLOW", value_delimiter = ',')]
     egress_allow: Vec<String>,
-    /// Let Firecracker orbs reach every private destination, the host's LAN included
-    /// (orbd before 0.2; cloud metadata stays blocked).
+    /// Let VM orbs reach every private destination, the host's LAN included (orbd
+    /// before 0.2; cloud metadata stays blocked).
     #[arg(long, env = "ORBD_ALLOW_PRIVATE_EGRESS")]
     allow_private_egress: bool,
+    /// Jail each VMM on Linux (`on`, `off`): its orb's own uid, no capabilities, only its
+    /// orb's files mounted. On, a Linux VM agent must run as root and launches no VMM the
+    /// jail cannot hold; `off` runs VMMs unjailed as the agent's user (unsafe; for
+    /// development only).
+    #[arg(long, env = "ORBD_VMM_JAIL", default_value_t = Default::default())]
+    vmm_jail: orbd::config::agent::JailMode,
+    /// First uid and gid of jailed VMMs; each orb's VMM gets its own above it.
+    #[arg(long, env = "ORBD_VMM_JAIL_UID_BASE", default_value_t = orbd::config::agent::DEFAULT_JAIL_UID_BASE)]
+    vmm_jail_uid_base: u32,
+    /// Log every new connection an orb in orbd's network namespaces (Firecracker) starts:
+    /// one `orbd::flow` event with the orb, its Amp orb and thread, protocol,
+    /// destination and whether the egress policy accepted or dropped it.
+    #[arg(long, env = "ORBD_FLOW_LOG")]
+    flow_log: bool,
+    /// Run orbs only in VMs (QEMU, Firecracker), never in Docker containers: start only
+    /// if a VM runtime is usable, and refuse a Docker runtime that is configured or that
+    /// this agent was set up with.
+    #[arg(long, env = "ORBD_VM_ONLY")]
+    vm_only: bool,
+    /// Give orbs of types with `kvm` their `/dev/kvm` (nested virtualization in QEMU).
+    /// `false`: this agent advertises no nested KVM, so the coordinator places no such orb
+    /// here, and it refuses to start one itself (e.g. one created here earlier).
+    #[arg(
+        long,
+        env = "ORBD_NESTED_KVM",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    nested_kvm: bool,
+    /// macOS: start QEMU orbs even when pf does not verifiably block their network group
+    /// (`runtime.qemu.network_group`); they then reach whatever the Mac can, its LAN
+    /// included.
+    #[arg(long, env = "ORBD_ALLOW_UNFENCED_EGRESS")]
+    allow_unfenced_egress: bool,
+    /// Images this agent prepares and runs, comma-separated: `<repository>` (any tag or
+    /// digest), `<repository>:<tag>`, `<repository>@<digest>` or `<registry>/<prefix>*`,
+    /// e.g. `us-central1-docker.pkg.dev/amp-prod-0/amp-orb/*`. Spawns of other images
+    /// fail, and they are not prewarmed [default: any image].
+    #[arg(long, env = "ORBD_IMAGE_ALLOW", value_delimiter = ',')]
+    image_allow: Vec<String>,
+    /// How Linux agents run umoci and mkfs.ext4 over image content: `on`, as root of a
+    /// user namespace that sees nothing else of the host (an agent that cannot build one,
+    /// e.g. one not running as root, refuses to start); `off`, as real root (unsafe:
+    /// whoever sets an orb's image then feeds root-run tar and ext4 tooling).
+    #[arg(long, env = "ORBD_IMAGE_SANDBOX", default_value = "on", value_parser = ["on", "off"])]
+    image_sandbox: String,
+    /// First of the 65536 host uids and gids the image sandbox maps (its 0..65535);
+    /// nothing on the host may use them.
+    #[arg(long, env = "ORBD_IMAGE_SANDBOX_UID_BASE", default_value_t = orbd::config::agent::DEFAULT_IMAGE_SANDBOX_UID_BASE)]
+    image_sandbox_uid_base: u32,
     /// Optional YAML with advanced runtime and image settings.
     #[arg(long, short, env = "ORBD_AGENT_CONFIG")]
     config: Option<PathBuf>,
@@ -310,6 +370,9 @@ fn main() -> anyhow::Result<()> {
             e.exit()
         }
     };
+    if let Command::FenceProbe { addr, gid } = cli.command {
+        std::process::exit(orbd::runtime::qemu::fence::probe_main(addr, gid));
+    }
     orbd::configure_failpoints();
     let rt = tokio::runtime::Runtime::new()?;
     use orbd::backend::fleet::admin;
@@ -319,6 +382,7 @@ fn main() -> anyhow::Result<()> {
             let code = rt.block_on(orbd::amp::dispatch::run_from_env());
             std::process::exit(code);
         }
+        Command::FenceProbe { .. } => unreachable!("handled above"),
         Command::Doctor { config, kernel } => {
             let ok = orbd::doctor::run(&orbd::doctor::DoctorOptions { config, kernel })?;
             std::process::exit(if ok { 0 } else { 1 });
@@ -429,7 +493,8 @@ fn main() -> anyhow::Result<()> {
                 Some(p) => orbd::config::agent::AgentConfig::load(p)?,
                 None => Default::default(),
             };
-            let mut s = orbd::config::agent::AgentSection::new(a.state_dir);
+            // Absolute: jailed VMMs resolve the paths of their files from their own root.
+            let mut s = orbd::config::agent::AgentSection::new(std::path::absolute(&a.state_dir)?);
             s.dns_servers = a.dns;
             s.guest_network = a.guest_network;
             s.capacity = orbd::config::agent::CapacityOverrides {
@@ -442,11 +507,44 @@ fn main() -> anyhow::Result<()> {
             s.metrics_listen = a.metrics_listen;
             s.coordinator_url = a.coordinator_url;
             s.overflow = a.overflow;
+            s.vm_only = a.vm_only;
+            s.refuse_nested_kvm = !a.nested_kvm;
+            s.allow_unfenced_egress = a.allow_unfenced_egress;
             s.checkpoint_max_age = orbd::config::agent::AgentSection::checkpoint_max_age_hours(
                 a.checkpoint_max_age_hours,
             );
             s.egress = orbd::config::agent::Egress::new(a.allow_private_egress, &a.egress_allow)
                 .map_err(anyhow::Error::msg)?;
+            s.vmm_jail = a.vmm_jail;
+            s.vmm_jail_uid_base = a.vmm_jail_uid_base;
+            s.egress.flow_log = a.flow_log;
+            s.image_allow = orbd::config::agent::ImageAllow::new(&a.image_allow)
+                .map_err(|e| anyhow::anyhow!("ORBD_IMAGE_ALLOW: {e}"))?;
+            s.image_sandbox = orbd::config::agent::ImageSandbox::new(
+                a.image_sandbox == "on",
+                a.image_sandbox_uid_base,
+            )
+            .map_err(anyhow::Error::msg)?;
+            // Jailed VMMs and image sandboxes must never share a host uid.
+            if let (orbd::config::agent::ImageSandbox::On { uid_base: sb }, false) = (
+                s.image_sandbox,
+                s.vmm_jail == orbd::config::agent::JailMode::Off,
+            ) {
+                let jail =
+                    u64::from(s.vmm_jail_uid_base)..=u64::from(s.vmm_jail_uid_base) + (1 << 24);
+                let sandbox = u64::from(sb)
+                    ..u64::from(sb) + u64::from(orbd::config::agent::IMAGE_SANDBOX_IDS);
+                if jail.start() < &sandbox.end && &sandbox.start <= jail.end() {
+                    anyhow::bail!(
+                        "ORBD_VMM_JAIL_UID_BASE ({}..={}) overlaps ORBD_IMAGE_SANDBOX_UID_BASE \
+                         ({}..{}): jailed VMMs and image builds must not share host uids",
+                        jail.start(),
+                        jail.end(),
+                        sandbox.start,
+                        sandbox.end
+                    );
+                }
+            }
             config.agent = s;
             rt.block_on(async {
                 let shutdown = shutdown_on_signal();

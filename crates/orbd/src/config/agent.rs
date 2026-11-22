@@ -41,6 +41,8 @@ fn default_images() -> Option<ImagesConfig> {
         prewarm: default_prewarm(),
         refresh_interval_secs: default_refresh_secs(),
         static_images: Vec::new(),
+        allow: ImageAllow::default(),
+        sandbox: ImageSandbox::default(),
     })
 }
 
@@ -101,6 +103,12 @@ pub struct ImagesConfig {
     /// images (development and KVM tests).
     #[serde(default)]
     pub static_images: Vec<StaticImage>,
+    /// Images that may be prepared, prewarmed ones included (from `agent.image_allow`).
+    #[serde(skip)]
+    pub allow: ImageAllow,
+    /// How umoci, du and mkfs.ext4 run without a builder (from `agent.image_sandbox`).
+    #[serde(skip)]
+    pub sandbox: ImageSandbox,
 }
 
 fn default_guest_helper() -> PathBuf {
@@ -149,6 +157,67 @@ pub struct AgentSection {
     /// on their next wake (`ORBD_CHECKPOINT_MAX_AGE_HOURS`; None: kept for as long as
     /// the orb sleeps).
     pub checkpoint_max_age: Option<std::time::Duration>,
+    /// Whether VMMs on Linux run jailed (`ORBD_VMM_JAIL`).
+    pub vmm_jail: JailMode,
+    /// Jailed VMMs run as `vmm_jail_uid_base + <index>` (`ORBD_VMM_JAIL_UID_BASE`).
+    pub vmm_jail_uid_base: u32,
+    /// Never use the Docker runtime (`ORBD_VM_ONLY`): detection fails unless a VM
+    /// runtime is usable, and a configured or recorded Docker runtime is refused.
+    pub vm_only: bool,
+    /// Run no orb with `/dev/kvm` (`ORBD_NESTED_KVM=false`): advertise no nested KVM and
+    /// refuse to start an orb whose type has `kvm`, whatever the coordinator sends.
+    pub refuse_nested_kvm: bool,
+    /// macOS: start QEMU orbs without a verified pf fence (`ORBD_ALLOW_UNFENCED_EGRESS`);
+    /// they then reach whatever the Mac can, its LAN included.
+    pub allow_unfenced_egress: bool,
+    /// Images this agent prepares and runs (`ORBD_IMAGE_ALLOW`; empty: any).
+    pub image_allow: ImageAllow,
+    /// How image preparation runs its tools over image content (`ORBD_IMAGE_SANDBOX`,
+    /// `ORBD_IMAGE_SANDBOX_UID_BASE`).
+    pub image_sandbox: ImageSandbox,
+}
+
+/// `ORBD_VMM_JAIL`: whether QEMU and Firecracker run jailed on Linux (each VMM under its
+/// orb's own uid, with no capabilities, in a mount namespace with only its orb's files;
+/// see `runtime::vm::jail`). macOS QEMU always runs in its Seatbelt sandbox.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JailMode {
+    /// The default: a Linux VM agent runs as root and jails every VMM, or does not start.
+    #[default]
+    On,
+    /// VMMs run as the agent's user, unjailed: unsafe, for development only.
+    Off,
+}
+
+impl std::str::FromStr for JailMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "1" | "" => Ok(Self::On),
+            "off" | "false" | "0" => Ok(Self::Off),
+            other => Err(format!("{other:?}: expected on or off")),
+        }
+    }
+}
+
+impl std::fmt::Display for JailMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::On => "on",
+            Self::Off => "off",
+        })
+    }
+}
+
+/// Default first uid and gid of jailed VMMs (1.4e9 and up are image builds' user
+/// namespaces).
+pub const DEFAULT_JAIL_UID_BASE: u32 = 1_300_000_000;
+
+/// The jail Linux VMMs run in: orb `n`'s VMM (n from 1) gets uid and gid `uid_base + n`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VmmJail {
+    pub uid_base: u32,
 }
 
 pub const DEFAULT_DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
@@ -236,12 +305,13 @@ impl std::str::FromStr for GuestNetwork {
     }
 }
 
-/// Which private destinations Firecracker orbs may reach. By default they get the
+/// Which private destinations VM orbs on Linux may reach. By default they get the
 /// internet only: private, shared (a tailnet's 100.64.0.0/10), loopback, multicast,
 /// documentation and reserved IPv4 destinations are dropped for their traffic, except
 /// what `allow` names and the orbs' DNS servers (port 53). Cloud metadata endpoints,
 /// IPv6 and the agent itself stay blocked whatever this says, and the agent's own
-/// traffic is never affected. QEMU and Docker orbs are not filtered by orbd.
+/// traffic is never affected. Docker orbs and macOS orbs (fenced by pf instead, see
+/// `QemuRuntimeConfig::network_group`) are not filtered by orbd.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Egress {
     /// Orbs may reach every private destination (`ORBD_ALLOW_PRIVATE_EGRESS`): orbd
@@ -249,6 +319,9 @@ pub struct Egress {
     pub allow_private: bool,
     /// Private destinations orbs may reach anyway (`ORBD_EGRESS_ALLOW`).
     pub allow: Vec<EgressRule>,
+    /// Log every new connection an orb starts, with the verdict (`ORBD_FLOW_LOG`; see
+    /// `runtime::vm::flowlog`).
+    pub flow_log: bool,
 }
 
 impl Egress {
@@ -271,6 +344,7 @@ impl Egress {
         Ok(Self {
             allow_private,
             allow,
+            flow_log: false,
         })
     }
 }
@@ -387,6 +461,205 @@ impl std::str::FromStr for EgressRule {
     }
 }
 
+/// Which images an agent prepares and runs (`ORBD_IMAGE_ALLOW`), checked on the agent
+/// before an image is resolved or pulled, for every spawn of a new disk and every
+/// prewarmed image. Empty allows any image. Each pattern is one of
+///
+/// * `<repository>`: any tag or digest of it, e.g. `ghcr.io/acme/orb`;
+/// * `<repository>:<tag>`: that tag only (a reference that also pins a digest is
+///   pulled by its digest, so it needs a digest or repository pattern);
+/// * `<repository>@<digest>`: that manifest only;
+/// * `<registry>/<prefix>*`: every repository whose name starts with it, e.g.
+///   `us-central1-docker.pkg.dev/amp-prod-0/amp-orb/*`.
+///
+/// References are compared in full (`debian` is `docker.io/library/debian:latest`, a
+/// reference without tag is `:latest`), the image as Amp names it (before arm64's
+/// `-arm64` repository).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImageAllow(Vec<ImagePattern>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ImagePattern {
+    /// `registry/repository`
+    Repository(String),
+    Tag(String, String),
+    Digest(String, String),
+    /// `registry/` and the start of a repository name.
+    Prefix(String),
+}
+
+impl std::fmt::Display for ImagePattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repository(r) => write!(f, "{r}"),
+            Self::Tag(r, t) => write!(f, "{r}:{t}"),
+            Self::Digest(r, d) => write!(f, "{r}@{d}"),
+            Self::Prefix(p) => write!(f, "{p}*"),
+        }
+    }
+}
+
+impl std::str::FromStr for ImagePattern {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = |why: &str| {
+            format!(
+                "{s:?}: {why} (expected <repository>, <repository>:<tag>, \
+                 <repository>@<digest> or <registry>/<prefix>*)"
+            )
+        };
+        let s = s.trim();
+        if let Some(prefix) = s.strip_suffix('*') {
+            if prefix.is_empty() {
+                return Err(bad(
+                    "`*` alone would allow every image: leave ORBD_IMAGE_ALLOW empty",
+                ));
+            }
+            let (registry, rest) = prefix
+                .split_once('/')
+                .filter(|(r, _)| r.contains(['.', ':']) || *r == "localhost")
+                .ok_or_else(|| bad("a prefix starts with a registry, e.g. ghcr.io/acme/*"))?;
+            if !rest
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-/".contains(c))
+            {
+                return Err(bad(
+                    "a prefix names repositories: lowercase, no tag, digest or inner `*`",
+                ));
+            }
+            let registry = if registry == "index.docker.io" {
+                "docker.io"
+            } else {
+                registry
+            };
+            return Ok(Self::Prefix(format!("{registry}/{rest}")));
+        }
+        if s.contains('*') {
+            return Err(bad("`*` only ends a prefix"));
+        }
+        let r: oci_client::Reference = s.parse().map_err(|e| bad(&format!("{e}")))?;
+        let repo = format!("{}/{}", r.registry(), r.repository());
+        let tagged = s.rsplit('/').next().is_some_and(|last| last.contains(':'));
+        Ok(match (r.digest(), r.tag()) {
+            (Some(d), _) => Self::Digest(repo, d.to_owned()),
+            (None, Some(t)) if tagged => Self::Tag(repo, t.to_owned()),
+            _ => Self::Repository(repo),
+        })
+    }
+}
+
+impl ImagePattern {
+    fn matches(&self, r: &oci_client::Reference) -> bool {
+        let repo = format!("{}/{}", r.registry(), r.repository());
+        match self {
+            Self::Repository(x) => repo == *x,
+            Self::Tag(x, t) => repo == *x && r.digest().is_none() && r.tag() == Some(t),
+            Self::Digest(x, d) => repo == *x && r.digest() == Some(d),
+            Self::Prefix(p) => repo.starts_with(p),
+        }
+    }
+}
+
+impl ImageAllow {
+    /// From `ORBD_IMAGE_ALLOW` entries (empty ones are skipped).
+    pub fn new(entries: &[String]) -> Result<Self, String> {
+        entries
+            .iter()
+            .filter(|e| !e.trim().is_empty())
+            .map(|e| e.parse())
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+
+    /// Any image is allowed.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `image_ref` (as Amp gives it) may be prepared and run here; the error
+    /// names the setting that refused it.
+    pub fn check(&self, image_ref: &str) -> Result<(), String> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        let allowed = image_ref
+            .parse::<oci_client::Reference>()
+            .is_ok_and(|r| self.0.iter().any(|p| p.matches(&r)));
+        if allowed {
+            Ok(())
+        } else {
+            Err(format!(
+                "image {image_ref} is not allowed on this agent (ORBD_IMAGE_ALLOW)"
+            ))
+        }
+    }
+}
+
+impl std::fmt::Display for ImageAllow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, p) in self.0.iter().enumerate() {
+            if i > 0 {
+                write!(f, ",")?;
+            }
+            write!(f, "{p}")?;
+        }
+        Ok(())
+    }
+}
+
+/// First of the host ids the image sandbox maps by default: far above regular users and
+/// clear of the per-VM ids (1_300_000_000 and up).
+pub const DEFAULT_IMAGE_SANDBOX_UID_BASE: u32 = 1_400_000_000;
+/// Ids the image sandbox maps: 0..65535 inside.
+pub const IMAGE_SANDBOX_IDS: u32 = 65_536;
+
+/// How a Linux agent without a builder image runs umoci, du and mkfs.ext4 over image
+/// content (`ORBD_IMAGE_SANDBOX`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageSandbox {
+    /// As root of a user namespace whose ids 0..65535 are the host's `uid_base..`, with
+    /// nothing of the host but the tools and the build's own files
+    /// (`ORBD_IMAGE_SANDBOX_UID_BASE`; see `image::sandbox`).
+    On { uid_base: u32 },
+    /// As real root (`sudo -n` when the agent is not root): orbd before the sandbox.
+    /// Unsafe: whoever sets an orb's image then feeds root-run tar and ext4 tooling.
+    Off,
+}
+
+impl Default for ImageSandbox {
+    fn default() -> Self {
+        Self::On {
+            uid_base: DEFAULT_IMAGE_SANDBOX_UID_BASE,
+        }
+    }
+}
+
+impl ImageSandbox {
+    /// From `ORBD_IMAGE_SANDBOX` (on or off) and `ORBD_IMAGE_SANDBOX_UID_BASE`: the base
+    /// must leave ids below 65536 (host root, system and regular users) unmapped and fit
+    /// all 65536 ids below 2^32-1.
+    pub fn new(on: bool, uid_base: u32) -> Result<Self, String> {
+        if !on {
+            return Ok(Self::Off);
+        }
+        if !(IMAGE_SANDBOX_IDS..=u32::MAX - IMAGE_SANDBOX_IDS).contains(&uid_base) {
+            return Err(format!(
+                "ORBD_IMAGE_SANDBOX_UID_BASE={uid_base}: must be between {IMAGE_SANDBOX_IDS} and {}",
+                u32::MAX - IMAGE_SANDBOX_IDS
+            ));
+        }
+        Ok(Self::On { uid_base })
+    }
+
+    pub fn uid_base(&self) -> Option<u32> {
+        match self {
+            Self::On { uid_base } => Some(*uid_base),
+            Self::Off => None,
+        }
+    }
+}
+
 impl AgentSection {
     pub fn new(state_dir: PathBuf) -> Self {
         Self {
@@ -401,6 +674,13 @@ impl AgentSection {
             coordinator_url: None,
             overflow: false,
             checkpoint_max_age: None,
+            vmm_jail: JailMode::On,
+            vmm_jail_uid_base: DEFAULT_JAIL_UID_BASE,
+            vm_only: false,
+            refuse_nested_kvm: false,
+            allow_unfenced_egress: false,
+            image_allow: ImageAllow::default(),
+            image_sandbox: ImageSandbox::default(),
         }
     }
 
@@ -456,9 +736,12 @@ pub struct QemuRuntimeConfig {
     /// Delegated cgroup v2 directory; each QEMU runs in `<cgroup_parent>/orbd-<orb>`,
     /// outside the agent's cgroup, so stopping the agent service leaves VMs running.
     pub cgroup_parent: Option<PathBuf>,
-    /// A group QEMU runs with, through `orbd-netgroup` (on PATH, setgid to it): host
-    /// firewall rules for that group (macOS pf `group`) then confine orb traffic without
-    /// touching the agent's own. The runtime refuses to start while it is not setgid.
+    /// macOS: a group QEMU runs with, through `orbd-netgroup` (on PATH, setgid to it):
+    /// pf `group` rules then confine orb traffic without touching the agent's own. The
+    /// runtime refuses to start while it is not setgid, and orbs start only while pf
+    /// verifiably blocks the group (see `runtime::qemu::fence`), unless
+    /// `ORBD_ALLOW_UNFENCED_EGRESS` is set. Ignored, with a warning, on Linux, where QEMU
+    /// orbs have their own filtered network namespaces.
     pub network_group: Option<String>,
     /// DNS servers delivered to guests (from `agent.dns_servers`).
     #[serde(skip)]
@@ -466,6 +749,20 @@ pub struct QemuRuntimeConfig {
     /// Network for new orbs (from `agent.guest_network`).
     #[serde(skip)]
     pub guest_network: GuestNetwork,
+    /// Private destinations orbs with their own network namespace may reach (from
+    /// `agent.egress`; Linux).
+    #[serde(skip)]
+    pub egress: Egress,
+    /// The jail QEMU runs in (from `agent.vmm_jail*`; Linux); None runs it unjailed.
+    #[serde(skip)]
+    pub jail: Option<VmmJail>,
+    /// Start no orb whose type has `kvm` (from `agent.refuse_nested_kvm`).
+    #[serde(skip)]
+    pub refuse_nested_kvm: bool,
+    /// macOS: start orbs without a verified egress fence (from
+    /// `agent.allow_unfenced_egress`).
+    #[serde(skip)]
+    pub allow_unfenced_egress: bool,
 }
 
 impl Default for QemuRuntimeConfig {
@@ -478,6 +775,10 @@ impl Default for QemuRuntimeConfig {
             network_group: None,
             dns_servers: Vec::new(),
             guest_network: GuestNetwork::default(),
+            egress: Egress::default(),
+            jail: None,
+            refuse_nested_kvm: false,
+            allow_unfenced_egress: false,
         }
     }
 }
@@ -511,6 +812,9 @@ pub struct FirecrackerRuntimeConfig {
     /// Private destinations orbs may reach (from `agent.egress`).
     #[serde(skip)]
     pub egress: Egress,
+    /// The jail Firecracker runs in (from `agent.vmm_jail*`); None runs it unjailed.
+    #[serde(skip)]
+    pub jail: Option<VmmJail>,
 }
 
 impl Default for FirecrackerRuntimeConfig {
@@ -522,6 +826,7 @@ impl Default for FirecrackerRuntimeConfig {
             dns_servers: Vec::new(),
             guest_network: GuestNetwork::default(),
             egress: Egress::default(),
+            jail: None,
         }
     }
 }
@@ -604,7 +909,10 @@ impl AgentConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentSection, Egress, EgressProto, EgressRule, GuestNetwork};
+    use super::{
+        AgentSection, Egress, EgressProto, EgressRule, GuestNetwork, ImageAllow, ImageSandbox,
+        JailMode,
+    };
     use std::time::Duration;
 
     /// Checkpoints are kept for as long as an orb sleeps unless a max age is set; 0
@@ -706,6 +1014,191 @@ mod tests {
             "both settings"
         );
         assert!(Egress::new(false, &list(&["udp:10.0.0.1:53", "bad"])).is_err());
+    }
+
+    fn allow(entries: &[&str]) -> ImageAllow {
+        let entries: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+        ImageAllow::new(&entries).unwrap_or_else(|e| panic!("{entries:?}: {e}"))
+    }
+
+    const AMP: &str = "us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb";
+    const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// An empty list (the default, `ORBD_IMAGE_ALLOW=` and stray commas) allows anything,
+    /// even what is no valid reference (the registry refuses that later).
+    #[test]
+    fn empty_image_allowlist_allows_any_image() {
+        assert!(ImageAllow::default().is_empty());
+        for a in [allow(&[]), allow(&["", " "])] {
+            assert!(a.is_empty());
+            for r in ["debian", "ghcr.io/x/y:z", "Not A Ref"] {
+                assert!(a.check(r).is_ok(), "{r}");
+            }
+        }
+    }
+
+    #[test]
+    fn image_allowlist_patterns() {
+        let latest = format!("{AMP}:latest");
+        let pinned = format!("{AMP}@{DIGEST}");
+        let tag_and_digest = format!("{AMP}:latest@{DIGEST}");
+        let other_tag = format!("{AMP}:canary");
+        let arm = format!("{AMP}-arm64:latest");
+        let sibling = "us-central1-docker.pkg.dev/amp-prod-0/amp-orb/other:1";
+        let elsewhere = "us-central1-docker.pkg.dev/amp-prod-0/elsewhere/amp-orb:latest";
+        let all = [
+            latest.as_str(),
+            AMP, // implicit :latest
+            &pinned,
+            &tag_and_digest,
+            &other_tag,
+            &arm,
+            sibling,
+            elsewhere,
+        ];
+        let check = |a: &ImageAllow, allowed: &[&str]| {
+            for r in all {
+                assert_eq!(a.check(r).is_ok(), allowed.contains(&r), "{a} with {r}");
+            }
+        };
+        // A repository: any tag or digest of it, not other repositories.
+        check(
+            &allow(&[AMP]),
+            &[&latest, AMP, &pinned, &tag_and_digest, &other_tag],
+        );
+        // A tag: that tag only; a digest pins the manifest whatever the tag says.
+        check(&allow(&[&latest]), &[&latest, AMP]);
+        check(&allow(&[&pinned]), &[&pinned, &tag_and_digest]);
+        // A prefix: every repository under it.
+        let prefix = "us-central1-docker.pkg.dev/amp-prod-0/amp-orb/*";
+        check(
+            &allow(&[prefix]),
+            &[
+                &latest,
+                AMP,
+                &pinned,
+                &tag_and_digest,
+                &other_tag,
+                &arm,
+                sibling,
+            ],
+        );
+        check(
+            &allow(&[&format!("{AMP}*")]),
+            &[&latest, AMP, &pinned, &tag_and_digest, &other_tag, &arm],
+        );
+        // Several patterns, with whitespace and an empty entry.
+        check(
+            &allow(&[" ghcr.io/acme/orb ", "", &other_tag]),
+            &[&other_tag],
+        );
+    }
+
+    /// References and patterns are compared in full form: Docker Hub's defaults apply.
+    #[test]
+    fn image_allowlist_normalizes_references() {
+        let a = allow(&[
+            "debian:13",
+            "docker.io/library/alpine",
+            "index.docker.io/acme/*",
+        ]);
+        for ok in [
+            "debian:13",
+            "docker.io/library/debian:13",
+            "index.docker.io/library/debian:13",
+            "alpine",
+            "alpine:3",
+            "acme/orb:1",
+            "docker.io/acme/orb",
+        ] {
+            assert!(a.check(ok).is_ok(), "{ok}");
+        }
+        for refused in [
+            "debian",
+            "debian:12",
+            "ghcr.io/library/alpine",
+            "acmecorp/orb",
+        ] {
+            let e = a.check(refused).unwrap_err();
+            assert!(e.contains("ORBD_IMAGE_ALLOW") && e.contains(refused), "{e}");
+        }
+        assert_eq!(
+            a.to_string(),
+            "docker.io/library/debian:13,docker.io/library/alpine,docker.io/acme/*"
+        );
+        // Not a reference at all: refused when there is a list.
+        assert!(a.check("Not A Ref").is_err());
+        assert!(
+            allow(&["localhost:5000/*"])
+                .check("localhost:5000/x/y:1")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn bad_image_patterns_are_refused() {
+        for bad in [
+            "*",                         // everything: leave the setting empty
+            "acme/*",                    // a prefix needs a registry
+            "debian*",                   // the same
+            "ghcr.io/acme/orb:*",        // no tags in prefixes
+            "ghcr.io/acme/*/orb",        // `*` only at the end
+            "ghcr.io/Acme/*",            // repository names are lowercase
+            "ghcr.io/Acme/orb",          // not a reference (uppercase)
+            "ghcr.io/acme/orb@sha256:1", // bad digest
+        ] {
+            assert!(
+                ImageAllow::new(&[bad.to_string()]).is_err(),
+                "{bad:?} parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn image_sandbox_settings() {
+        assert_eq!(
+            ImageSandbox::default(),
+            ImageSandbox::On {
+                uid_base: 1_400_000_000
+            }
+        );
+        assert_eq!(
+            AgentSection::new("/s".into()).image_sandbox,
+            ImageSandbox::default()
+        );
+        assert_eq!(ImageSandbox::new(false, 0), Ok(ImageSandbox::Off));
+        assert_eq!(ImageSandbox::Off.uid_base(), None);
+        assert_eq!(
+            ImageSandbox::new(true, 200_000).unwrap().uid_base(),
+            Some(200_000)
+        );
+        // Never host root or ordinary users, and all 65536 ids below 2^32-1.
+        for bad in [0, 1000, 65_535, u32::MAX - 65_535, u32::MAX] {
+            assert!(ImageSandbox::new(true, bad).is_err(), "{bad}");
+        }
+        assert!(ImageSandbox::new(true, u32::MAX - 65_536).is_ok());
+    }
+
+    #[test]
+    fn jail_mode_parsing() {
+        for (s, m) in [
+            ("", JailMode::On),
+            ("on", JailMode::On),
+            ("TRUE", JailMode::On),
+            ("1", JailMode::On),
+            ("off", JailMode::Off),
+            ("false", JailMode::Off),
+            (" 0 ", JailMode::Off),
+        ] {
+            assert_eq!(s.parse::<JailMode>().unwrap(), m, "{s:?}");
+        }
+        assert!("maybe".parse::<JailMode>().is_err());
+        assert!("auto".parse::<JailMode>().is_err());
+        assert_eq!(JailMode::default(), JailMode::On);
+        assert_eq!(
+            JailMode::Off.to_string().parse::<JailMode>(),
+            Ok(JailMode::Off)
+        );
     }
 
     #[test]

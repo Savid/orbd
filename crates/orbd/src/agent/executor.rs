@@ -844,6 +844,24 @@ impl Run {
                     self.mark_fault(&last_known, reason);
                     return Ok(self.fault_result(last_known, reason));
                 }
+                // Before anything is resolved or pulled, whatever the coordinator sent.
+                let (InitialDiskSource::Image { image_ref }
+                | InitialDiskSource::ProjectSnapshot { image_ref, .. }) =
+                    &self.orb().spec.initial_disk;
+                if let Err(why) = self.sh.config.agent.image_allow.check(image_ref) {
+                    tracing::warn!(orb_id = %orb_id, image_ref, "spawn refused: {why}");
+                    if planned_new {
+                        self.sh
+                            .db
+                            .call(move |c| db::clear_created(c, orb_id))
+                            .await?;
+                    }
+                    return Ok(Finished::fail(
+                        FailureCode::UnsupportedCapability,
+                        why,
+                        ProcessDisposition::NotApplicable,
+                    ));
+                }
                 self.admit()?;
                 self.check()?;
                 if !planned_new {

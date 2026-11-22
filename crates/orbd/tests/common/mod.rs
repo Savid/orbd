@@ -46,6 +46,8 @@ pub struct Cluster {
     pub agent_env: Vec<(String, String)>,
     /// Agents with their own config file instead of the shared `agent.yaml`.
     agent_configs: BTreeMap<String, PathBuf>,
+    /// Agents run this `orbd` instead of the one under test (e.g. an older release).
+    pub agent_bin: Option<PathBuf>,
 }
 
 pub struct Job {
@@ -128,6 +130,7 @@ offerings:
                 vec![("ORBD_DISK_RESERVE_GIB".into(), "1".into())]
             },
             agent_configs: BTreeMap::new(),
+            agent_bin: None,
         }
     }
 
@@ -238,7 +241,10 @@ offerings:
             .unwrap();
         let state = self.root().join("agents").join(id).join("state");
         let n = self.agent_orbs;
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_orbd"));
+        let mut cmd = match &self.agent_bin {
+            Some(bin) => Command::new(bin),
+            None => Command::new(env!("CARGO_BIN_EXE_orbd")),
+        };
         cmd.arg("agent")
             .arg("--state-dir")
             .arg(state)

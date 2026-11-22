@@ -13,6 +13,7 @@ impl QemuRuntime {
     pub(super) fn connector(&self, orb: OrbId) -> VirtioSerialConnector {
         VirtioSerialConnector {
             socket: self.run_paths(orb).guest_sock,
+            server_uid: self.server_uid(orb),
         }
     }
 

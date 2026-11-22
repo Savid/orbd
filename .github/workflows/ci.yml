@@ -227,12 +227,43 @@ jobs:
         env:
           GATES: ${{ matrix.gates }}
         run: |
-          docker run --rm --privileged -v "$PWD:$PWD" -w "$PWD/crates/orbd" \
+          # The README's agent flags (no --privileged), plus SYS_PTRACE for the gates
+          # themselves: they inspect jailed VMMs through /proc/<pid>/root.
+          docker run --rm --cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add SYS_PTRACE \
+            --device /dev/kvm --device /dev/net/tun \
+            --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
+            -v "$PWD:$PWD" -w "$PWD/crates/orbd" \
             -e ORBD_KVM_KERNEL=/usr/share/orbd/bzImage -e "ORBD_KVM_ROOTFS=$PWD/$ROOTFS" -e ORBD_KVM_NESTED \
             -e ORBD_KVM_RUNTIME=${{ matrix.suite }} \
             --entrypoint sh orbd:smoke -c \
             'apt-get update -qq && apt-get install -y -qq procps >/dev/null && exec "$0" --ignored --test-threads=1 --nocapture "$@"' \
             "$(cat gates.txt)" $GATES
+      - if: matrix.suite == 'firecracker' && matrix.part == 'rest'
+        name: Root-only unit tests in the image
+        # The VMM jail, the disk tools and image sandbox as deployed: root in the image with
+        # the README's agent flags. ORBD_TEST_JAIL=1 turns a skipped test into a failure.
+        # Docker's default seccomp refuses pivot_root, so the jail takes its fallback
+        # there; seccomp=unconfined runs its pivot_root path too.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          cargo test --locked -p orbd-vm -p orbd-qemu -p orbd --lib \
+            --target x86_64-unknown-linux-musl --no-run --message-format=json |
+            jq -r 'select(.profile.test == true) | .executable' >libtests.txt
+          exe() { grep "/$1-" libtests.txt; }
+          for seccomp in default unconfined; do
+            docker run --rm --cap-add SYS_ADMIN --cap-add NET_ADMIN \
+              --device /dev/kvm --device /dev/net/tun \
+              --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
+              $([ "$seccomp" = unconfined ] && echo --security-opt seccomp=unconfined) \
+              -e ORBD_TEST_JAIL=1 -v "$PWD:$PWD" -w "$PWD" --entrypoint sh orbd:smoke -c "
+                set -e
+                $(exe orbd_vm) --test-threads=1 jail:: process::
+                $(exe orbd_qemu) --test-threads=1 qmp::
+                $(exe orbd) --test-threads=1 --include-ignored image::sandbox image::rootfs \
+                  snapshots_read_only vmm_sockets_must uids_are ownership_fixups \
+                  install_prefixes log_tails external_data"
+          done
 
       - if: matrix.suite == 'container'
         run: crates/orbd/tests/container-e2e.sh orbd:smoke "$ROOTFS"

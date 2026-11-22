@@ -1,11 +1,14 @@
 //! What the VM runtimes (QEMU, Firecracker) share: durable file operations, checkpoint
-//! directories, VMM process supervision, networking, the guest channel and root disk
-//! images. Each runtime keeps its own launch configuration and the state machine that
+//! directories, VMM process supervision and jails, networking, the guest channel and
+//! root disk images. Each runtime keeps its own launch configuration and the state machine that
 //! interprets its VMM.
 
 pub mod checkpoints;
+pub mod disktools;
+pub mod flowlog;
 pub mod guest;
 pub mod images;
+pub mod jail;
 pub mod net;
 
 pub use orbd_vm::fsutil::{self, create_private_dir};
@@ -51,6 +54,19 @@ pub fn last_used(dir: &Path) -> std::io::Result<std::time::SystemTime> {
     )
 }
 
+/// Makes sure the orb's host network exists before a launch (repaired after a host
+/// reboot; its TAP owned by `owner` for a jailed VMM).
+pub async fn adopt_net(
+    net: &net::NetAttachment,
+    owner: Option<jail::Ids>,
+) -> Result<(), RuntimeError> {
+    let net = net.clone();
+    tokio::task::spawn_blocking(move || net.adopt(owner))
+        .await
+        .map_err(|e| RuntimeError::Other(e.to_string()))?
+        .map_err(|e| RuntimeError::Other(format!("network: {e}")))
+}
+
 /// Runs a host tool with fixed arguments, bounded by the context; killed if cancelled
 /// or late.
 pub async fn run_tool(
@@ -78,14 +94,17 @@ pub async fn run_tool(
     Ok(())
 }
 
-/// `program` itself if it has a directory part, else its first match on PATH.
+/// `program` itself if it has a directory part, else its first match on PATH; made
+/// absolute (jailed processes resolve paths from their own root).
 pub fn on_path(program: &Path) -> Option<PathBuf> {
-    if program.components().count() > 1 {
-        return Some(program.to_owned());
-    }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(program))
-        .find(|p| p.is_file())
+    let found = if program.components().count() > 1 {
+        program.to_owned()
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|d| d.join(program))
+            .find(|p| p.is_file())?
+    };
+    std::path::absolute(found).ok()
 }
 
 /// Stable per-orb systemd machine id (project-snapshot clones get their own).
@@ -95,10 +114,34 @@ pub fn machine_id(orb: OrbId) -> String {
 }
 
 /// Last lines of a log, for error messages.
+/// Reads only the end of the file (a guest or VMM writes it, at any size), never
+/// through a link or from a FIFO.
 pub fn log_tail(path: &Path) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let text = tail_bytes(path, LOG_TAIL_BYTES).unwrap_or_default();
+    let text = String::from_utf8_lossy(&text);
     let lines: Vec<&str> = text.lines().rev().take(5).collect();
     lines.into_iter().rev().collect::<Vec<_>>().join(" | ")
+}
+
+/// How much of a log [`log_tail`] reads.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
+/// The last `max` bytes of the regular file at `path`.
+fn tail_bytes(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    let len = f.metadata()?.len();
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    f.seek(SeekFrom::Start(len.saturating_sub(max)))?;
+    let mut buf = Vec::with_capacity(max as usize);
+    f.take(max).read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 pub fn io_err(e: std::io::Error) -> RuntimeError {
@@ -158,54 +201,6 @@ pub async fn copy_disk(ctx: &OpContext, from: &Path, to: &Path) -> Result<(), Ru
         ],
     )
     .await
-}
-
-/// Shrinks a raw ext4 disk to the blocks its files use, so a snapshot of a big orb fits
-/// any offering; the guest grows its root filesystem to the orb's disk at boot.
-async fn shrink_ext4(ctx: &OpContext, raw: &Path) -> Result<(), RuntimeError> {
-    let path = raw.display().to_string();
-    // resize2fs wants a freshly checked filesystem. Exit 1 means e2fsck fixed something,
-    // such as replaying the journal of this crash-consistent copy.
-    let fsck = bounded(
-        ctx,
-        tokio::process::Command::new("e2fsck")
-            .args(["-f", "-y", &path])
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await?
-    .map_err(|e| RuntimeError::Other(format!("e2fsck: {e}")))?;
-    if !matches!(fsck.status.code(), Some(0 | 1)) {
-        return Err(RuntimeError::Other(format!(
-            "e2fsck: {}",
-            String::from_utf8_lossy(&fsck.stdout).trim()
-        )));
-    }
-    run_tool(ctx, Path::new("resize2fs"), &["-M".into(), path.clone()]).await?;
-    let out = bounded(
-        ctx,
-        tokio::process::Command::new("dumpe2fs")
-            .args(["-h", &path])
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await?
-    .map_err(|e| RuntimeError::Other(format!("dumpe2fs: {e}")))?;
-    let header = String::from_utf8_lossy(&out.stdout);
-    let field = |name: &str| {
-        header
-            .lines()
-            .find_map(|l| l.strip_prefix(name)?.trim().parse::<u64>().ok())
-            .ok_or_else(|| RuntimeError::Other(format!("dumpe2fs: no {name:?} in {path}")))
-    };
-    let bytes = field("Block count:")? * field("Block size:")?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(raw)
-        .and_then(|f| f.set_len(bytes))
-        .map_err(io_err)
 }
 
 /// Whether the project snapshot `key` is already published; if so, records its use
@@ -290,15 +285,18 @@ pub async fn initial_source(
 }
 
 /// Publishes the project snapshot `<state>/projects/<key>/{disk.raw, meta.json}`:
-/// `write_raw` fills a standalone raw disk in staging, which is shrunk to its used size,
+/// `write_raw` fills a standalone raw disk in staging (an empty file lent to `tools`),
+/// which is shrunk to its used size (by `tools`), taken back, made read-only (0444),
 /// fsynced and renamed into place. The format is the same for every VM runtime.
 /// `lineage` is the source orb's (see [`project_lineage`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
     ctx: &OpContext,
     state_dir: &Path,
     key: &ProjectSnapshotKey,
     source_orb: OrbId,
     lineage: Option<String>,
+    tools: &disktools::DiskTools<'_>,
     write_raw: impl FnOnce(PathBuf) -> F,
 ) -> Result<(), RuntimeError> {
     use fsutil::{fsync_dir, remove_via_trash, rename_durable, write_json_atomic};
@@ -309,11 +307,18 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
     let built = async {
         std::fs::create_dir_all(&staging).map_err(io_err)?;
         let raw = staging.join("disk.raw");
+        std::fs::File::create(&raw).map_err(io_err)?;
+        let lent = tools.lend(&raw).map_err(io_err)?;
         write_raw(raw.clone()).await?;
-        shrink_ext4(ctx, &raw).await?;
-        std::fs::File::open(&raw)
-            .and_then(|f| f.sync_all())
+        let bytes = disktools::shrink_ext4(tools, ctx, &raw).await?;
+        let f = tools.take_back(lent).map_err(io_err)?;
+        disktools::truncate(&f, &raw, bytes)?;
+        // Read-only from here; world-readable (inside root-only directories) so jailed
+        // QEMUs of orbs built on it read through to it.
+        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o444))
             .map_err(io_err)?;
+        f.sync_all().map_err(io_err)?;
+        drop(f);
         let meta = serde_json::json!({
             "key": key,
             "source_orb": source_orb,
@@ -352,6 +357,24 @@ pub fn file_digest(path: &Path, what: &str) -> Result<String, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a log's end is read, and only from a regular file.
+    #[test]
+    fn log_tails_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("console.log");
+        let mut text = "x".repeat(3 * LOG_TAIL_BYTES as usize);
+        text.push_str("\nlast line\n");
+        std::fs::write(&log, &text).unwrap();
+        assert!(log_tail(&log).ends_with("last line"));
+        assert!(tail_bytes(&log, LOG_TAIL_BYTES).unwrap().len() as u64 == LOG_TAIL_BYTES);
+        let link = dir.path().join("link.log");
+        std::os::unix::fs::symlink(&log, &link).unwrap();
+        assert_eq!(log_tail(&link), "");
+        let fifo = dir.path().join("fifo.log");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert_eq!(log_tail(&fifo), "", "a FIFO neither blocks nor counts");
+    }
     use crate::image::{ImageError, PreparedImage};
     use crate::model::ProjectSnapshotRef;
 

@@ -12,8 +12,14 @@
 //!                   /checkpoints/<gen>.tmp/  save in progress (complete once manifest.json exists)
 //!                   /logs/{firecracker.log (latest launch),console.log}
 //! <state>/net/<index>                        network index claimed by an orb
+//! <state>/uids/<index>                       jail uid claimed by an orb
 //! <run>/firecracker/<orb>/{launch.json,api.sock,vsock.sock}
+//! <run>/firecracker/<orb>/vmm/{api.sock,vsock.sock}   a jailed VMM's (linked from above)
 //! ```
+//!
+//! Each Firecracker runs in its orb's jail (`super::vm::jail`) unless `ORBD_VMM_JAIL=off`:
+//! there `<run>/firecracker/<orb>` is its `vmm/` directory, so the API and vsock paths it
+//! was given, and recorded in its snapshots, are the same as unjailed.
 //!
 //! The durability contract is QEMU's: every method first reconciles the host (adopting
 //! VMMs that outlived an earlier agent, finishing or discarding interrupted saves and
@@ -50,11 +56,12 @@ use super::vm::fsutil::write_json_atomic;
 use super::vm::fsutil::{free_bytes, fsync_dir, read_json, remove_via_trash, rename_durable};
 use super::vm::guest as channel;
 use super::vm::images::ImageProvider;
+use super::vm::jail::{self, Ids, Jailer};
 use super::vm::net::{self, NetAttachment};
 use super::vm::process::{self, CpuIdentity, KernelIdentity, LaunchKind, Process, VmmIdentity};
 use super::vm::{
-    OrbLocks, SAVES, bounded, copy_disk, create_private_dir, file_digest, io_err, log, log_tail,
-    machine_id, on_path, publish_project,
+    OrbLocks, SAVES, adopt_net, bounded, copy_disk, create_private_dir, file_digest, io_err, log,
+    log_tail, machine_id, on_path, publish_project,
 };
 use super::{
     CheckpointInfo, GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError,
@@ -68,6 +75,7 @@ use crate::model::{
 };
 use api::Api;
 use async_trait::async_trait;
+use orbd_vm::jail::{Access, Bind, Jail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -223,6 +231,8 @@ pub struct FirecrackerRuntime {
     images: Arc<dyn ImageProvider>,
     firecracker: VmmIdentity,
     cpu: CpuIdentity,
+    /// Builds each VMM's jail; None with `ORBD_VMM_JAIL=off` (or a non-root agent).
+    jail: Option<Jailer>,
     locks: OrbLocks,
 }
 
@@ -253,6 +263,10 @@ impl FirecrackerRuntime {
                 &format!("{} is too long for unix socket paths", run_dir.display()),
             ));
         }
+        // A jailed Firecracker resolves paths from its own root: a relative one is made
+        // absolute.
+        let mut config = config;
+        config.kernel = std::path::absolute(&config.kernel).map_err(|e| other("kernel", &e))?;
         if !config.kernel.is_file() {
             return Err(other("kernel", &config.kernel.display()));
         }
@@ -269,8 +283,27 @@ impl FirecrackerRuntime {
             version,
         };
         net::prepare_host(&config.egress, &config.dns_servers).map_err(|e| other("network", &e))?;
+        let jail = match config.jail {
+            Some(s) => {
+                let j = Jailer::new(s, state_dir, run_dir).map_err(|e| other("jail", &e))?;
+                j.probe(
+                    &firecracker.path,
+                    &["--version"],
+                    vec![Bind::at(&firecracker.path, Access::Exec)],
+                    Vec::new(),
+                )
+                .map_err(|e| {
+                    other(
+                        "jail",
+                        &format!("{e} (run the agent as real root, or set ORBD_VMM_JAIL=off)"),
+                    )
+                })?;
+                Some(j)
+            }
+            None => None,
+        };
         let cpu = CpuIdentity::host();
-        tracing::info!(firecracker = %firecracker.version, cpu = %cpu.model, "firecracker runtime ready");
+        tracing::info!(firecracker = %firecracker.version, cpu = %cpu.model, jailed = jail.is_some(), "firecracker runtime ready");
         Ok(Self {
             config,
             state_dir: state_dir.to_owned(),
@@ -278,6 +311,7 @@ impl FirecrackerRuntime {
             images,
             firecracker,
             cpu,
+            jail,
             locks: OrbLocks::default(),
         })
     }
@@ -305,7 +339,13 @@ impl FirecrackerRuntime {
     }
 
     fn api(&self, orb: OrbId) -> Api {
-        Api::new(self.run_paths(orb).api)
+        Api::new(self.run_paths(orb).api, self.server_uid(orb))
+    }
+
+    /// The uid that must serve the orb's sockets (see `vm::jail::socket_owner`); none
+    /// can when that cannot be told.
+    fn server_uid(&self, orb: OrbId) -> u32 {
+        jail::socket_owner(&self.run_paths(orb).dir).unwrap_or(u32::MAX)
     }
 
     fn trash(&self) -> PathBuf {
@@ -327,6 +367,63 @@ impl FirecrackerRuntime {
         read_json(&self.orb_paths(orb).recipe)
             .map_err(|e| RuntimeError::Other(format!("reading vm.json: {e}")))?
             .ok_or_else(|| RuntimeError::NotFound(format!("orb {orb} has no disk")))
+    }
+
+    /// The orb's jail uid and gid (claimed on first use); None when VMMs run unjailed.
+    fn jail_ids(&self, orb: OrbId) -> Result<Option<Ids>, RuntimeError> {
+        self.jail
+            .as_ref()
+            .map(|j| j.ids(orb))
+            .transpose()
+            .map_err(|e| RuntimeError::Other(format!("jail: {e}")))
+    }
+
+    /// The jail of a launch: puts the orb's files in the jail's ownership (see
+    /// `vm::jail`; also for orbs created or saved unjailed) and binds what this
+    /// Firecracker uses. Called with the run directory freshly created.
+    fn jail_for(
+        &self,
+        jailer: &Jailer,
+        orb: OrbId,
+        ids: Ids,
+        record: &LaunchRecord,
+    ) -> Result<Jail, RuntimeError> {
+        let op = self.orb_paths(orb);
+        let rp = self.run_paths(orb);
+        let fixed = (|| {
+            for d in [&op.dir, &op.dir.join("logs"), &op.checkpoints] {
+                jail::traversable(d, ids)?;
+            }
+            jail::owned(&op.disk, ids)?;
+            // Firecracker opens its log itself, and only an existing one.
+            jail::owned_new(&op.vmm_log, ids)?;
+            let mut binds = vec![
+                Bind::at(&record.config.firecracker.path, Access::Exec),
+                Bind::at(&op.dir, Access::Write),
+                Bind {
+                    src: jail::socket_dir(&rp.dir, ids, &["api.sock", "vsock.sock"])?,
+                    dst: rp.dir.clone(),
+                    access: Access::Write,
+                },
+            ];
+            match record.kind {
+                LaunchKind::Boot => {
+                    jail::shared_input(&record.config.kernel.path, false)?;
+                    binds.push(Bind::at(&record.config.kernel.path, Access::Read));
+                }
+                LaunchKind::Restore { generation } => {
+                    let dir = self.checkpoints(orb).published(generation);
+                    jail::traversable(&dir, ids)?;
+                    for f in ["memory", "vmstate"] {
+                        jail::readable(&dir.join(f), ids)?;
+                    }
+                }
+            }
+            binds.extend(jail::devices(true));
+            Ok::<_, std::io::Error>(binds)
+        })();
+        let binds = fixed.map_err(|e| RuntimeError::Other(format!("jail: {e}")))?;
+        Ok(jailer.jail(ids, binds, Vec::new(), &[]))
     }
 
     /// Only once no VMM for the orb can run (its sockets are reused by the next launch).
@@ -357,6 +454,11 @@ impl FirecrackerRuntime {
         let proc = record
             .as_ref()
             .and_then(|r| Process::adopt(r, &marker(r), None));
+        if let (Some(p), Some(r), Some(_)) = (&proc, &record, &self.jail)
+            && r.jail.is_none()
+        {
+            jail::warn_unjailed(orb, p.pid);
+        }
         if !self.orb_paths(orb).dir.is_dir() {
             if let Some(p) = proc {
                 return Ok(Observed::Inconsistent(format!(
@@ -500,8 +602,8 @@ impl FirecrackerRuntime {
         })
     }
 
-    /// Starts Firecracker in the orb's network namespace and waits until its API
-    /// answers as this launch.
+    /// Starts Firecracker in the orb's network namespace and jail (unless VMMs run
+    /// unjailed) and waits until its API answers as this launch.
     async fn launch(
         &self,
         orb: OrbId,
@@ -518,6 +620,16 @@ impl FirecrackerRuntime {
         // Firecracker writes its log from the start of the file: one launch per log.
         let _ = std::fs::remove_file(&op.vmm_log);
         let record = LaunchRecord::new(kind, machine);
+        let jail = match &self.jail {
+            Some(j) => {
+                let ids = j
+                    .ids(orb)
+                    .map_err(|e| RuntimeError::Other(format!("jail: {e}")))?;
+                j.kill_strays(ids).map_err(RuntimeError::Other)?;
+                Some(self.jail_for(j, orb, ids, &record)?)
+            }
+            None => None,
+        };
         let id = marker(&record);
         let args = vec![
             "--api-sock".into(),
@@ -538,8 +650,14 @@ impl FirecrackerRuntime {
             record,
             cgroup: self.cgroup_dir(orb),
             netns: net.netns_path(),
+            jail,
         })
-        .map_err(|e| RuntimeError::Other(format!("launching Firecracker: {e}")))?;
+        .map_err(|e| {
+            RuntimeError::Other(format!(
+                "launching Firecracker: {e} {}",
+                log_tail(&op.vmm_log)
+            ))
+        })?;
         log(ctx, &format!("Firecracker started (pid {})", proc.pid));
         let api = self.api(orb);
         let ready_by = Instant::now() + Duration::from_secs(10);
@@ -570,7 +688,8 @@ impl FirecrackerRuntime {
 
     async fn boot(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), RuntimeError> {
         let recipe = self.read_recipe(orb.id)?;
-        adopt_net(&recipe.net).await?;
+        let ids = self.jail_ids(orb.id)?;
+        adopt_net(&recipe.net, ids).await?;
         let machine = self.machine(&recipe)?;
         let proc = self
             .launch(orb.id, LaunchKind::Boot, machine.clone(), &recipe.net, ctx)
@@ -717,12 +836,29 @@ impl FirecrackerRuntime {
                 &format!("base is {base_bytes} bytes, larger than the offering disk"),
             );
         }
-        // The network index is claimed (durably, by this orb) before anything is built.
+        // The jail uid and network index are claimed (durably, by this orb) before
+        // anything is built.
+        let ids = self.jail_ids(orb.id)?;
         let (id, state, network) = (orb.id, self.state_dir.clone(), self.config.guest_network);
-        let net = tokio::task::spawn_blocking(move || NetAttachment::tap(id, &state, network))
-            .await
-            .map_err(|e| RuntimeError::Other(e.to_string()))?
-            .map_err(|e| RuntimeError::Other(format!("network: {e}")))?;
+        let staging = self.state_dir.join("staging").join(format!(
+            "orb-{}-{}",
+            orb.id,
+            uuid::Uuid::new_v4().simple()
+        ));
+        let net =
+            match tokio::task::spawn_blocking(move || NetAttachment::tap(id, &state, network, ids))
+                .await
+            {
+                Ok(Ok(net)) => net,
+                Ok(Err(e)) => {
+                    self.undo_create(orb.id, &staging);
+                    return Err(RuntimeError::Other(format!("network: {e}")));
+                }
+                Err(e) => {
+                    self.undo_create(orb.id, &staging);
+                    return Err(RuntimeError::Other(e.to_string()));
+                }
+            };
         let recipe = VmRecipe {
             orb: orb.id,
             vcpus: res.vcpus,
@@ -733,13 +869,8 @@ impl FirecrackerRuntime {
             net,
             created_unix_ms: unix_ms_now(),
         };
-        self.machine(&recipe)?;
-        let staging = self.state_dir.join("staging").join(format!(
-            "orb-{}-{}",
-            orb.id,
-            uuid::Uuid::new_v4().simple()
-        ));
         let built = async {
+            self.machine(&recipe)?;
             for d in ["logs", "checkpoints"] {
                 std::fs::create_dir_all(staging.join(d)).map_err(io_err)?;
             }
@@ -756,13 +887,24 @@ impl FirecrackerRuntime {
             fsync_dir(&staging).map_err(io_err)
         }
         .await;
-        if let Err(e) = built {
-            let _ = remove_via_trash(&staging, &self.trash());
-            net::release(orb.id, &self.state_dir);
+        let published = built
+            .and_then(|()| rename_durable(&staging, &self.orb_paths(orb.id).dir).map_err(io_err));
+        if let Err(e) = published {
+            // Unless the disk was published (and only its fsync failed).
+            if !self.orb_paths(orb.id).dir.exists() {
+                self.undo_create(orb.id, &staging);
+            }
             return Err(e);
         }
-        rename_durable(&staging, &self.orb_paths(orb.id).dir).map_err(io_err)?;
         Ok(())
+    }
+
+    /// Undoes a create that did not publish the orb's disk: its staging directory and
+    /// what was claimed for it (network namespace and index, jail uid).
+    fn undo_create(&self, orb: OrbId, staging: &Path) {
+        let _ = remove_via_trash(staging, &self.trash());
+        net::release(orb, &self.state_dir);
+        jail::release(&self.state_dir, orb);
     }
 
     // --- save -------------------------------------------------------------------
@@ -831,6 +973,10 @@ impl FirecrackerRuntime {
 
         let tmp = self.checkpoints(orb).fresh_tmp(generation)?;
         let (memory, vmstate) = (tmp.join("memory"), tmp.join("vmstate"));
+        // A jailed VMM writes into files of its own, in a directory of the agent's.
+        if let Some(ids) = record.jail {
+            jail::traversable(&tmp, ids).map_err(io_err)?;
+        }
         for f in [&memory, &vmstate] {
             use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
@@ -839,6 +985,9 @@ impl FirecrackerRuntime {
                 .mode(0o600)
                 .open(f)
                 .map_err(io_err)?;
+            if let Some(ids) = record.jail {
+                jail::owned(f, ids).map_err(io_err)?;
+            }
         }
         // Held across the snapshot: Firecracker flushes the drive but does not report
         // a failed flush, so orbd checks its own fsync.
@@ -980,7 +1129,8 @@ impl FirecrackerRuntime {
         }
         let manifest = self.restorable(orb.id, g)?;
         let recipe = self.read_recipe(orb.id)?;
-        adopt_net(&recipe.net).await?;
+        let ids = self.jail_ids(orb.id)?;
+        adopt_net(&recipe.net, ids).await?;
         let dir = self.checkpoints(orb.id).published(g);
         let started = Instant::now();
         let proc = self
@@ -1272,13 +1422,18 @@ impl Runtime for FirecrackerRuntime {
         let disk = self.orb_paths(orb.id).disk;
         log(ctx, &format!("copying disk into project snapshot {key}"));
         let lineage = self.read_recipe(orb.id)?.lineage;
+        // The copy reads no content as root; the guest's filesystem is checked and shrunk
+        // in the orb's jail.
+        let ids = self.jail_ids(orb.id)?;
+        let tools = super::vm::disktools::DiskTools::new(self.jail.as_ref().zip(ids));
         publish_project(
             ctx,
             &self.state_dir,
             key,
             orb.id,
             lineage,
-            |raw| async move { copy_disk(ctx, &disk, &raw).await },
+            &tools,
+            |raw: PathBuf| async move { copy_disk(ctx, &disk, &raw).await },
         )
         .await?;
         crate::crash_point!("firecracker::clone::after_publish");
@@ -1305,6 +1460,10 @@ impl Runtime for FirecrackerRuntime {
         }
         remove_via_trash(&dir, &self.trash()).map_err(io_err)?;
         self.clear_run(orb);
+        match &self.jail {
+            Some(j) => j.release(orb),
+            None => jail::release(&self.state_dir, orb),
+        }
         if let Some(cg) = self.cgroup_dir(orb) {
             let _ = std::fs::remove_dir(cg);
         }
@@ -1335,15 +1494,6 @@ fn version(path: &Path) -> Result<String, String> {
         ));
     }
     Ok(line)
-}
-
-/// Repairs the orb's network namespace if it is missing (after a host reboot).
-async fn adopt_net(net: &NetAttachment) -> Result<(), RuntimeError> {
-    let net = net.clone();
-    tokio::task::spawn_blocking(move || net.adopt())
-        .await
-        .map_err(|e| RuntimeError::Other(e.to_string()))?
-        .map_err(|e| RuntimeError::Other(format!("network: {e}")))
 }
 
 fn api_err(e: api::ApiError) -> RuntimeError {

@@ -107,7 +107,7 @@ async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
                 kind: pb::RuntimeKind::from(c.kind) as i32,
                 version: c.version,
                 memory_preserving_sleep: c.memory_preserving_sleep,
-                nested_kvm: c.nested_kvm,
+                nested_kvm: c.nested_kvm && !sh.config.agent.refuse_nested_kvm,
                 nested_state_qualified: c.nested_state_qualified,
                 project_snapshots: c.project_snapshots,
                 arch: pb::Arch::from(c.arch) as i32,
@@ -291,6 +291,9 @@ fn parse_delivery(sh: &Shared, d: &pb::CommandDelivery) -> Result<Parsed, (Failu
             "this agent has no runtime for the orb's execution target".into(),
         ));
     }
+    if let Some(why) = refused_by_policy(&sh.config.agent, &command, &orb) {
+        return Err((FailureCode::UnsupportedCapability, why.into()));
+    }
     let env = PermittedGuestEnv(
         d.secrets
             .as_ref()
@@ -304,6 +307,21 @@ fn parse_delivery(sh: &Shared, d: &pb::CommandDelivery) -> Result<Parsed, (Failu
     );
     env.validate().map_err(invalid)?;
     Ok(Parsed { command, orb, env })
+}
+
+/// Why this agent's own settings refuse `command`, whatever the coordinator decided (it
+/// may be wrong or compromised). Pauses and deletes are never refused, so orbs created
+/// before a setting changed can still be put to sleep and removed.
+fn refused_by_policy(
+    agent: &crate::config::agent::AgentSection,
+    command: &crate::model::Command,
+    orb: &OrbDefinition,
+) -> Option<&'static str> {
+    let spawn = matches!(command.action, crate::model::Action::Spawn);
+    if spawn && agent.refuse_nested_kvm && crate::runtime::needs_nested_kvm(orb) {
+        return Some(crate::runtime::NESTED_KVM_REFUSED);
+    }
+    None
 }
 
 async fn handle_delivery(sh: &Arc<Shared>, d: pb::CommandDelivery) -> anyhow::Result<()> {
@@ -526,4 +544,93 @@ async fn handle_reconcile(sh: &Arc<Shared>, r: pb::ReconcileRequest) -> anyhow::
         },
     )));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::agent::AgentSection;
+    use crate::model::*;
+
+    fn orb(nested_kvm: NestedKvmRequirement) -> OrbDefinition {
+        let spec = OrbSpec {
+            template: SpecTemplate {
+                target: ExecutionTarget::Fleet {
+                    runtime: RuntimeKind::Qemu,
+                },
+                resources: Resources {
+                    vcpus: 2,
+                    memory_bytes: 2 * GIB,
+                    disk_bytes: 4 * GIB,
+                },
+                requirements: CapabilityRequirements {
+                    release_compute_when_paused: true,
+                    nested_kvm,
+                    project_snapshots: SnapshotRequirement::NotRequired,
+                    arch: Arch::Amd64,
+                },
+                pause_policy: PausePolicy::MemoryPreserving {
+                    on_failure: CheckpointFailurePolicy::ColdStop,
+                },
+            },
+            initial_disk: InitialDiskSource::Image {
+                image_ref: "image".into(),
+            },
+        };
+        OrbDefinition {
+            id: OrbId::generate(),
+            identity: OrbIdentity {
+                amp_endpoint: AmpEndpointId::new("amp"),
+                amp_orb_id: AmpOrbId::new("amp-1"),
+            },
+            offering_id: OfferingId::new("kvm"),
+            spec_digest: spec.digest(),
+            spec,
+        }
+    }
+
+    fn command(orb: &OrbDefinition, action: Action) -> Command {
+        Command {
+            operation_id: OperationId::generate(),
+            orb_id: orb.id,
+            generation: 1,
+            spec_digest: orb.spec_digest.clone(),
+            command_digest: CommandDigest("d".into()),
+            action,
+        }
+    }
+
+    /// ORBD_NESTED_KVM=false: an orb with /dev/kvm is never started, whatever the
+    /// coordinator sends, but can still be paused and deleted.
+    #[test]
+    fn nested_kvm_off_refuses_spawning_kvm_orbs_only() {
+        let off = AgentSection {
+            refuse_nested_kvm: true,
+            ..AgentSection::new("/s".into())
+        };
+        let on = AgentSection::new("/s".into());
+        let kvm = orb(NestedKvmRequirement::GuestDevice);
+        let preserved = orb(NestedKvmRequirement::GuestDeviceAndPreservedNestedState);
+        let plain = orb(NestedKvmRequirement::NotRequired);
+        let spawn = |o: &OrbDefinition| command(o, Action::Spawn);
+        assert_eq!(
+            refused_by_policy(&off, &spawn(&kvm), &kvm),
+            Some(crate::runtime::NESTED_KVM_REFUSED)
+        );
+        assert!(refused_by_policy(&off, &spawn(&preserved), &preserved).is_some());
+        assert_eq!(refused_by_policy(&off, &spawn(&plain), &plain), None);
+        assert_eq!(refused_by_policy(&on, &spawn(&kvm), &kvm), None);
+        for action in [
+            Action::Delete,
+            Action::Pause {
+                publish_snapshot: None,
+            },
+        ] {
+            assert_eq!(
+                refused_by_policy(&off, &command(&kvm, action.clone()), &kvm),
+                None,
+                "{action:?}"
+            );
+        }
+    }
 }

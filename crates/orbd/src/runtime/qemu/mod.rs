@@ -13,8 +13,16 @@
 //!                   /logs/{qemu.log,console.log}
 //! <state>/projects/<key>/{disk.raw,meta.json} standalone sparse raw project snapshots
 //! <state>/staging/, <state>/trash/            build-then-rename and delete-by-rename areas
+//! <state>/net/<index>, <state>/uids/<index>   network index and jail uid claimed by an orb
 //! <run>/qemu/<orb>/{launch.json,qemu.pid,qmp.sock,guest.sock}
+//! <run>/qemu/<orb>/vmm/{qemu.pid,qmp.sock,guest.sock}  a jailed QEMU's (linked from above)
 //! ```
+//!
+//! On Linux each QEMU runs in its orb's jail (`super::vm::jail`) unless
+//! `ORBD_VMM_JAIL=off`, in the orb's own network namespace behind orbd's egress filter,
+//! as Firecracker orbs do; an orb created with QEMU's user-mode network (orbd 0.2.8 or
+//! earlier) is refused. macOS orbs use QEMU's user-mode network, fenced by pf
+//! (`network_group`).
 //!
 //! Every publication is rename-based and fsynced, and every method first reconciles
 //! what is on the host (adopting QEMUs that outlived an earlier agent, finishing or
@@ -41,6 +49,7 @@
 //! save that is still writing as QEMU does on ENOSPC (cancelled, partial file left);
 //! `qemu::save::throttle=return(<MiB/s>)` caps the save's bandwidth.
 
+pub mod fence;
 mod guest;
 
 use super::vm::checkpoints::{Checkpoints, MANIFEST, remove_trashed};
@@ -49,11 +58,12 @@ use super::vm::fsutil::{
 };
 use super::vm::guest as channel;
 use super::vm::images::ImageProvider;
+use super::vm::jail::{self, Ids, Jailer};
 use super::vm::net::{self, NetAttachment};
 use super::vm::process::{self, CpuIdentity, KernelIdentity, LaunchKind, Process, VmmIdentity};
 use super::vm::{
-    OrbLocks, SAVES, bounded, create_private_dir, file_digest, io_err, log, log_tail, machine_id,
-    on_path, publish_project, run_tool,
+    OrbLocks, SAVES, adopt_net, bounded, create_private_dir, file_digest, io_err, log, log_tail,
+    machine_id, on_path, publish_project, run_tool,
 };
 use super::{
     CheckpointInfo, GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError,
@@ -66,10 +76,13 @@ use crate::model::{
     RuntimeKind, SleepCheckpointRef, unix_ms_now,
 };
 use async_trait::async_trait;
-use orbd_qemu::launch::{self, DEFAULT_CPU_MODEL, HostFiles, LaunchConfig, LaunchRecord, Machine};
+use orbd_qemu::launch::{
+    self, DEFAULT_CPU_MODEL, HostFiles, LaunchConfig, LaunchRecord, Machine, NO_NESTED_CPU_MODEL,
+};
 use orbd_qemu::migration::{self, MigrationError};
 use orbd_qemu::probe::{self, check_qemu_version, machine_type};
 use orbd_qemu::qmp::{self, FileMigration, Qmp};
+use orbd_vm::jail::{Access, Bind, Jail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -259,8 +272,12 @@ pub struct QemuRuntime {
     run_dir: PathBuf,
     images: Arc<dyn ImageProvider>,
     qemu: VmmIdentity,
-    /// `orbd-netgroup`, setgid to `network_group`.
+    /// `orbd-netgroup`, setgid to `network_group` (macOS).
     group_exec: Option<PathBuf>,
+    /// Builds each QEMU's jail (Linux); None with `ORBD_VMM_JAIL=off`, and on macOS.
+    jail: Option<Jailer>,
+    /// Whether orbs may start as far as their egress fence goes (macOS).
+    fence: fence::EgressFence,
     /// Versioned machine type (`q35` or `virt` resolved at startup), recorded in each
     /// launch.
     machine: String,
@@ -289,7 +306,8 @@ impl QemuRuntime {
         }
         let qemu_run = run_dir.join("qemu");
         std::fs::create_dir_all(&qemu_run).map_err(|e| other("run dir", &e))?;
-        // Longest socket path must fit sockaddr_un.sun_path.
+        // Longest socket path must fit sockaddr_un.sun_path (a jailed QEMU binds it in its
+        // view of the run directory; the agent connects through the link).
         let longest = qemu_run
             .join(OrbId(uuid::Uuid::nil()).to_string())
             .join("guest.sock");
@@ -299,20 +317,44 @@ impl QemuRuntime {
                 &format!("{} is too long for unix socket paths", run_dir.display()),
             ));
         }
+        // Jailed QEMUs resolve paths from their own root: a relative one is made absolute.
+        let mut config = config;
+        config.kernel = std::path::absolute(&config.kernel).map_err(|e| other("kernel", &e))?;
         if !config.kernel.is_file() {
             return Err(other("kernel", &config.kernel.display()));
         }
         let qemu_path = on_path(&config.qemu)
             .ok_or_else(|| other("qemu", &format!("{} not found", config.qemu.display())))?;
+        // `network_group` fences QEMU's user-mode network on macOS; Linux orbs have their
+        // own filtered network namespaces.
         let group_exec = match &config.network_group {
-            Some(group) => {
+            Some(group) if cfg!(target_os = "macos") => {
                 let exec = on_path(Path::new(GROUP_EXEC))
                     .ok_or_else(|| other("network_group", &format!("{GROUP_EXEC} not found")))?;
                 check_network_group(&exec, group).map_err(|e| other("network_group", &e))?;
                 Some(exec)
             }
+            Some(_) => {
+                tracing::warn!(
+                    "runtime.qemu.network_group has no effect on Linux: QEMU orbs have their own \
+                     filtered network namespaces"
+                );
+                None
+            }
             None => None,
         };
+        let fence_probe = match (&group_exec, &config.network_group) {
+            (Some(exec), Some(group)) if cfg!(target_os = "macos") => {
+                Some(fence::probe_for(exec, group).map_err(|e| other("network_group", &e))?)
+            }
+            _ => None,
+        };
+        let fence = fence::EgressFence::new(
+            cfg!(target_os = "macos"),
+            config.allow_unfenced_egress,
+            fence_probe,
+        );
+        fence.monitor();
         let version = probe::qemu_version(&qemu_path)
             .map_err(|e| other(&qemu_path.display().to_string(), &e))?;
         check_qemu_version(&version).map_err(|e| other("qemu", &e))?;
@@ -322,6 +364,26 @@ impl QemuRuntime {
             path: qemu_path,
             version,
         };
+        let jail = match config.jail {
+            Some(s) => {
+                let j = Jailer::new(s, state_dir, run_dir).map_err(|e| other("jail", &e))?;
+                let (mut binds, links) = j.system(&qemu.path).map_err(|e| other("jail", &e))?;
+                binds.push(Bind::at(&qemu.path, Access::Exec));
+                j.probe(&qemu.path, &["--version"], binds, links)
+                    .map_err(|e| {
+                        other(
+                            "jail",
+                            &format!("{e} (run the agent as real root, or set ORBD_VMM_JAIL=off)"),
+                        )
+                    })?;
+                Some(j)
+            }
+            None => None,
+        };
+        if cfg!(target_os = "linux") {
+            net::prepare_host(&config.egress, &config.dns_servers)
+                .map_err(|e| other("network", &e))?;
+        }
         let cpu = CpuIdentity::host();
         // Nested virtualization is on unless the loaded KVM module says it is off.
         let nested_kvm = probe::nested_kvm();
@@ -330,7 +392,7 @@ impl QemuRuntime {
             direct_io: MIGRATION.direct_io && direct_io,
             ..MIGRATION
         };
-        tracing::info!(qemu = %qemu.version, %machine, cpu = %cpu.model, direct_io, ?migration, nested_kvm, "qemu runtime ready");
+        tracing::info!(qemu = %qemu.version, %machine, cpu = %cpu.model, direct_io, ?migration, nested_kvm, jailed = jail.is_some(), "qemu runtime ready");
         Ok(Self {
             config,
             state_dir: state_dir.to_owned(),
@@ -338,6 +400,8 @@ impl QemuRuntime {
             images,
             qemu,
             group_exec,
+            jail,
+            fence,
             machine,
             migration,
             cpu,
@@ -395,6 +459,67 @@ impl QemuRuntime {
             .ok_or_else(|| RuntimeError::NotFound(format!("orb {orb} has no disk")))
     }
 
+    /// The orb's jail uid and gid (claimed on first use); None when QEMU runs unjailed.
+    fn jail_ids(&self, orb: OrbId) -> Result<Option<Ids>, RuntimeError> {
+        self.jail
+            .as_ref()
+            .map(|j| j.ids(orb))
+            .transpose()
+            .map_err(|e| RuntimeError::Other(format!("jail: {e}")))
+    }
+
+    /// The jail of a launch: puts the orb's files in the jail's ownership (see
+    /// `vm::jail`; also for orbs created or saved unjailed) and binds what this QEMU
+    /// uses. Called with the run directory freshly created.
+    fn jail_for(
+        &self,
+        jailer: &Jailer,
+        orb: OrbId,
+        ids: Ids,
+        kind: LaunchKind,
+        config: &LaunchConfig,
+        recipe: &VmRecipe,
+    ) -> Result<Jail, RuntimeError> {
+        let op = self.orb_paths(orb);
+        let rp = self.run_paths(orb);
+        let fixed = (|| {
+            for d in [&op.dir, &op.dir.join("logs"), &op.checkpoints] {
+                jail::traversable(d, ids)?;
+            }
+            jail::owned(&op.disk, ids)?;
+            // QEMU opens the console itself.
+            jail::owned_new(&op.console_log, ids)?;
+            // Bases are the agent's (images are read-only already; project snapshots
+            // published before jails are made so); kernels are the operator's.
+            let base = &recipe.base.path;
+            jail::shared_input(base, base.starts_with(&self.state_dir))?;
+            jail::shared_input(&config.kernel.path, false)?;
+            let (mut binds, links) = jailer
+                .system(&config.qemu.path)
+                .map_err(std::io::Error::other)?;
+            binds.extend([
+                Bind::at(&config.qemu.path, Access::Exec),
+                Bind::at(&config.kernel.path, Access::Read),
+                Bind::at(base, Access::Read),
+                Bind::at(&op.dir, Access::Write),
+                Bind {
+                    src: jail::socket_dir(&rp.dir, ids, &["qemu.pid", "qmp.sock", "guest.sock"])?,
+                    dst: rp.dir.clone(),
+                    access: Access::Write,
+                },
+            ]);
+            if let LaunchKind::Restore { generation } = kind {
+                let dir = self.checkpoints(orb).published(generation);
+                jail::traversable(&dir, ids)?;
+                jail::readable(&dir.join("memory"), ids)?;
+            }
+            binds.extend(jail::devices(recipe.net.is_tap()));
+            Ok::<_, std::io::Error>((binds, links))
+        })();
+        let (binds, links) = fixed.map_err(|e| RuntimeError::Other(format!("jail: {e}")))?;
+        Ok(jailer.jail(ids, binds, links, &[]))
+    }
+
     fn checkpoints(&self, orb: OrbId) -> Checkpoints {
         Checkpoints::new(orb, self.orb_paths(orb).checkpoints, self.trash())
     }
@@ -413,7 +538,12 @@ impl QemuRuntime {
         let record: Option<LaunchRecord> = process::read_record(&rp.launch);
         let proc = record
             .as_ref()
-            .and_then(|r| Process::adopt(r, &launch_name(orb, r), Some(&rp.pidfile)));
+            .and_then(|r| Process::adopt(r, &launch_name(orb, r), Some(&self.pidfile(orb))));
+        if let (Some(p), Some(r), Some(_)) = (&proc, &record, &self.jail)
+            && r.jail.is_none()
+        {
+            jail::warn_unjailed(orb, p.pid);
+        }
         if !op.dir.is_dir() {
             if let Some(p) = proc {
                 return Ok(Observed::Inconsistent(format!(
@@ -444,7 +574,7 @@ impl QemuRuntime {
         record: &LaunchRecord,
     ) -> Result<Option<Observed>, RuntimeError> {
         let rp = self.run_paths(orb);
-        let qmp = match Qmp::connect(&rp.qmp, QMP_TIMEOUT).await {
+        let qmp = match Qmp::connect(&rp.qmp, Some(self.server_uid(orb)), QMP_TIMEOUT).await {
             Ok(q) => q,
             Err(e) => {
                 return Ok(Some(Observed::Inconsistent(format!(
@@ -555,7 +685,10 @@ impl QemuRuntime {
 
     // --- launching --------------------------------------------------------------
 
-    fn boot_config(&self, recipe: &VmRecipe) -> Result<LaunchConfig, RuntimeError> {
+    /// The machine of a cold boot. Unless `nested` (its orb type has kvm and this agent
+    /// allows nested KVM), x86 guests do not see VMX or SVM. A restore uses the machine
+    /// it was saved with instead, so a checkpoint keeps its CPU.
+    fn boot_config(&self, recipe: &VmRecipe, nested: bool) -> Result<LaunchConfig, RuntimeError> {
         if !recipe.memory_bytes.is_multiple_of(MIB) || recipe.memory_bytes == 0 {
             return Err(RuntimeError::Other(format!(
                 "guest memory {} is not a whole number of MiB",
@@ -568,7 +701,11 @@ impl QemuRuntime {
         };
         let machine_args = Machine {
             machine_type: &self.machine,
-            cpu_model: DEFAULT_CPU_MODEL,
+            cpu_model: if nested || cfg!(not(target_arch = "x86_64")) {
+                DEFAULT_CPU_MODEL
+            } else {
+                NO_NESTED_CPU_MODEL
+            },
             vcpus: recipe.vcpus,
             memory_mib: recipe.memory_bytes / MIB,
             kernel: &kernel.path,
@@ -588,7 +725,8 @@ impl QemuRuntime {
         })
     }
 
-    /// Starts QEMU and waits until its QMP socket answers as this launch.
+    /// Starts QEMU in the orb's jail (unless VMMs run unjailed) and waits until its QMP
+    /// socket answers as this launch.
     async fn launch(
         &self,
         orb: OrbId,
@@ -596,15 +734,29 @@ impl QemuRuntime {
         config: LaunchConfig,
         ctx: &OpContext,
     ) -> Result<Process, RuntimeError> {
-        // Checked on every launch: replacing the binary drops the setgid bit.
-        if let (Some(exec), Some(group)) = (&self.group_exec, &self.config.network_group) {
-            check_network_group(exec, group).map_err(RuntimeError::Other)?;
-        }
         let recipe = self.read_recipe(orb)?;
         let rp = self.run_paths(orb);
         self.clear_run(orb);
         create_private_dir(&rp.dir).map_err(io_err)?;
         let op = self.orb_paths(orb);
+        let jail = match &self.jail {
+            Some(j) => {
+                let ids = j
+                    .ids(orb)
+                    .map_err(|e| RuntimeError::Other(format!("jail: {e}")))?;
+                j.kill_strays(ids).map_err(RuntimeError::Other)?;
+                Some(self.jail_for(j, orb, ids, kind, &config, &recipe)?)
+            }
+            None => None,
+        };
+        // Checked on every launch: replacing the binary drops the setgid bit.
+        let group_exec = match (&jail, &self.group_exec, &self.config.network_group) {
+            (None, Some(exec), Some(group)) => {
+                check_network_group(exec, group).map_err(RuntimeError::Other)?;
+                Some(exec.as_path())
+            }
+            _ => None,
+        };
         let prefix = name_prefix(orb);
         let (proc, record) = launch::spawn(launch::Launch {
             record: LaunchRecord::new(kind, config),
@@ -626,12 +778,22 @@ impl QemuRuntime {
                 run_dir: &rp.dir,
                 base_dir: recipe.base.path.parent().unwrap_or(&recipe.base.path),
             },
-            group_exec: self.group_exec.as_deref(),
+            group_exec,
+            jail,
         })
-        .map_err(|e| RuntimeError::Other(format!("launching QEMU: {e}")))?;
+        .map_err(|e| {
+            RuntimeError::Other(format!("launching QEMU: {e} {}", log_tail(&op.qemu_log)))
+        })?;
         log(ctx, &format!("QEMU started (pid {})", proc.pid));
         let expected = launch_name(orb, &record);
-        let ready = launch::wait_ready(&proc, &rp.qmp, &expected, Duration::from_secs(30), POLL);
+        let ready = launch::wait_ready(
+            &proc,
+            &rp.qmp,
+            Some(self.server_uid(orb)),
+            &expected,
+            Duration::from_secs(30),
+            POLL,
+        );
         match bounded(ctx, ready).await {
             Ok(Ok(())) => Ok(proc),
             Ok(Err(launch::ReadyError::Exited)) => Err(RuntimeError::Other(format!(
@@ -651,12 +813,28 @@ impl QemuRuntime {
         }
     }
 
-    async fn qmp(&self, orb: OrbId) -> Result<Qmp, RuntimeError> {
-        Qmp::connect(&self.run_paths(orb).qmp, QMP_TIMEOUT)
-            .await
-            .map_err(qmp_err)
+    /// The uid that must serve the orb's sockets (see `vm::jail::socket_owner`); none
+    /// can when that cannot be told.
+    fn server_uid(&self, orb: OrbId) -> u32 {
+        jail::socket_owner(&self.run_paths(orb).dir).unwrap_or(u32::MAX)
     }
 
+    /// QEMU's pidfile where it really is (a jailed QEMU's own directory).
+    fn pidfile(&self, orb: OrbId) -> PathBuf {
+        jail::vmm_file(&self.run_paths(orb).dir, "qemu.pid")
+    }
+
+    async fn qmp(&self, orb: OrbId) -> Result<Qmp, RuntimeError> {
+        Qmp::connect(
+            &self.run_paths(orb).qmp,
+            Some(self.server_uid(orb)),
+            QMP_TIMEOUT,
+        )
+        .await
+        .map_err(qmp_err)
+    }
+
+    /// The base disk is the one the orb was created on.
     fn verify_base(&self, recipe: &VmRecipe) -> Result<(), RuntimeError> {
         let source: BaseSource = serde_json::from_str(&recipe.base.source)
             .map_err(|e| RuntimeError::Other(format!("vm.json base: {e}")))?;
@@ -672,13 +850,27 @@ impl QemuRuntime {
                 recipe.base.path.display()
             )));
         }
-        recipe.net.adopt().map_err(RuntimeError::Other)
+        Ok(())
+    }
+
+    /// Linux QEMU orbs run only in their own network namespace: one created with QEMU's
+    /// user-mode network (orbd 0.2.8 or earlier) is refused.
+    fn check_net(&self, net: &NetAttachment) -> Result<(), RuntimeError> {
+        if cfg!(target_os = "linux") && !net.is_tap() {
+            return Err(RuntimeError::Unsupported(LEGACY_USER_NETWORK.into()));
+        }
+        Ok(())
     }
 
     async fn boot(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), RuntimeError> {
         let recipe = self.read_recipe(orb.id)?;
         self.verify_base(&recipe)?;
-        let config = self.boot_config(&recipe)?;
+        self.check_net(&recipe.net)?;
+        let ids = self.jail_ids(orb.id)?;
+        adopt_net(&recipe.net, ids).await?;
+        let nested =
+            super::needs_nested_kvm(orb) && self.nested_kvm && !self.config.refuse_nested_kvm;
+        let config = self.boot_config(&recipe, nested)?;
         let proc = self.launch(orb.id, LaunchKind::Boot, config, ctx).await?;
         let status = self.qmp(orb.id).await?.status().await.map_err(qmp_err)?;
         if status != "running" {
@@ -741,6 +933,27 @@ impl QemuRuntime {
                 &format!("base is {} bytes, larger than the offering disk", base.size),
             );
         }
+        // The jail uid and network index are claimed (durably, by this orb) before
+        // anything is built.
+        let net = if cfg!(target_os = "linux") {
+            let ids = self.jail_ids(orb.id)?;
+            let (id, state, network) = (orb.id, self.state_dir.clone(), self.config.guest_network);
+            match tokio::task::spawn_blocking(move || NetAttachment::tap(id, &state, network, ids))
+                .await
+            {
+                Ok(Ok(net)) => net,
+                Ok(Err(e)) => {
+                    self.undo_create(orb.id, None);
+                    return Err(RuntimeError::Other(format!("network: {e}")));
+                }
+                Err(e) => {
+                    self.undo_create(orb.id, None);
+                    return Err(RuntimeError::Other(e.to_string()));
+                }
+            }
+        } else {
+            NetAttachment::user(orb.id, self.config.guest_network)
+        };
         let recipe = VmRecipe {
             orb: orb.id,
             vcpus: res.vcpus,
@@ -748,7 +961,7 @@ impl QemuRuntime {
             disk_bytes,
             base,
             lineage,
-            net: NetAttachment::user(orb.id, self.config.guest_network),
+            net,
             created_unix_ms: unix_ms_now(),
         };
         let staging = self.state_dir.join("staging").join(format!(
@@ -786,12 +999,26 @@ impl QemuRuntime {
             fsync_dir(&staging).map_err(io_err)
         }
         .await;
-        if let Err(e) = built {
-            let _ = remove_via_trash(&staging, &self.trash());
+        let published = built
+            .and_then(|()| rename_durable(&staging, &self.orb_paths(orb.id).dir).map_err(io_err));
+        if let Err(e) = published {
+            // Unless the disk was published (and only its fsync failed).
+            if !self.orb_paths(orb.id).dir.exists() {
+                self.undo_create(orb.id, Some(&staging));
+            }
             return Err(e);
         }
-        rename_durable(&staging, &self.orb_paths(orb.id).dir).map_err(io_err)?;
         Ok(())
+    }
+
+    /// Undoes a create that did not publish the orb's disk: its staging directory and
+    /// what was claimed for it (network namespace and index, jail uid).
+    fn undo_create(&self, orb: OrbId, staging: Option<&Path>) {
+        if let Some(staging) = staging {
+            let _ = remove_via_trash(staging, &self.trash());
+        }
+        net::release(orb, &self.state_dir);
+        jail::release(&self.state_dir, orb);
     }
 
     // --- save -------------------------------------------------------------------
@@ -808,7 +1035,7 @@ impl QemuRuntime {
     ) -> Result<CheckpointManifest, RuntimeError> {
         let started = Instant::now();
         let rp = self.run_paths(orb);
-        let record = process::read_record(&rp.launch)
+        let record: LaunchRecord = process::read_record(&rp.launch)
             .ok_or_else(|| RuntimeError::Other("launch record is missing".into()))?;
         let qmp = bounded(ctx, self.qmp(orb)).await??;
         bounded(
@@ -822,6 +1049,11 @@ impl QemuRuntime {
 
         let tmp = self.checkpoints(orb).fresh_tmp(generation)?;
         let memory = tmp.join("memory");
+        // A jailed QEMU writes into a file of its own, in a directory of the agent's.
+        if let Some(ids) = record.jail {
+            jail::traversable(&tmp, ids).map_err(io_err)?;
+        }
+        let owner = record.jail.map(|i| (i.uid, i.gid));
         let mut next_log = 512 * MIB;
         let progress = |info: &qmp::MigrationInfo| {
             inject_write_fault()?;
@@ -832,23 +1064,26 @@ impl QemuRuntime {
             }
             Ok(())
         };
-        let saved = bounded(ctx, migration::save_to_file(&qmp, &memory, POLL, progress))
-            .await?
-            .map_err(|e| match e {
-                MigrationError::Qmp(e) => qmp_err(e),
-                MigrationError::Io(e) => io_err(e),
-                MigrationError::Failed { status, desc } => {
-                    RuntimeError::CheckpointFailed(format!("migration {status}: {desc}"))
-                }
-                MigrationError::UnexpectedStatus(status) => {
-                    RuntimeError::CheckpointFailed(format!("QEMU is {status} after migration"))
-                }
-                MigrationError::Fsync(e) => {
-                    RuntimeError::CheckpointFailed(format!("fsync {}: {e}", memory.display()))
-                }
-                MigrationError::Aborted(why) => RuntimeError::CheckpointFailed(why),
-                other => RuntimeError::Other(other.to_string()),
-            })?;
+        let saved = bounded(
+            ctx,
+            migration::save_to_file(&qmp, &memory, POLL, owner, progress),
+        )
+        .await?
+        .map_err(|e| match e {
+            MigrationError::Qmp(e) => qmp_err(e),
+            MigrationError::Io(e) => io_err(e),
+            MigrationError::Failed { status, desc } => {
+                RuntimeError::CheckpointFailed(format!("migration {status}: {desc}"))
+            }
+            MigrationError::UnexpectedStatus(status) => {
+                RuntimeError::CheckpointFailed(format!("QEMU is {status} after migration"))
+            }
+            MigrationError::Fsync(e) => {
+                RuntimeError::CheckpointFailed(format!("fsync {}: {e}", memory.display()))
+            }
+            MigrationError::Aborted(why) => RuntimeError::CheckpointFailed(why),
+            other => RuntimeError::Other(other.to_string()),
+        })?;
         let (info, bytes) = (saved.info, saved.bytes);
         let manifest = CheckpointManifest {
             orb,
@@ -932,6 +1167,13 @@ impl QemuRuntime {
         memory: &Path,
     ) -> Result<(), RuntimeError> {
         let bad = |why: String| Err(RuntimeError::CheckpointIncompatible(why));
+        // A jailed QEMU resolves paths from its own root.
+        if self.jail.is_some() && !m.launch.kernel.path.is_absolute() {
+            return bad(format!(
+                "saved with the relative kernel path {}",
+                m.launch.kernel.path.display()
+            ));
+        }
         if m.launch.qemu != self.qemu {
             return bad(format!(
                 "saved by {:?}, this host runs {:?} (or another binary)",
@@ -994,7 +1236,11 @@ impl QemuRuntime {
         }
         let manifest = self.restorable(orb.id, g)?;
         let memory = self.checkpoints(orb.id).published(g).join("memory");
-        self.verify_base(&self.read_recipe(orb.id)?)?;
+        let recipe = self.read_recipe(orb.id)?;
+        self.verify_base(&recipe)?;
+        self.check_net(&recipe.net)?;
+        let ids = self.jail_ids(orb.id)?;
+        adopt_net(&recipe.net, ids).await?;
         let started = Instant::now();
         let proc = self
             .launch(
@@ -1108,7 +1354,7 @@ impl Runtime for QemuRuntime {
             kind: RuntimeKind::Qemu,
             version: self.qemu.version.clone(),
             memory_preserving_sleep: true,
-            nested_kvm: self.nested_kvm,
+            nested_kvm: self.nested_kvm && !self.config.refuse_nested_kvm,
             nested_state_qualified: false,
             project_snapshots: true,
             arch: crate::model::Arch::HOST,
@@ -1118,7 +1364,14 @@ impl Runtime for QemuRuntime {
     fn vmm_alive(&self, orb: OrbId) -> Option<bool> {
         let rp = self.run_paths(orb);
         let record: LaunchRecord = process::read_record(&rp.launch)?;
-        Some(Process::adopt(&record, &launch_name(orb, &record), Some(&rp.pidfile)).is_some())
+        Some(
+            Process::adopt(
+                &record,
+                &launch_name(orb, &record),
+                Some(&self.pidfile(orb)),
+            )
+            .is_some(),
+        )
     }
 
     async fn inspect(&self, orb: OrbId) -> Result<RuntimeObservation, RuntimeError> {
@@ -1131,6 +1384,16 @@ impl Runtime for QemuRuntime {
         source: StartSource,
         ctx: &OpContext,
     ) -> Result<(), RuntimeError> {
+        // Also when the coordinator asks for it anyway: it does not decide this host's
+        // policy.
+        if self.config.refuse_nested_kvm && super::needs_nested_kvm(orb) {
+            return Err(RuntimeError::Unsupported(super::NESTED_KVM_REFUSED.into()));
+        }
+        let fence = self.fence.clone();
+        tokio::task::spawn_blocking(move || fence.check())
+            .await
+            .map_err(|e| RuntimeError::Other(e.to_string()))?
+            .map_err(RuntimeError::Other)?;
         let _g = bounded(ctx, self.lock(orb.id)).await?;
         match source {
             StartSource::NewDisk(src) => {
@@ -1326,27 +1589,41 @@ impl Runtime for QemuRuntime {
         }
         let disk = self.orb_paths(orb.id).disk;
         log(ctx, &format!("converting disk into project snapshot {key}"));
-        let lineage = self.read_recipe(orb.id)?.lineage;
+        let recipe = self.read_recipe(orb.id)?;
+        self.verify_base(&recipe)?;
+        // The overlay's header is the VMM's: converted in the orb's jail, reading through
+        // to the recipe's base only.
+        let ids = self.jail_ids(orb.id)?;
+        if let Some(ids) = ids {
+            // The orb's disk is its uid's even if it never launched jailed (a failed boot,
+            // or created with the jail off); idempotent otherwise.
+            let base = &recipe.base.path;
+            jail::owned(&disk, ids)
+                .and_then(|()| jail::shared_input(base, base.starts_with(&self.state_dir)))
+                .map_err(|e| RuntimeError::Other(format!("jail: {e}")))?;
+        }
+        let tools = super::vm::disktools::DiskTools::new(self.jail.as_ref().zip(ids));
+        let (tools_ref, base, disk_bytes) = (&tools, recipe.base.path.clone(), recipe.disk_bytes);
         publish_project(
             ctx,
             &self.state_dir,
             key,
             orb.id,
-            lineage,
-            |raw| async move {
-                run_tool(
+            recipe.lineage,
+            &tools,
+            |raw: PathBuf| async move {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&raw)
+                    .and_then(|f| f.set_len(disk_bytes))
+                    .map_err(io_err)?;
+                super::vm::disktools::qcow2_to_raw(
+                    tools_ref,
                     ctx,
                     &self.config.qemu_img,
-                    &[
-                        "convert".into(),
-                        "-q".into(),
-                        "-f".into(),
-                        "qcow2".into(),
-                        "-O".into(),
-                        "raw".into(),
-                        disk.display().to_string(),
-                        raw.display().to_string(),
-                    ],
+                    &disk,
+                    &base,
+                    &raw,
                 )
                 .await
             },
@@ -1361,8 +1638,11 @@ impl Runtime for QemuRuntime {
         let _g = bounded(ctx, self.lock(orb)).await?;
         let rp = self.run_paths(orb);
         if let Some(record) = process::read_record::<LaunchConfig>(&rp.launch)
-            && let Some(proc) =
-                Process::adopt(&record, &launch_name(orb, &record), Some(&rp.pidfile))
+            && let Some(proc) = Process::adopt(
+                &record,
+                &launch_name(orb, &record),
+                Some(&self.pidfile(orb)),
+            )
         {
             log(ctx, &format!("killing QEMU (pid {})", proc.pid));
             if !proc.kill_and_wait(Duration::from_secs(10)).await {
@@ -1372,13 +1652,20 @@ impl Runtime for QemuRuntime {
                 )));
             }
         }
-        net::release(orb, &self.state_dir);
+        let state = self.state_dir.clone();
+        tokio::task::spawn_blocking(move || net::release(orb, &state))
+            .await
+            .map_err(|e| RuntimeError::Other(e.to_string()))?;
         let dir = self.orb_paths(orb).dir;
         if dir.exists() {
             log(ctx, "removing disk and checkpoints");
         }
         remove_via_trash(&dir, &self.trash()).map_err(io_err)?;
         self.clear_run(orb);
+        match &self.jail {
+            Some(j) => j.release(orb),
+            None => jail::release(&self.state_dir, orb),
+        }
         if let Some(cg) = self.cgroup_dir(orb) {
             let _ = std::fs::remove_dir(cg);
         }
@@ -1390,12 +1677,17 @@ impl Runtime for QemuRuntime {
     }
 }
 
+/// Why a Linux QEMU orb on QEMU's user-mode network does not start.
+const LEGACY_USER_NETWORK: &str = "this QEMU orb was created by orbd 0.2.8 or earlier, on QEMU's \
+     unfiltered user-mode network, which Linux agents no longer run: delete it (`orbd orb \
+     delete`) and Amp starts a new one";
+
 /// Runs a program with the group it is setgid to (`src/bin/orbd-netgroup.rs`).
-const GROUP_EXEC: &str = "orbd-netgroup";
+pub(crate) const GROUP_EXEC: &str = "orbd-netgroup";
 
 /// `exec` must be setgid `group`, so every socket QEMU opens for an orb (slirp) carries
 /// that group and host firewall rules for it (macOS pf `group`) apply to orb traffic only.
-fn check_network_group(exec: &Path, group: &str) -> Result<(), String> {
+pub(crate) fn check_network_group(exec: &Path, group: &str) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let g = nix::unistd::Group::from_name(group)
         .map_err(|e| format!("group {group}: {e}"))?

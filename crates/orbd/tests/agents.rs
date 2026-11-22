@@ -228,3 +228,41 @@ fn removed_agent_cannot_connect_and_keeps_its_orbs() {
     let rejoin = c.admin(&["join-token", home]);
     assert_ne!(rejoin.code, 0, "a removed id is never reused");
 }
+
+/// `ORBD_IMAGE_ALLOW` is the agent's own: a spawn of another image fails naming the
+/// setting before the runtime sees it, whatever the coordinator placed there.
+#[test]
+fn agents_refuse_images_their_allowlist_does_not_name() {
+    let mut c = Cluster::new(&["agent-a"], 2);
+    c.agent_env.push((
+        "ORBD_IMAGE_ALLOW".into(),
+        "example.invalid/amp-orb:stable, example.invalid/tools/*".into(),
+    ));
+    c.start_all();
+
+    // The cluster's spawns name example.invalid/amp-orb:latest.
+    let refused = c.dispatch("spawn", "amp-1", &[]);
+    assert_ne!(refused.code, 0, "{}", refused.stdout);
+    let out = format!("{}{}", refused.stdout, refused.stderr);
+    assert!(
+        out.contains(
+            "example.invalid/amp-orb:latest is not allowed on this agent (ORBD_IMAGE_ALLOW)"
+        ),
+        "{out}"
+    );
+    assert!(
+        c.fake_orbs("agent-a").iter().all(|o| !o.disk),
+        "the runtime never created a disk"
+    );
+
+    for (orb, image) in [
+        ("amp-2", "example.invalid/amp-orb:stable"),
+        ("amp-3", "example.invalid/tools/orb:1"),
+    ] {
+        assert_ok(&c.dispatch("spawn", orb, &[("ORB_IMAGE", image)]), image);
+    }
+    assert!(
+        c.logs()
+            .contains("only images ORBD_IMAGE_ALLOW lists are prepared and run")
+    );
+}

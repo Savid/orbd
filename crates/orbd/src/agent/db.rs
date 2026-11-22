@@ -649,6 +649,21 @@ pub fn get_orb_claimed(conn: &Connection, orb: OrbId) -> rusqlite::Result<Option
     .optional()
 }
 
+/// The most recent definition of `orb` the agent has accepted work for (the flow log's
+/// Amp ids).
+#[cfg(target_os = "linux")]
+pub fn get_orb_definition(
+    conn: &Connection,
+    orb: OrbId,
+) -> rusqlite::Result<Option<OrbDefinition>> {
+    conn.query_row(
+        "SELECT orb_json FROM receipts WHERE orb_id = ?1 ORDER BY seq DESC LIMIT 1",
+        [orb.to_string()],
+        |r| from_json(&r.get::<_, String>(0)?),
+    )
+    .optional()
+}
+
 /// The most recent orb definition for every orb the agent has accepted work for.
 pub fn list_orb_definitions(conn: &Connection) -> rusqlite::Result<Vec<OrbDefinition>> {
     let mut st = conn.prepare(

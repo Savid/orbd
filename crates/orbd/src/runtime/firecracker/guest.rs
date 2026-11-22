@@ -14,6 +14,7 @@ impl FirecrackerRuntime {
         FirecrackerVsockConnector {
             socket: self.run_paths(orb).vsock,
             port: VSOCK_PORT,
+            server_uid: self.server_uid(orb),
         }
     }
 

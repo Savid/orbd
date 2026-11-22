@@ -13,12 +13,45 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 /// The greeting line [`open`] read, put back in front of the rest of the stream.
-type RawReader = tokio::io::Chain<std::io::Cursor<Vec<u8>>, BufReader<ReadHalf<UnixStream>>>;
+type RawReader =
+    tokio::io::Chain<std::io::Cursor<Vec<u8>>, BufReader<LineLimit<ReadHalf<UnixStream>>>>;
 type Writer = QmpStreamTokio<WriteHalf<UnixStream>>;
 type Reader = QmpStreamTokio<RawReader>;
 
 /// Lines skipped before the greeting before giving up on a connection.
 const MAX_SKIPPED_LINES: usize = 16;
+/// Longest QMP line (one JSON message) read: the answers orbd asks for are a few KiB,
+/// and a VMM must not make the agent buffer without bound.
+const MAX_LINE: usize = 1 << 20;
+
+/// Fails the stream once a line exceeds [`MAX_LINE`] bytes.
+struct LineLimit<R> {
+    inner: R,
+    line: usize,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for LineLimit<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_read(cx, buf))?;
+        let mut line = self.line;
+        for &b in &buf.filled()[before..] {
+            line = if b == b'\n' { 0 } else { line + 1 };
+            if line > MAX_LINE {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("a QMP line exceeds {MAX_LINE} bytes"),
+                )));
+            }
+        }
+        self.line = line;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum QmpError {
@@ -266,10 +299,16 @@ pub struct MigrationEvent {
 }
 
 impl Qmp {
-    /// Connects and negotiates, bounded by `timeout`. Events are discarded.
-    pub async fn connect(path: &Path, timeout: Duration) -> Result<Self, QmpError> {
+    /// Connects and negotiates, bounded by `timeout`. Events are discarded. With
+    /// `server_uid`, the socket must be served by that uid (QEMU's, see
+    /// [`orbd_vm::process::connect_unix`]).
+    pub async fn connect(
+        path: &Path,
+        server_uid: Option<u32>,
+        timeout: Duration,
+    ) -> Result<Self, QmpError> {
         let fut = async {
-            let neg = open(path).await?;
+            let neg = open(path, server_uid).await?;
             let stream = neg.negotiate().await?;
             let (service, events) = stream.spawn_tokio();
             Ok::<_, std::io::Error>(Self { service, events })
@@ -284,10 +323,11 @@ impl Qmp {
     /// events are discarded; the receiver ends when the session does.
     pub async fn connect_with_events(
         path: &Path,
+        server_uid: Option<u32>,
         timeout: Duration,
     ) -> Result<(Self, mpsc::UnboundedReceiver<MigrationEvent>), QmpError> {
         let fut = async {
-            let neg = open(path).await?;
+            let neg = open(path, server_uid).await?;
             let (service, events) = neg.negotiate().await?.into_parts();
             let (tx, rx) = mpsc::unbounded_channel();
             let events = tokio::spawn(forward_events(events, tx));
@@ -514,9 +554,19 @@ impl Qmp {
 /// A line before the greeting is logged and skipped rather than failing the session:
 /// a drain once lost an orb's checkpoint to a 133-byte non-greeting first line
 /// (`missing field QMP`), and a fresh greeting may still follow it.
-async fn open(path: &Path) -> std::io::Result<qapi::futures::QmpStreamNegotiation<Reader, Writer>> {
-    let (read, write) = tokio::io::split(UnixStream::connect(path).await?);
-    let mut read = BufReader::new(read);
+async fn open(
+    path: &Path,
+    server_uid: Option<u32>,
+) -> std::io::Result<qapi::futures::QmpStreamNegotiation<Reader, Writer>> {
+    let stream = match server_uid {
+        Some(uid) => orbd_vm::process::connect_unix(path, uid).await?,
+        None => UnixStream::connect(path).await?,
+    };
+    let (read, write) = tokio::io::split(stream);
+    let mut read = BufReader::new(LineLimit {
+        inner: read,
+        line: 0,
+    });
     let mut skipped = 0;
     let greeting = loop {
         let mut line = Vec::new();
@@ -608,7 +658,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("qmp.sock");
         let server = tokio::spawn(fake_qemu(tokio::net::UnixListener::bind(&path).unwrap()));
-        let (qmp, mut events) = Qmp::connect_with_events(&path, Duration::from_secs(5))
+        let (qmp, mut events) = Qmp::connect_with_events(&path, None, Duration::from_secs(5))
             .await
             .unwrap();
         qmp.blockdev_snapshot("disk0", "snap1").await.unwrap();
@@ -633,11 +683,50 @@ mod tests {
         let stray = b"{\"timestamp\": {\"seconds\": 1793912345, \"microseconds\": 12345}, \"event\": \"SHUTDOWN\", \"data\": {\"guest\": false, \"reason\": \"host-signal\"}}\r\n";
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move { fake_qemu_after(listener, stray).await });
-        let qmp = Qmp::connect(&path, Duration::from_secs(5)).await.unwrap();
+        let qmp = Qmp::connect(&path, None, Duration::from_secs(5))
+            .await
+            .unwrap();
         qmp.blockdev_snapshot("disk0", "snap1").await.unwrap();
         assert_eq!(
             server.await.unwrap(),
             serde_json::json!({"node": "disk0", "overlay": "snap1"})
+        );
+    }
+
+    /// A line longer than [`MAX_LINE`] fails the session instead of being buffered,
+    /// and a socket served by another uid than QEMU's is refused.
+    #[tokio::test]
+    async fn long_lines_and_foreign_servers_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("qmp.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let line = vec![b'x'; MAX_LINE + 2];
+            let _ = s.write_all(&line).await;
+            let _ = s.write_all(b"\n").await;
+        });
+        let err = Qmp::connect(&path, None, Duration::from_secs(5))
+            .await
+            .err();
+        assert!(
+            matches!(&err, Some(QmpError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData),
+            "{err:?}"
+        );
+        server.await.unwrap();
+        let me = nix::unistd::geteuid().as_raw();
+        let listener = tokio::net::UnixListener::bind(dir.path().join("q2.sock")).unwrap();
+        let err = Qmp::connect(
+            &dir.path().join("q2.sock"),
+            Some(me + 1),
+            Duration::from_secs(5),
+        )
+        .await
+        .err();
+        drop(listener);
+        assert!(
+            matches!(&err, Some(QmpError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{err:?}"
         );
     }
 }

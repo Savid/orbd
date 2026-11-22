@@ -13,12 +13,18 @@
 //! every check and signal first confirms the pid still has the start time it had when
 //! it was opened, and exits are polled. Cgroups and network namespaces are Linux-only.
 //!
+//! On Linux a VMM can be launched into a [`Jail`] (its own uid, no capabilities, a mount
+//! namespace with only what it needs); the launch record says so. Adoption does not
+//! depend on it: a VMM left running unjailed by an earlier supervisor is adopted the
+//! same way.
+//!
 //! Production placement: VMMs must not live in the supervisor service's cgroup, or a
 //! service stop kills every VM. Under systemd use `KillMode=process` or pass a
 //! delegated cgroup v2 directory as [`Spawn::cgroup`]; the launcher moves the VMM into
 //! it before exec.
 
 use crate::fsutil::{read_json, write_json_atomic};
+use crate::jail::{Jail, JailIdentity};
 use nix::libc;
 use serde::{Deserialize, Serialize};
 use std::os::fd::AsRawFd;
@@ -78,6 +84,10 @@ pub struct LaunchRecord<C> {
     pub config: C,
     pub pid: Option<i32>,
     pub start_time: Option<u64>,
+    /// Who the VMM runs as in its jail; None if it runs unjailed (as its supervisor, or
+    /// launched by an orbd without jails).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jail: Option<JailIdentity>,
 }
 
 impl<C> LaunchRecord<C> {
@@ -89,6 +99,7 @@ impl<C> LaunchRecord<C> {
             config,
             pid: None,
             start_time: None,
+            jail: None,
         }
     }
 }
@@ -136,11 +147,7 @@ impl Process {
         }
         let pid = record
             .pid
-            .or_else(|| {
-                std::fs::read_to_string(pidfile?)
-                    .ok()
-                    .and_then(|s| s.trim().parse().ok())
-            })
+            .or_else(|| read_pidfile(pidfile?))
             .or_else(|| find_by_marker(marker))?;
         let p = Self::open(pid)?;
         // Validate after opening the pidfd, so the checks are about this process.
@@ -175,6 +182,90 @@ impl Process {
     }
 }
 
+/// A pid from `path`, a file the VMM writes (in a directory it may own): only a regular
+/// file, not through a symbolic link, without blocking, at most 32 bytes.
+fn read_pidfile(path: &Path) -> Option<i32> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(32);
+    f.take(32).read_to_end(&mut buf).ok()?;
+    std::str::from_utf8(&buf).ok()?.trim().parse().ok()
+}
+
+/// Connects to the unix socket at `path` and checks that whoever serves it runs as
+/// `uid` (`SO_PEERCRED`), before anything is sent: a VMM that owns the directory of its
+/// sockets cannot point the agent at another orb's or the host's sockets.
+pub async fn connect_unix(path: &Path, uid: u32) -> std::io::Result<tokio::net::UnixStream> {
+    let stream = tokio::net::UnixStream::connect(path).await?;
+    let peer = stream.peer_cred()?.uid();
+    if peer != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is served by uid {peer}, not the VMM's uid {uid}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(stream)
+}
+
+/// Kills every process that runs as `uid` (as kill(2) matches: real or saved uid) at
+/// once: a helper switches to `uid` and sends SIGKILL to -1, which reaches all of that
+/// uid's processes and nothing else, however many there are or they fork.
+#[cfg(target_os = "linux")]
+pub fn kill_uid(uid: u32) -> std::io::Result<()> {
+    if uid == 0 || uid == u32::MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to kill every process of uid {uid}"),
+        ));
+    }
+    // SAFETY: the child makes only async-signal-safe syscalls and _exits; the parent
+    // waits for exactly that child.
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if pid == 0 {
+            // Undumpable before it becomes the orb's uid (it holds the agent's memory),
+            // and kill(-1) only once it verifiably holds nothing but that uid: with a
+            // capability left it would kill every process it can see.
+            let switched = libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) == 0
+                && libc::setgroups(0, std::ptr::null()) == 0
+                && libc::setresgid(uid, uid, uid) == 0
+                && libc::setresuid(uid, uid, uid) == 0
+                && crate::jail::shed_privileges(uid, uid);
+            if switched {
+                libc::kill(-1, libc::SIGKILL);
+            }
+            libc::_exit(if switched { 0 } else { 1 });
+        }
+        let mut status = 0;
+        while libc::waitpid(pid, &mut status, 0) < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                return Err(e);
+            }
+        }
+        if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
+            return Err(std::io::Error::other(format!(
+                "could not switch to uid {uid} to kill its processes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn has_marker(pid: i32, marker: &str) -> bool {
     sys::cmdline(pid).is_some_and(|cmdline| {
         cmdline
@@ -199,12 +290,22 @@ pub struct Spawn<'a, C> {
     pub cgroup: Option<PathBuf>,
     /// Network namespace (`/run/netns/<name>`) the VMM runs in.
     pub netns: Option<PathBuf>,
+    /// The jail the VMM runs in (Linux), entered last before exec; it starts with an
+    /// empty environment. A jail that cannot be set up fails the launch.
+    pub jail: Option<Jail>,
 }
 
 /// Records the launch intent, then forks and execs the VMM in its own session. Returns
 /// once the process exists (not once it is ready).
 pub fn spawn<C: Serialize>(s: Spawn<'_, C>) -> std::io::Result<(Process, LaunchRecord<C>)> {
+    #[cfg(target_os = "linux")]
+    let jail = s.jail.as_ref().map(Jail::prepare).transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    if s.jail.is_some() {
+        return Err(std::io::Error::other("VMM jails need Linux"));
+    }
     let mut record = s.record;
+    record.jail = s.jail.as_ref().map(Jail::identity);
     write_json_atomic(s.record_path, &record)?;
     let open_log = |p: &Path| {
         std::fs::OpenOptions::new()
@@ -238,7 +339,11 @@ pub fn spawn<C: Serialize>(s: Spawn<'_, C>) -> std::io::Result<(Process, LaunchR
         .stdin(std::process::Stdio::null())
         .stdout(stdout)
         .stderr(stderr);
-    // SAFETY: only async-signal-safe calls (setsid, write, setns) between fork and exec.
+    if s.jail.is_some() {
+        cmd.env_clear();
+    }
+    // SAFETY: only async-signal-safe calls (setsid, write, setns, the jail's raw
+    // syscalls on prepared data) between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
             if libc::setsid() < 0 {
@@ -257,6 +362,10 @@ pub fn spawn<C: Serialize>(s: Spawn<'_, C>) -> std::io::Result<(Process, LaunchR
             }
             #[cfg(not(target_os = "linux"))]
             let _ = netns_fd;
+            #[cfg(target_os = "linux")]
+            if let Some(j) = &jail {
+                j.enter()?;
+            }
             Ok(())
         });
     }
@@ -528,5 +637,102 @@ mod sys {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// A pidfile is read only as a small regular file, never through a link or from a
+    /// FIFO (which would block).
+    #[test]
+    fn pidfiles_are_small_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("qemu.pid");
+        std::fs::write(&file, "1234\n").unwrap();
+        assert_eq!(read_pidfile(&file), Some(1234));
+        let link = dir.path().join("link.pid");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(read_pidfile(&link), None, "not through a link");
+        let fifo = dir.path().join("fifo.pid");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert_eq!(
+            read_pidfile(&fifo),
+            None,
+            "a FIFO neither blocks nor counts"
+        );
+        std::fs::write(&file, format!("{}1234", " ".repeat(40))).unwrap();
+        assert_eq!(
+            read_pidfile(&file),
+            None,
+            "only the first 32 bytes are read"
+        );
+        assert_eq!(read_pidfile(&dir.path().join("missing")), None);
+    }
+
+    /// A socket served by another uid than the VMM's is refused before anything is
+    /// sent.
+    #[tokio::test]
+    async fn sockets_are_checked_for_their_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let me = nix::unistd::geteuid().as_raw();
+        let accept = tokio::spawn(async move {
+            let mut got = Vec::new();
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf)
+                    .await
+                    .unwrap();
+                got.push(buf);
+            }
+            got
+        });
+        let ok = connect_unix(&path, me).await.unwrap();
+        drop(ok);
+        let err = connect_unix(&path, me.wrapping_add(1)).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(accept.await.unwrap(), [Vec::<u8>::new(), Vec::new()]);
+    }
+
+    /// As root (skipped otherwise unless `ORBD_TEST_JAIL=1` requires it): every
+    /// process of a uid dies, and nothing else.
+    #[test]
+    fn every_process_of_a_uid_is_killed() {
+        if !nix::unistd::geteuid().is_root() {
+            assert!(
+                std::env::var("ORBD_TEST_JAIL").is_err(),
+                "ORBD_TEST_JAIL is set but the test does not run as root"
+            );
+            eprintln!("skipped: needs root");
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let uid = 1_300_999_999;
+        let spawn = |uid: u32| {
+            std::process::Command::new("sleep")
+                .arg("100")
+                .uid(uid)
+                .gid(uid)
+                .spawn()
+                .unwrap()
+        };
+        let mut victims = [spawn(uid), spawn(uid)];
+        let mut other = spawn(uid - 1);
+        kill_uid(uid).unwrap();
+        for v in &mut victims {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(v.wait().unwrap().signal(), Some(libc::SIGKILL));
+        }
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "another uid's process lives"
+        );
+        other.kill().unwrap();
+        other.wait().unwrap();
+        assert!(kill_uid(0).is_err());
     }
 }
