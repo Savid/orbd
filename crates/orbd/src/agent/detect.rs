@@ -150,7 +150,7 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
     let filtered = r.firecracker.is_some() || (cfg!(target_os = "linux") && r.qemu.is_some());
     if !filtered && config.agent.egress != Default::default() {
         tracing::warn!(
-            "ORBD_EGRESS_ALLOW / ORBD_ALLOW_PRIVATE_EGRESS / ORBD_FLOW_LOG have no effect: \
+            "ORBD_EGRESS_ALLOW / ORBD_FLOW_LOG have no effect: \
              this agent's orbs have no network namespaces of their own"
         );
     }

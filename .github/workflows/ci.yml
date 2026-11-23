@@ -243,6 +243,32 @@ jobs:
           crates/orbd/tests/kvm-guest/build-rootfs.sh \
             artifacts/orbd-guest-x86_64-unknown-linux-musl/orbd-guest artifacts/guest-kernel/bzImage "$ROOTFS"
 
+      - if: matrix.part == 'rest'
+        name: The previous release's orbd and orbd-guest, for the upgrade gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          retry() { for i in 1 2 3 4 5; do "$@" && return; [ "$i" = 5 ] && return 1; sleep 20; done; }
+          # The highest release (by version, no drafts or prereleases) that is not this
+          # commit: a release commit's own run upgrades from the release before it.
+          tags=$(retry gh release list -R "$GITHUB_REPOSITORY" --limit 100 --exclude-drafts \
+            --exclude-pre-releases --json tagName -q '.[].tagName')
+          tag=
+          for t in $(sort -rV <<<"$tags"); do
+            sha=$(retry gh api "repos/$GITHUB_REPOSITORY/commits/$t" -q .sha)
+            [ -n "$sha" ] || { echo "::error::no commit for release $t"; exit 1; }
+            [ "$sha" != "$GITHUB_SHA" ] && { tag=$t; break; }
+          done
+          [ -n "$tag" ] || { echo "::error::no previous release"; exit 1; }
+          mkdir -p previous && cd previous
+          retry gh release download "$tag" -R "$GITHUB_REPOSITORY" --clobber \
+            -p "orbd-$tag-x86_64-unknown-linux-musl" -p "orbd-guest-$tag-x86_64-unknown-linux-musl" \
+            -p SHA256SUMS
+          sha256sum -c --ignore-missing SHA256SUMS
+          mv "orbd-$tag-x86_64-unknown-linux-musl" orbd
+          mv "orbd-guest-$tag-x86_64-unknown-linux-musl" orbd-guest
+          chmod 755 orbd orbd-guest
+          echo "upgrade gate from $tag: $(./orbd --version)"
       - if: matrix.suite != 'container'
         name: Run the gates in the image
         # procps provides the `kill` the test harness runs; QEMU is the image's own.
@@ -252,12 +278,16 @@ jobs:
         run: |
           # The README's agent flags (no --privileged), plus SYS_PTRACE for the gates
           # themselves: they inspect jailed VMMs through /proc/<pid>/root.
+          previous=
+          if [ "${{ matrix.part }}" = rest ]; then
+            previous="-e ORBD_KVM_PREVIOUS_AGENT=$PWD/previous/orbd -e ORBD_KVM_PREVIOUS_GUEST=$PWD/previous/orbd-guest"
+          fi
           docker run --rm --cap-add SYS_ADMIN --cap-add NET_ADMIN --cap-add SYS_PTRACE \
             --device /dev/kvm --device /dev/net/tun \
             --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
             -v "$PWD:$PWD" -w "$PWD/crates/orbd" \
             -e ORBD_KVM_KERNEL=/usr/share/orbd/bzImage -e "ORBD_KVM_ROOTFS=$PWD/$ROOTFS" -e ORBD_KVM_NESTED \
-            -e ORBD_KVM_RUNTIME=${{ matrix.suite }} \
+            -e ORBD_KVM_RUNTIME=${{ matrix.suite }} $previous \
             --entrypoint sh orbd:smoke -c \
             'apt-get update -qq && apt-get install -y -qq procps >/dev/null && exec "$0" --ignored --test-threads=1 --nocapture "$@"' \
             "$PWD/$(awk '$1 == "kvm" { print $2 }' gates.txt)" $GATES

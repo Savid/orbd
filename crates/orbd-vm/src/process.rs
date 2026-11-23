@@ -84,8 +84,7 @@ pub struct LaunchRecord<C> {
     pub config: C,
     pub pid: Option<i32>,
     pub start_time: Option<u64>,
-    /// Who the VMM runs as in its jail; None if it runs unjailed (as its supervisor, or
-    /// launched by an orbd without jails).
+    /// Who the VMM runs as in its jail; None if it runs unjailed, as its supervisor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jail: Option<JailIdentity>,
 }

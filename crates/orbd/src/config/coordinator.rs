@@ -17,7 +17,7 @@
 //! ```
 //!
 //! Without `config_version` (v1) the file lists `offerings`, each pinned to a runtime,
-//! and `providers` or per-offering provider tokens. A v2 file is turned into v1
+//! and `providers`. A v2 file is turned into v1
 //! offerings at load (see [`CoordinatorConfig::normalize`]), so everything after loading
 //! sees one form.
 //!
@@ -129,9 +129,9 @@ pub enum ConfigVersion {
 pub struct ProviderV2Config {
     /// `AMP_ORB_PROVIDER_TOKEN` of the provider.
     pub token_file: PathBuf,
-    /// Tokens of providers being retired, e.g. v1's per-offering ones. They are still
-    /// served so their threads keep their orbs; a spawn of a new orb from one gets the
-    /// default orb type. Drop them once those threads are gone.
+    /// Tokens of providers being retired. They are still served so their threads keep
+    /// their orbs; a spawn of a new orb from one gets the default orb type. Drop them
+    /// once those threads are gone.
     #[serde(default)]
     pub retired_token_files: Vec<PathBuf>,
 }
@@ -333,9 +333,6 @@ fn default_amp_cli() -> PathBuf {
 #[serde(deny_unknown_fields)]
 pub struct OfferingConfig {
     pub id: OfferingId,
-    /// `AMP_ORB_PROVIDER_TOKEN` for this offering's `amp orb provider` child.
-    /// When absent the offering is served for local dispatch only (tests).
-    pub provider_token_file: Option<PathBuf>,
     pub runtime: OfferingRuntime,
     /// For `runtime: boat`, the vCPUs and memory of a Boat size (see
     /// [`crate::backend::boat::SIZES`]).
@@ -562,7 +559,6 @@ impl CoordinatorConfig {
             for (i, &(runtime, arch)) in places.iter().enumerate() {
                 self.offerings.push(OfferingConfig {
                     id: id(i, (runtime, arch)),
-                    provider_token_file: None,
                     runtime,
                     resources: ResourcesConfig {
                         vcpus: t.vcpus,
@@ -720,11 +716,7 @@ impl CoordinatorConfig {
         }
         // Amp splits one token's jobs between all the providers polling with it.
         let mut tokens = HashSet::new();
-        let token_files = self
-            .offerings
-            .iter()
-            .filter_map(|o| o.provider_token_file.as_ref());
-        for t in token_files.chain(self.providers.iter().map(|p| &p.token_file)) {
+        for t in self.providers.iter().map(|p| &p.token_file) {
             if !tokens.insert(t) {
                 return inv(format!(
                     "provider token file {} is used twice; each provider needs its own token",
@@ -761,7 +753,6 @@ mod tests {
     fn offering(id: &str, runtime: OfferingRuntime, vcpus: u32, memory_mib: u64) -> Offering {
         OfferingConfig {
             id: OfferingId::new(id),
-            provider_token_file: None,
             runtime,
             resources: ResourcesConfig {
                 vcpus,
@@ -808,9 +799,9 @@ mod tests {
             let yaml = format!(
                 "public_url: https://c.example:7443\n\
                  offerings:\n  - id: qemu-4vcpu-8gb\n    runtime: qemu\n    \
-                 resources: {{ vcpus: 4, memory_mib: 8192, disk_gib: 40 }}\n    \
-                 provider_token_file: /t/qemu\n\
-                 providers:\n{providers}"
+                 resources: {{ vcpus: 4, memory_mib: 8192, disk_gib: 40 }}\n\
+                 providers:\n  - {{ id: other, token_file: /t/qemu, orb_types: [qemu-4vcpu-8gb] }}\n\
+                 {providers}"
             );
             serde_saphyr::from_str::<CoordinatorConfig>(&yaml)
                 .unwrap()

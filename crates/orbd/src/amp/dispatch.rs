@@ -27,8 +27,8 @@ pub mod exit {
     pub const DEADLINE: i32 = 124;
 }
 
-/// Environment set by the coordinator for its `amp orb provider` children: the
-/// offering, or for a provider with orb types the provider.
+/// Environment of a dispatch: the provider, set by the coordinator for its `amp orb
+/// provider` children, or an offering for local dispatch (tests).
 pub const ENV_OFFERING_ID: &str = "ORBD_OFFERING_ID";
 pub const ENV_PROVIDER_ID: &str = "ORBD_PROVIDER_ID";
 pub const ENV_DISPATCH_SOCKET: &str = "ORBD_DISPATCH_SOCKET";
@@ -142,10 +142,6 @@ fn build_job() -> Result<Job, String> {
             amp_orb_id,
             remaining_budget_ms: 0,
             resume_after_log_seq: 0,
-            amp_url: var("AMP_URL").unwrap_or_default(),
-            amp_thread_id: var("AMP_THREAD_ID").unwrap_or_default(),
-            amp_sandbox_id: var("AMP_SANDBOX_ID").unwrap_or_default(),
-            orb_sandbox_id: var("ORB_SANDBOX_ID").unwrap_or_default(),
             action: Some(action),
             provider_id,
             orb_type: var("ORB_TYPE").unwrap_or_default(),

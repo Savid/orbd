@@ -257,11 +257,6 @@ pub(crate) fn info_of(manifest: &impl serde::Serialize) -> CheckpointInfo {
     info
 }
 
-/// Size of a checkpoint file, for manifests and compatibility checks.
-pub fn file_len(path: &Path) -> Result<u64, RuntimeError> {
-    std::fs::metadata(path).map(|m| m.len()).map_err(io_err)
-}
-
 /// Blocks allocated by the files directly in `dir` (a checkpoint has no subdirectories).
 fn allocated_bytes(dir: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;

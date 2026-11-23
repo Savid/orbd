@@ -296,18 +296,15 @@ message DeleteRequest {}
 message DispatchRequest {
   // UUID chosen by the `orbd dispatch` process; reused when it reconnects.
   string invocation_id = 1;
-  // Trusted offering id from ORBD_OFFERING_ID (set by the coordinator for its child).
-  // Empty when the job came from a provider with orb types (provider_id).
+  // Offering id from ORBD_OFFERING_ID, for local dispatch (tests). Empty for a job from
+  // a provider child, which the coordinator gives ORBD_PROVIDER_ID (provider_id).
   string offering_id = 2;
   string amp_orb_id = 3;          // ORB_ID
   uint64 remaining_budget_ms = 4; // remaining dispatch budget when sent
   // On reconnect: resume logs after this sequence number (0 = from the start).
   uint64 resume_after_log_seq = 5;
-  // Informational Amp fields, validated against configuration where applicable.
-  string amp_url = 6;
-  string amp_thread_id = 7;
-  string amp_sandbox_id = 8;
-  string orb_sandbox_id = 9;
+  reserved 6 to 9;
+  reserved "amp_url", "amp_thread_id", "amp_sandbox_id", "orb_sandbox_id";
 
   oneof action {
     SpawnRequest spawn = 10;
@@ -433,7 +430,8 @@ message Hello {
   // what orbd may actually allocate under the agent's state directory (not the sum of
   // orb disk sizes, which are sparse).
   Resources capacity = 5;
-  uint64 last_controller_epoch = 6; // highest epoch this agent has accepted
+  reserved 6;
+  reserved "last_controller_epoch";
   repeated string project_snapshot_keys = 7; // project snapshots published on this host
   // Overflow agent (e.g. a laptop or workstation): a new orb goes here only when no other
   // agent fits it.
@@ -445,7 +443,8 @@ message Heartbeat {
   Resources reserved = 2;           // agent-local reservations (running/starting orbs)
   // Filesystem holding the agent's state directory: bytes available to the agent.
   uint64 disk_free_bytes = 3;
-  uint32 memory_pressure_permille = 4;
+  reserved 4;
+  reserved "memory_pressure_permille";
   // The agent is shutting down: it accepts no new commands and is checkpointing its
   // running orbs, which it restores when it starts again.
   bool draining = 5;
@@ -455,7 +454,6 @@ message Heartbeat {
   // snapshots; sparse files count only their allocated blocks). Measured periodically.
   uint64 disk_allocated_bytes = 7;
   // Free space the agent keeps: orbs are refused once free space would drop below it.
-  // With disk_total_bytes 0 (an older agent), the coordinator assumes 10 GiB.
   uint64 disk_reserve_bytes = 8;
   // The host's available memory (MemAvailable) and the part of it the agent keeps:
   // orbs are refused unless what is left holds them. 0 = not reported.
@@ -626,7 +624,8 @@ message CreateJoinTokenRequest {
 
 message CreateJoinTokenResponse {
   string token = 1;
-  uint64 expires_unix_ms = 2;
+  reserved 2;
+  reserved "expires_unix_ms";
 }
 
 message ListAgentsRequest {}

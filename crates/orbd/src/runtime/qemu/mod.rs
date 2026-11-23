@@ -20,8 +20,7 @@
 //!
 //! On Linux each QEMU runs in its orb's jail (`super::vm::jail`) unless
 //! `ORBD_VMM_JAIL=off`, in the orb's own network namespace behind orbd's egress filter,
-//! as Firecracker orbs do; an orb created with QEMU's user-mode network (orbd 0.2.8 or
-//! earlier) is refused. macOS orbs use QEMU's user-mode network, fenced by pf
+//! as Firecracker orbs do. macOS orbs use QEMU's user-mode network, fenced by pf
 //! (`network_group`).
 //!
 //! Every publication is rename-based and fsynced, and every method first reconciles
@@ -853,11 +852,15 @@ impl QemuRuntime {
         Ok(())
     }
 
-    /// Linux QEMU orbs run only in their own network namespace: one created with QEMU's
-    /// user-mode network (orbd 0.2.8 or earlier) is refused.
+    /// Linux QEMU orbs run only in their own network namespace, never on QEMU's
+    /// unfiltered user-mode network.
     fn check_net(&self, net: &NetAttachment) -> Result<(), RuntimeError> {
         if cfg!(target_os = "linux") && !net.is_tap() {
-            return Err(RuntimeError::Unsupported(LEGACY_USER_NETWORK.into()));
+            return Err(RuntimeError::Unsupported(
+                "this QEMU orb's recipe names QEMU's unfiltered user-mode network, which Linux \
+                 agents do not run: delete it (`orbd orb delete`) and Amp starts a new one"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -1687,11 +1690,6 @@ impl Runtime for QemuRuntime {
         self
     }
 }
-
-/// Why a Linux QEMU orb on QEMU's user-mode network does not start.
-const LEGACY_USER_NETWORK: &str = "this QEMU orb was created by orbd 0.2.8 or earlier, on QEMU's \
-     unfiltered user-mode network, which Linux agents no longer run: delete it (`orbd orb \
-     delete`) and Amp starts a new one";
 
 /// Runs a program with the group it is setgid to (`src/bin/orbd-netgroup.rs`).
 pub(crate) const GROUP_EXEC: &str = "orbd-netgroup";

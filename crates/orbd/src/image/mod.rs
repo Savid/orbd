@@ -29,7 +29,7 @@ mod registry;
 mod rootfs;
 mod sandbox;
 
-pub use integration::IntegrationLayer;
+pub use integration::{GUEST_HELPER_PATH, IntegrationLayer};
 pub(crate) use rootfs::DOCKER_RUN;
 pub use rootfs::UMOCI_VERSION;
 
@@ -63,7 +63,7 @@ pub struct PreparedImage {
     /// Size of `rootfs` in bytes (the filesystem size; orb disks grow beyond it).
     pub rootfs_bytes: u64,
     /// What a project snapshot must descend from to stand in for this image: see
-    /// [`lineage`]. None for images published before orbd recorded it.
+    /// [`lineage`]. None for an image with neither an os-release nor layers.
     pub lineage: Option<String>,
 }
 
@@ -99,7 +99,7 @@ struct ImageMeta {
     guest_integration_digest: String,
     rootfs_bytes: u64,
     created_unix: u64,
-    /// See [`lineage`]; absent in images published by older orbd.
+    /// See [`lineage`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lineage: Option<String>,
 }

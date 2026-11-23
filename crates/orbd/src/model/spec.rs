@@ -53,13 +53,6 @@ impl Resources {
             disk_bytes: self.disk_bytes.saturating_sub(o.disk_bytes),
         }
     }
-
-    /// True when every dimension of `self` fits within `ceiling`.
-    pub fn fits_within(self, ceiling: Self) -> bool {
-        self.vcpus <= ceiling.vcpus
-            && self.memory_bytes <= ceiling.memory_bytes
-            && self.disk_bytes <= ceiling.disk_bytes
-    }
 }
 
 /// Where an offering executes.
