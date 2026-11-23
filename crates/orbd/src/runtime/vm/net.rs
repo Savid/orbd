@@ -1797,7 +1797,8 @@ mod tests {
         nft(&host_table(&Egress::default(), &[], &[])).unwrap();
         let receiver = in_netns("inet", || {
             let s = std::net::UdpSocket::bind("8.8.8.8:9999").map_err(|e| e.to_string())?;
-            s.set_read_timeout(Some(std::time::Duration::from_millis(700)))
+            // How long a dropped datagram is waited for; delivery takes well under 1 ms.
+            s.set_read_timeout(Some(std::time::Duration::from_millis(300)))
                 .map_err(|e| e.to_string())?;
             Ok(s)
         })

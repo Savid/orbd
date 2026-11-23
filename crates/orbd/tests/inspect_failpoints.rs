@@ -6,7 +6,6 @@
 mod common;
 use common::*;
 use serde_json::Value;
-use std::time::Duration;
 
 fn start(c: &mut Cluster, failpoints: &str) {
     c.start_coordinator("");
@@ -25,7 +24,8 @@ fn json(job: &Job, what: &str) -> Value {
 #[test]
 fn a_waking_orb_is_not_blocked_by_its_own_reservation() {
     let mut c = Cluster::new(&["agent-a"], 2);
-    start(&mut c, "fake::start::delay=return(3000)");
+    // Only the fourth start, the wake below, is slow.
+    start(&mut c, "fake::start::delay=3*off->return(3000)");
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn 1");
     assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause 1");
     assert_ok(&c.dispatch("spawn", "amp-2", &[]), "spawn 2");
@@ -34,10 +34,7 @@ fn a_waking_orb_is_not_blocked_by_its_own_reservation() {
     assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2");
 
     let wake = c.dispatch_bg("spawn", "amp-1", &[]);
-    wait_until(Duration::from_secs(10), "the wake in flight", || {
-        let o = c.admin(&["orb", "show", "amp-1", "--json"]);
-        o.stdout.contains("\"open_command\": {")
-    });
+    c.wait_open_command("amp-1");
     let one = json(&c.admin(&["orb", "show", "amp-1", "--json"]), "show");
     assert_eq!(one["open_command"]["action"], "spawn");
     assert_eq!(one["wake_blockers"], serde_json::json!([]), "{one}");

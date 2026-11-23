@@ -62,14 +62,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked --features "${{ matrix.features }}" -- -D warnings
 
+  # With failpoints: every test, plus those that inject faults. Failpoints that are not
+  # set do nothing, and clippy checks the default build.
   test:
-    name: test (${{ matrix.features || 'default' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        features: ["", orbd/failpoints]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,7 +74,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          key: ${{ matrix.features }}
+          key: orbd/failpoints
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # orbd's nftables table is loaded in a throwaway user and network namespace
       # (ORBD_TEST_NFT makes that test fail instead of skipping).
@@ -86,7 +83,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq nftables
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           unshare -rn nft list ruleset
-      - run: cargo test --workspace --locked --features "${{ matrix.features }}"
+      - run: cargo test --workspace --locked --features orbd/failpoints
         env:
           ORBD_TEST_NFT: "1"
 
@@ -111,6 +108,44 @@ jobs:
   build:
     uses: ./.github/workflows/build.yml
 
+  # The KVM gates and the root-only unit tests, built once for every kvm job (beside the
+  # release build, not after it): static musl binaries run in the image whatever its libc.
+  gates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
+          sudo apt-get install -y -qq musl-tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: kvm-musl
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          exes() { jq -r 'select(.profile.test == true) | "\(.target.name) \(.executable)"'; }
+          {
+            cargo test --locked -p orbd --features failpoints --test kvm \
+              --target x86_64-unknown-linux-musl --no-run --message-format=json | exes
+            cargo test --locked -p orbd-vm -p orbd-qemu -p orbd --lib \
+              --target x86_64-unknown-linux-musl --no-run --message-format=json | exes
+          } | sed "s|$PWD/||" >gates.txt
+          cat gates.txt
+          # The gates run the orbd built with them (CARGO_BIN_EXE_orbd, an absolute path:
+          # every job checks out to the same one). A tar keeps the modes.
+          cut -d' ' -f2 gates.txt | xargs tar -cf gates.tar gates.txt target/x86_64-unknown-linux-musl/debug/orbd
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gates
+          path: gates.tar
+          if-no-files-found: error
+          retention-days: 14
+
   # The amd64 image for the kvm jobs, and separately the multi-arch build, so the kvm
   # jobs do not wait for arm64.
   image:
@@ -131,27 +166,32 @@ jobs:
   # pull requests run here too. Every suite runs inside the image built above, so they
   # test the shipped QEMU, Firecracker and guest kernel.
   # - qemu, firecracker: the gates in tests/kvm.rs (ignored by default) through a real
-  #   coordinator and agent, on that runtime.
+  #   coordinator and agent, on that runtime, split across three runners of about the same
+  #   length: the crash-boundary gate; sleep, project snapshots and restricted egress; the
+  #   rest (agent restarts and upgrades, flow log, nested KVM).
   # - container: tests/container-e2e.sh, the coordinator and agent containers as deployed,
   #   with a QEMU and a Firecracker orb on one agent.
   kvm:
     name: kvm (${{ matrix.suite }}${{ matrix.part && format(', {0}', matrix.part) || '' }})
-    needs: [build, image]
+    needs: [build, image, gates]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        # The crash-boundary gate takes about as long as the other gates together, so each
-        # VM runtime runs it on a runner of its own.
+        suite: [qemu, firecracker]
+        part: [crash, sleep, rest]
         include:
-          - { suite: qemu, part: crash, gates: agent_crash_at_publication_boundaries }
-          - { suite: qemu, part: rest, gates: --skip agent_crash_at_publication_boundaries }
-          - { suite: firecracker, part: crash, gates: agent_crash_at_publication_boundaries }
-          - { suite: firecracker, part: rest, gates: --skip agent_crash_at_publication_boundaries }
-          - { suite: container }
+          - part: crash
+            gates: agent_crash_at_publication_boundaries
+          - part: sleep
+            gates: sleep_preserves spawn_boots_from_project_snapshot restricted_egress
+          - part: rest
+            gates: >-
+              --skip agent_crash_at_publication_boundaries --skip sleep_preserves
+              --skip spawn_boots_from_project_snapshot --skip restricted_egress
+          - suite: container
     env:
-      # Not under target/: the rust cache restores target/ over it.
       ROOTFS: kvm-guest/rootfs.ext4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -181,9 +221,11 @@ jobs:
           esac
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: "{image-amd64,guest-kernel,orbd-guest-*}"
+          pattern: "{image-amd64,guest-kernel,orbd-guest-*,gates}"
           path: artifacts
-      - run: zstd -dc artifacts/image-amd64/image-amd64.tar.zst | docker load
+      - run: |
+          zstd -dc artifacts/image-amd64/image-amd64.tar.zst | docker load
+          tar -xf artifacts/gates/gates.tar
       - id: rootfs
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -201,25 +243,6 @@ jobs:
           crates/orbd/tests/kvm-guest/build-rootfs.sh \
             artifacts/orbd-guest-x86_64-unknown-linux-musl/orbd-guest artifacts/guest-kernel/bzImage "$ROOTFS"
 
-      # Static musl test binaries run in the image whatever its libc.
-      - if: matrix.suite != 'container'
-        run: |
-          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
-          sudo apt-get install -y -qq musl-tools
-      - if: matrix.suite != 'container'
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: kvm-musl
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: matrix.suite != 'container'
-        name: Build the gates
-        env:
-          CARGO_PROFILE_DEV_DEBUG: "0"
-        run: |
-          cargo test --locked -p orbd --features failpoints --test kvm \
-            --target x86_64-unknown-linux-musl --no-run --message-format=json |
-            jq -r 'select(.profile.test == true and .target.name == "kvm") | .executable' >gates.txt
-          cat gates.txt
       - if: matrix.suite != 'container'
         name: Run the gates in the image
         # procps provides the `kill` the test harness runs; QEMU is the image's own.
@@ -237,20 +260,15 @@ jobs:
             -e ORBD_KVM_RUNTIME=${{ matrix.suite }} \
             --entrypoint sh orbd:smoke -c \
             'apt-get update -qq && apt-get install -y -qq procps >/dev/null && exec "$0" --ignored --test-threads=1 --nocapture "$@"' \
-            "$(cat gates.txt)" $GATES
-      - if: matrix.suite == 'firecracker' && matrix.part == 'rest'
+            "$PWD/$(awk '$1 == "kvm" { print $2 }' gates.txt)" $GATES
+      - if: matrix.suite == 'qemu' && matrix.part == 'rest'
         name: Root-only unit tests in the image
         # The VMM jail, the disk tools and image sandbox as deployed: root in the image with
         # the README's agent flags. ORBD_TEST_JAIL=1 turns a skipped test into a failure.
         # Docker's default seccomp refuses pivot_root, so the jail takes its fallback
         # there; seccomp=unconfined runs its pivot_root path too.
-        env:
-          CARGO_PROFILE_DEV_DEBUG: "0"
         run: |
-          cargo test --locked -p orbd-vm -p orbd-qemu -p orbd --lib \
-            --target x86_64-unknown-linux-musl --no-run --message-format=json |
-            jq -r 'select(.profile.test == true) | .executable' >libtests.txt
-          exe() { grep "/$1-" libtests.txt; }
+          exe() { awk -v n="$1" '$1 == n { print $2 }' gates.txt; }
           for seccomp in default unconfined; do
             docker run --rm --cap-add SYS_ADMIN --cap-add NET_ADMIN \
               --device /dev/kvm --device /dev/net/tun \
@@ -271,11 +289,13 @@ jobs:
   # Single required status check for branch rules and auto-merge.
   ci-ok:
     if: always()
-    needs: [fmt, deny, clippy, test, macos, build, image, image-multiarch, kvm]
+    needs: [fmt, deny, clippy, test, macos, build, gates, image, image-multiarch, kvm]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: All CI jobs succeeded
-        run: test "$RESULTS" = "success"
+        run: |
+          echo "$RESULTS"
+          for r in $RESULTS; do [ "$r" = success ] || exit 1; done
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') == 'success success success success success success success success success' && 'success' || 'failure' }}
+          RESULTS: ${{ join(needs.*.result, ' ') }}
