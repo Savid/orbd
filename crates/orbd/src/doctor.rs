@@ -125,15 +125,25 @@ pub(crate) fn kvm_usable() -> Result<(), String> {
 #[cfg(not(target_os = "macos"))]
 fn kvm() -> Result<String, String> {
     kvm_usable()?;
+    Ok("API 12".into())
+}
+
+/// Whether the host's KVM nests, so orbs of types with `kvm` can run here (with
+/// `ORBD_NESTED_KVM=true`). Optional: no orb gets `/dev/kvm` by default.
+#[cfg(not(target_os = "macos"))]
+fn nested_kvm() -> Result<String, String> {
     let nested = ["kvm_intel", "kvm_amd"].iter().find_map(|m| {
         let v = std::fs::read_to_string(format!("/sys/module/{m}/parameters/nested")).ok()?;
         Some(format!("{m} nested={}", v.trim()))
     });
     let nested = nested.unwrap_or_else(|| "nested support unknown".into());
     if nested.ends_with("=N") || nested.ends_with("=0") {
-        return Err(format!("API 12, {nested}: orbs get no /dev/kvm"));
+        return Err(format!(
+            "{nested}: orbs of types with kvm cannot run here (they need a host whose KVM \
+             nests, and ORBD_NESTED_KVM=true)"
+        ));
     }
-    Ok(format!("API 12, {nested}"))
+    Ok(nested)
 }
 
 /// macOS: pf blocks QEMU's network group (`runtime::qemu::fence`), probed as the agent
@@ -260,6 +270,8 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
         r.line(first_line(Path::new("nft"), &["--version"]), "nft", root);
     }
     r.line(accel(), ACCEL_NAME, true);
+    #[cfg(not(target_os = "macos"))]
+    r.line(nested_kvm(), "nested KVM", false);
     if cfg!(target_os = "macos") {
         // Required unless the agent runs QEMU orbs unfenced on purpose.
         // As the agent's flag reads it: `true` (it refuses anything but true or false).

@@ -57,7 +57,7 @@ Measured on a Ryzen 9 7940HS with a 2 vCPU / 4 GiB orb on Amp's orb image.
 | Wake                    | ~0.3 s         | ~0.05 s     | ~0.5 s      |
 | Processes kept on sleep | ✅             | ✅          | ❌          |
 | No host RAM while asleep | ✅            | ✅          | ✅          |
-| `/dev/kvm` in the orb   | ✅             | ❌          | ❌          |
+| `/dev/kvm` in the orb   | opt-in (amd64) | ❌          | ❌          |
 | Status                  | ✅ works       | ✅ works    | ✅ works    |
 
 ## Build
@@ -87,8 +87,9 @@ Static binaries for x86_64 and aarch64 are attached to each release.
    ```
 
    An orb type says what an orb gets; orbd decides where it runs. On the agents an orb
-   type with `kvm: true` runs in QEMU and has `/dev/kvm`, any other in Firecracker
-   (vCPUs: 1 or an even number). A spawn of a new orb uses the orb type the thread
+   type with `kvm: true` runs in QEMU and has `/dev/kvm`, only on agents started with
+   `ORBD_NESTED_KVM=true` (below); any other runs in Firecracker (vCPUs: 1 or an even
+   number). A spawn of a new orb uses the orb type the thread
    picked, or the first one if it has none; an orb type not listed fails the spawn. An
    orb keeps its orb type and place for life, whatever later jobs name.
    `arch` says which CPU architectures a new orb may get: `amd64` (the default),
@@ -119,6 +120,12 @@ Static binaries for x86_64 and aarch64 are attached to each release.
      --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
      -v orbd-agent:/var/lib/orbd -e ORBD_JOIN=<token> ghcr.io/samcm/orbd agent
    ```
+
+   Agents run only VM orbs and give no orb `/dev/kvm` unless told to: add
+   `-e ORBD_NESTED_KVM=true` on the agents meant for `kvm` orb types. Set
+   `ORBD_IMAGE_ALLOW` to the images your Amp projects use (e.g.
+   `us-central1-docker.pkg.dev/amp-prod-0/amp-orb/*`), so a project cannot make your
+   agents pull and unpack anything else (below).
 
    The agent needs no `--privileged`. On top of Docker's default capabilities it needs
    `CAP_SYS_ADMIN` (namespaces and mounts for VMM jails, image sandboxes and orb
@@ -216,7 +223,8 @@ fails with `image <ref> is not allowed on this agent (ORBD_IMAGE_ALLOW)`, and pr
 images it does not list are skipped. Disks that exist already are not checked: orbs
 keep running, and a project snapshot on the agent built from an image the list no longer
 allows is still used while its image lineage (Debian release) matches the spawn's.
-Unset (the default) allows any image; the agent logs which applies when it starts.
+Unset (the default) allows any image; the agent logs which applies when it starts. Set
+it: an Amp project's image is otherwise whatever its owner names.
 
 On Linux, umoci, `du` and `mkfs.ext4` handle the image's files in a sandbox
 (`ORBD_IMAGE_SANDBOX=on`, the default): as root of a user namespace whose ids 0-65535
@@ -374,17 +382,20 @@ no usable bootstrap environment), the providers go back to the known-good copy a
 version is never run again; the next release gets its own probation. A broken release
 therefore costs a couple of failed spawns, which Amp retries, instead of an outage.
 
-Agents use QEMU and Firecracker when `/dev/kvm` works, otherwise Docker (mount
-`/var/run/docker.sock`), and keep the runtime they started with. Docker orbs are
-containers sharing the host's kernel; `ORBD_VM_ONLY=true` keeps an agent from ever using
-Docker: it starts only when a VM runtime works, and refuses an agent config with
-`runtime.docker` or a state directory set up for Docker orbs. Nested virtualization
-exposes more of the host's KVM to orbs: an agent started with `ORBD_NESTED_KVM=false`
-advertises none, so the coordinator places no orb type with `kvm` on it, and refuses to
+Agents use QEMU and Firecracker, and start only when they can run them
+(`ORBD_VM_ONLY=true`, the default): on Linux `/dev/kvm` must work; on macOS QEMU must be
+installed and on the agent's `PATH`. Docker orbs are containers sharing the host's
+kernel: an agent runs them only with `ORBD_VM_ONLY=false`, and then uses Docker (mount
+`/var/run/docker.sock`) when `/dev/kvm` does not work or its config has
+`runtime.docker`. An agent keeps the runtime it started with, so one set up for Docker
+orbs refuses to start without `ORBD_VM_ONLY=false`. Nested virtualization exposes more
+of the host's KVM to orbs, so agents allow none by default: only one started with
+`ORBD_NESTED_KVM=true` advertises it, so the coordinator places orb types with `kvm`
+only there (a spawn finding none fails, saying so). An agent without it refuses to
 start such an orb itself (one created there earlier, or one a coordinator sends anyway);
-it still pauses and deletes them. A QEMU orb whose type has no `kvm`, or any on such an
-agent, sees no VMX or SVM from its next cold boot (a sleeping orb wakes with the CPU it
-slept with). On `docker stop` an agent saves its running VM orbs and
+it still pauses and deletes them. On x86, a QEMU orb whose type has no `kvm`, or any on
+such an agent, sees no VMX or SVM from its next cold boot (a sleeping orb wakes with the
+CPU it slept with). On `docker stop` an agent saves its running VM orbs and
 restores them when it starts again,
 so give it time (`--stop-timeout 300`; under systemd, `KillMode=mixed` and
 `TimeoutStopSec=300`). When the host shuts down, systemd stops `docker.service` itself,
@@ -400,6 +411,17 @@ reach the agent itself, each other or private networks (see above). A sleeping o
 only on the VMM build and CPU it slept on, so after an upgrade it cold-boots once; the
 agent deletes such memory checkpoints when it starts, as it deletes every checkpoint that
 was restored or superseded.
+
+### Upgrading to 0.4
+
+Agents are VM-only and allow no nested KVM unless told otherwise:
+
+- An agent running Docker orbs refuses to start until it has `ORBD_VM_ONLY=false`.
+- Agents meant for orb types with `kvm` need `ORBD_NESTED_KVM=true`. Without it, new
+  orbs of those types find no agent. Running ones are checkpointed when the agent stops,
+  as always, but the new agent refuses to restore or wake them: they stay asleep with
+  their checkpoint until it runs with `ORBD_NESTED_KVM=true` (unless the checkpoint is
+  dropped meanwhile, by `ORBD_CHECKPOINT_MAX_AGE_HOURS` or a new QEMU or kernel).
 
 ### Inside an orb
 

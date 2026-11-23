@@ -274,19 +274,31 @@ struct AgentArgs {
     /// destination and whether the egress policy accepted or dropped it.
     #[arg(long, env = "ORBD_FLOW_LOG")]
     flow_log: bool,
-    /// Run orbs only in VMs (QEMU, Firecracker), never in Docker containers: start only
-    /// if a VM runtime is usable, and refuse a Docker runtime that is configured or that
-    /// this agent was set up with.
-    #[arg(long, env = "ORBD_VM_ONLY")]
+    /// Run orbs only in VMs (QEMU, Firecracker; the default): start only if a VM runtime
+    /// is usable. `false` lets this agent run Docker orbs, containers sharing the host's
+    /// kernel: when no VM runtime is usable, when its config has `runtime.docker`, or when
+    /// it was set up with them.
+    #[arg(
+        long,
+        env = "ORBD_VM_ONLY",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     vm_only: bool,
     /// Give orbs of types with `kvm` their `/dev/kvm` (nested virtualization in QEMU).
-    /// `false`: this agent advertises no nested KVM, so the coordinator places no such orb
-    /// here, and it refuses to start one itself (e.g. one created here earlier).
+    /// Off by default: this agent then advertises no nested KVM, so the coordinator places
+    /// no such orb here, and it refuses to start one itself (e.g. one created here
+    /// earlier).
     #[arg(
         long,
         env = "ORBD_NESTED_KVM",
-        default_value_t = true,
+        default_value_t = false,
         action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     nested_kvm: bool,
@@ -582,4 +594,30 @@ fn shutdown_on_signal() -> CancellationToken {
         t.cancel();
     });
     token
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(args: &[&str]) -> Box<AgentArgs> {
+        let argv = ["orbd", "agent"].iter().chain(args);
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Agent { manage: None, run } => run,
+            _ => panic!("not `orbd agent`"),
+        }
+    }
+
+    /// Agents are VM-only and allow no nested KVM unless told otherwise; the bare flags
+    /// and boolean values still work. (Set in the environment, `ORBD_VM_ONLY` and
+    /// `ORBD_NESTED_KVM` would override these defaults: not set in tests.)
+    #[test]
+    fn agent_defaults_are_vm_only_without_nested_kvm() {
+        let a = agent(&[]);
+        assert!(a.vm_only && !a.nested_kvm);
+        let a = agent(&["--vm-only=false", "--nested-kvm"]);
+        assert!(!a.vm_only && a.nested_kvm);
+        let a = agent(&["--vm-only", "--nested-kvm", "false"]);
+        assert!(a.vm_only && !a.nested_kvm);
+    }
 }

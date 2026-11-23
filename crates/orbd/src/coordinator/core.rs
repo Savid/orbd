@@ -1015,24 +1015,25 @@ impl Core {
                 },
             )
             .await;
-        let (available, unavailable): (Vec<PlacementCandidate>, Vec<PlacementCandidate>) = cands
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| c.capabilities.check(&offering.spec).is_empty())
-            .partition(|c| c.availability == Availability::Available);
+        let Some(cands) = cands else {
+            return Ok(Err(refuse(
+                FailureCode::BackendUnavailable,
+                "no available host can run this offering (the backend did not list its hosts)",
+            )));
+        };
+        let available: Vec<PlacementCandidate> = cands
+            .iter()
+            .filter(|c| {
+                c.availability == Availability::Available
+                    && c.capabilities.check(&offering.spec).is_empty()
+            })
+            .cloned()
+            .collect();
         if available.is_empty() {
-            let reasons: Vec<&str> = unavailable
-                .iter()
-                .filter_map(|c| match &c.availability {
-                    Availability::Unavailable { reason } => Some(reason.as_str()),
-                    _ => None,
-                })
-                .collect();
-            let mut message = "no available host can run this offering".to_owned();
-            if !reasons.is_empty() {
-                message = format!("{message} ({})", reasons.join("; "));
-            }
-            return Ok(Err(refuse(FailureCode::BackendUnavailable, message)));
+            return Ok(Err(refuse(
+                FailureCode::BackendUnavailable,
+                no_host_message(&offering.spec, &cands),
+            )));
         }
         let demand = self.demand(&offering.spec);
         let mut fitting: Vec<(PlacementCandidate, u64)> = Vec::new();
@@ -2052,6 +2053,70 @@ pub(super) fn shortfalls(
     out
 }
 
+/// Why no host can take a new orb of `spec`, given its runtime's hosts (`cands`), none
+/// of them both available and able to run it: the hosts that could run it but are not
+/// available, then what the others lack (once each), or that there are none at all.
+fn no_host_message(spec: &SpecTemplate, cands: &[PlacementCandidate]) -> String {
+    let mut reasons: Vec<String> = Vec::new();
+    if cands.is_empty()
+        && let ExecutionTarget::Fleet { runtime } = &spec.target
+    {
+        reasons.push(match runtime {
+            RuntimeKind::Docker => "no agent runs docker orbs (agents run them only with \
+                ORBD_VM_ONLY=false)"
+                .into(),
+            r => format!("no agent runs {} orbs", r.as_str()),
+        });
+    }
+    let mut lacking: Vec<CapabilityMismatch> = Vec::new();
+    for c in cands {
+        let m = c.capabilities.check(spec);
+        if m.is_empty() {
+            match &c.availability {
+                Availability::Unavailable { reason } => {
+                    reasons.push(format!("{}: {reason}", c.capacity_pool))
+                }
+                Availability::Draining => reasons.push(format!("{}: draining", c.capacity_pool)),
+                Availability::Available => {}
+            }
+        }
+        for x in m {
+            if !lacking.contains(&x) {
+                lacking.push(x);
+            }
+        }
+    }
+    // A host with nested KVM that is not available is named above instead.
+    let nests = cands
+        .iter()
+        .any(|c| c.capabilities.nested_kvm == Support::Supported);
+    let (mut want, mut have) = (None, Vec::new());
+    for m in &lacking {
+        match m {
+            CapabilityMismatch::NestedKvm if nests => {}
+            CapabilityMismatch::NestedKvm => reasons.push(
+                "its type has kvm, which needs ORBD_NESTED_KVM=true on a host whose KVM nests"
+                    .into(),
+            ),
+            CapabilityMismatch::Arch(w, h) => {
+                want = Some(*w);
+                if !have.contains(h) {
+                    have.push(*h);
+                }
+            }
+            other => reasons.push(other.to_string()),
+        }
+    }
+    if let Some(w) = want {
+        reasons.push(format!("{} hosts cannot run {w} orbs", have.join(" and ")));
+    }
+    let mut message = "no available host can run this offering".to_owned();
+    if !reasons.is_empty() {
+        message = format!("{message} ({})", reasons.join("; "));
+    }
+    message
+}
+
 fn describe(short: &[(FailureCode, String)]) -> String {
     short
         .iter()
@@ -2123,6 +2188,92 @@ fn command_digest(plan: &CreatePlan, spec_digest: &SpecDigest) -> String {
 mod tests {
     use super::*;
     use crate::model::{AgentId, BackendId, DiskReport, MemoryReport, RuntimeKind};
+
+    /// A new orb no host can take says why: hosts that could run it but are not
+    /// available, by name; what the others lack, once each; nested KVM's switch only when
+    /// no host has it at all; and a runtime no agent offers.
+    #[test]
+    fn no_host_message_says_why() {
+        let spec = |kvm: bool, arch: Arch| SpecTemplate {
+            target: ExecutionTarget::Fleet {
+                runtime: RuntimeKind::Qemu,
+            },
+            resources: Resources::default(),
+            requirements: CapabilityRequirements {
+                release_compute_when_paused: true,
+                nested_kvm: if kvm {
+                    NestedKvmRequirement::GuestDevice
+                } else {
+                    NestedKvmRequirement::NotRequired
+                },
+                project_snapshots: SnapshotRequirement::NotRequired,
+                arch,
+                egress: None,
+            },
+            pause_policy: PausePolicy::DiskOnly,
+        };
+        let host = |id: &str, availability: Availability, nests: bool, arch: Arch| {
+            let mut capabilities = crate::backend::fleet::capabilities::ceiling(RuntimeKind::Qemu);
+            capabilities.nested_kvm = if nests {
+                Support::Supported
+            } else {
+                Support::Unsupported
+            };
+            capabilities.arch = Some(arch);
+            PlacementCandidate {
+                location: Location::Fleet {
+                    backend_id: BackendId::new("fleet"),
+                    agent_id: AgentId::new(id.to_owned()),
+                },
+                availability,
+                capabilities,
+                capacity_pool: id.into(),
+                capacity_ceiling: Resources::default(),
+                demand: Resources::default(),
+                disk: None,
+                memory: None,
+                has_project_snapshot: false,
+                overflow: false,
+            }
+        };
+        let kvm = spec(true, Arch::Amd64);
+        let plain = host("a", Availability::Available, false, Arch::Amd64);
+        assert_eq!(
+            no_host_message(&kvm, std::slice::from_ref(&plain)),
+            "no available host can run this offering (its type has kvm, which needs \
+             ORBD_NESTED_KVM=true on a host whose KVM nests)"
+        );
+        // A host with nested KVM that is draining or gone is named instead.
+        for (availability, why) in [
+            (Availability::Draining, "draining"),
+            (
+                Availability::Unavailable {
+                    reason: "agent has not connected".into(),
+                },
+                "agent has not connected",
+            ),
+        ] {
+            let nesting = host("b", availability, true, Arch::Amd64);
+            assert_eq!(
+                no_host_message(&kvm, &[plain.clone(), nesting]),
+                format!("no available host can run this offering (b: {why})")
+            );
+        }
+        let mac = host("m", Availability::Available, false, Arch::Arm64);
+        assert_eq!(
+            no_host_message(&spec(false, Arch::Amd64), &[mac.clone(), mac]),
+            "no available host can run this offering (arm64 hosts cannot run amd64 orbs)"
+        );
+        assert_eq!(
+            no_host_message(&kvm, &[]),
+            "no available host can run this offering (no agent runs qemu orbs)"
+        );
+        let mut docker = spec(false, Arch::Amd64);
+        docker.target = ExecutionTarget::Fleet {
+            runtime: RuntimeKind::Docker,
+        };
+        assert!(no_host_message(&docker, &[]).contains("ORBD_VM_ONLY=false"));
+    }
 
     /// The current policy of a restricted orb's type goes with its commands: an edited
     /// one, the type's own for an orb spilled to another place, none for a type that
