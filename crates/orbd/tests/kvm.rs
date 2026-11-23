@@ -17,8 +17,10 @@
 //!
 //! On Linux every VMM must run jailed (its own uid, no capabilities, only its orb's files)
 //! in its orb's own network namespace behind orbd's egress filter, checked from outside.
-//! `ORBD_KVM_LEGACY_AGENT=<orbd>` (e.g. the previous release's binary) is the older agent
-//! of the upgrade gate; without it, that gate uses this agent with `ORBD_VMM_JAIL=off`.
+//! The upgrade gate needs the previous release's binaries, `ORBD_KVM_PREVIOUS_AGENT=<orbd>`
+//! and `ORBD_KVM_PREVIOUS_GUEST=<orbd-guest>` (put into a copy of the root disk with
+//! `debugfs`), and fails without them unless `ORBD_KVM_PREVIOUS_AGENT=skip`. Only the
+//! agent binary is the previous release's: VMMs, kernel and image are this tree's.
 //!
 //! On an Apple Silicon Mac (QEMU with Hypervisor.framework; arm64 orbs, no `/dev/kvm`)
 //! run as your user with `ORBD_KVM_NESTED=0 TMPDIR=/tmp` (the default temp dir makes
@@ -47,8 +49,15 @@ fn point(name: &str) -> String {
 }
 
 fn cluster(orbs: u64) -> Cluster {
+    cluster_on(
+        orbs,
+        &std::env::var("ORBD_KVM_ROOTFS").expect("set ORBD_KVM_ROOTFS"),
+    )
+}
+
+/// A cluster whose image is the root disk `rootfs`.
+fn cluster_on(orbs: u64, rootfs: &str) -> Cluster {
     let kernel = std::env::var("ORBD_KVM_KERNEL").expect("set ORBD_KVM_KERNEL");
-    let rootfs = std::env::var("ORBD_KVM_ROOTFS").expect("set ORBD_KVM_ROOTFS");
     let rt = runtime();
     if rt == "qemu" && !nested() {
         eprintln!("NOTICE: ORBD_KVM_NESTED=0: the nested KVM guest assertions are SKIPPED");
@@ -163,11 +172,6 @@ fn status(pid: i32, field: &str) -> Vec<String> {
         .split_whitespace()
         .map(str::to_owned)
         .collect()
-}
-
-#[cfg(target_os = "linux")]
-fn uid_of(pid: i32) -> u32 {
-    status(pid, "Uid:")[0].parse().unwrap()
 }
 
 /// The VMM `pid` of the orb at `orb` runs jailed: its own unprivileged uid and gid,
@@ -1207,144 +1211,307 @@ fn spawn_boots_from_project_snapshot() {
     eprintln!("amp-4 (snapshot gone from the host): marker created {other}");
 }
 
-/// An upgrade from an agent whose VMMs ran unjailed (`ORBD_KVM_LEGACY_AGENT`, else this
-/// agent with `ORBD_VMM_JAIL=off`).
-///
-/// Firecracker keeps every orb, each moving into its own jail on its next start: a VMM
-/// left running when the old agent died is adopted unjailed and jailed after a sleep; an
-/// orb asleep under the old agent wakes jailed from the old checkpoint; running orbs
-/// checkpointed by the old agent's graceful stop are restored jailed by the new one
-/// (after a downgrade: the old agent restores the new one's checkpoints). Every counter
-/// continues.
-///
-/// QEMU: an orb on QEMU's user-mode network (all that orbd 0.2.8 and earlier created on
-/// Linux) is refused with one clear error, starts nothing, and can be deleted.
+/// The agent before the switch in [`carry_over`].
+enum Before {
+    /// The previous release's `orbd` (the binary alone: it runs with this tree's VMMs,
+    /// kernel and image), with orbs whose disk holds that release's `orbd-guest`.
+    PreviousRelease { agent: PathBuf, guest: PathBuf },
+    /// This agent with `ORBD_VMM_JAIL=off`.
+    JailOff,
+}
+
+/// An upgrade from the previous release keeps every orb (see [`carry_over`]). Needs
+/// `ORBD_KVM_PREVIOUS_AGENT` and `ORBD_KVM_PREVIOUS_GUEST`, that release's `orbd` and
+/// `orbd-guest`; `ORBD_KVM_PREVIOUS_AGENT=skip` skips it.
 #[test]
 #[ignore = "needs KVM; see the module docs"]
-fn upgrade_jails_the_orbs_of_an_unjailed_agent() {
-    if runtime() == "qemu" {
-        return legacy_qemu_orbs_are_refused();
+fn upgrade_from_the_previous_release_keeps_every_orb() {
+    let agent = std::env::var_os("ORBD_KVM_PREVIOUS_AGENT")
+        .expect("set ORBD_KVM_PREVIOUS_AGENT (the previous release's orbd, or `skip`)");
+    if agent == "skip" {
+        eprintln!("NOTICE: ORBD_KVM_PREVIOUS_AGENT=skip: upgrade gate SKIPPED");
+        return;
     }
-    let mut c = cluster(2);
-    let _vms = Vms(c.root().to_owned());
-    let legacy = std::env::var_os("ORBD_KVM_LEGACY_AGENT").map(PathBuf::from);
-    match &legacy {
-        Some(b) => eprintln!("older agent: {}", b.display()),
-        None => eprintln!(
-            "NOTICE: no ORBD_KVM_LEGACY_AGENT: the older agent is this one with ORBD_VMM_JAIL=off"
-        ),
-    }
-    let old = |c: &mut Cluster| match &legacy {
-        Some(bin) => c.agent_bin = Some(bin.clone()),
-        None => c.agent_env.push(("ORBD_VMM_JAIL".into(), "off".into())),
-    };
-    let new = |c: &mut Cluster| {
-        c.agent_bin = None;
-        c.agent_env.retain(|(k, _)| k != "ORBD_VMM_JAIL");
-    };
+    let guest = std::env::var_os("ORBD_KVM_PREVIOUS_GUEST")
+        .expect("set ORBD_KVM_PREVIOUS_GUEST (the previous release's orbd-guest)");
+    carry_over(Before::PreviousRelease {
+        agent: agent.into(),
+        guest: guest.into(),
+    });
+}
 
-    old(&mut c);
+/// Turning the jail on keeps every orb an agent ran with `ORBD_VMM_JAIL=off`: a VMM it
+/// left running is adopted unjailed, and each orb moves into its jail (its files and
+/// TAP handed to its uid) at its next start.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+fn turning_the_jail_on_keeps_every_orb() {
+    carry_over(Before::JailOff);
+}
+
+/// Two orbs started under `before` carry over to this agent: one asleep wakes from the
+/// checkpoint `before` took, and a VMM `before` left running when it died is adopted.
+/// Graceful stops then go both ways (a downgrade, then an upgrade again), each agent
+/// restoring what the other checkpointed. Every counter continues, each orb keeps its
+/// jail, uid and network, and a delete under this agent leaves nothing of the orb.
+fn carry_over(before: Before) {
+    let rootfs = tempfile::tempdir().unwrap();
+    let mut c = match &before {
+        Before::PreviousRelease { agent, guest } => {
+            eprintln!(
+                "previous agent {}, guest {}",
+                agent.display(),
+                guest.display()
+            );
+            let path = rootfs.path().join("rootfs.ext4");
+            with_guest(guest, &path);
+            cluster_on(2, &path.display().to_string())
+        }
+        Before::JailOff => cluster(2),
+    };
+    // amp-2 is a restricted orb (egress: {}), so its egress chain is carried over too.
+    let path = c.root().join("coordinator.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let (_, block) = yaml.split_once("offerings:\n").unwrap();
+    let restricted = block
+        .trim_end()
+        .replace(&format!("id: {}", c.offering), "id: restricted");
+    let yaml = format!("{}\n{restricted}\n    egress: {{}}\n", yaml.trim_end());
+    std::fs::write(&path, yaml).unwrap();
+    let jailed_before = matches!(before, Before::PreviousRelease { .. });
+    let set = |c: &mut Cluster, earlier: bool| match &before {
+        Before::PreviousRelease { agent, .. } => c.agent_bin = earlier.then(|| agent.clone()),
+        Before::JailOff if earlier => c.agent_env.push(("ORBD_VMM_JAIL".into(), "off".into())),
+        Before::JailOff => c.agent_env.retain(|(k, _)| k != "ORBD_VMM_JAIL"),
+    };
+    let _vms = Vms(c.root().to_owned());
+
+    set(&mut c, true);
     c.start_all();
-    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn 1 (old agent)");
-    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "spawn 2 (old agent)");
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn 1 (before)");
+    assert_ok(
+        &c.dispatch("spawn", "amp-2", &[("ORBD_OFFERING_ID", "restricted")]),
+        "spawn 2, restricted (before)",
+    );
     let orbs = orb_dirs(&c);
+    let mut first = Vec::new();
     for o in &orbs {
         wait_progress(o, (0, 0));
-        unjailed_vmm(o);
+        first.push(match jailed_before {
+            true => assert_isolated(&c, o),
+            false => unjailed_vmm(o),
+        });
     }
     let asleep = counts(&orbs[1]);
-    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2 (old agent)");
+    assert_ok(&c.dispatch("pause", "amp-2", &[]), "pause 2 (before)");
 
-    // The old agent dies with amp-1 running: the new one adopts its unjailed VMM.
+    // The earlier agent dies with amp-1 running: this one adopts its VMM as it is.
     let running = counts(&orbs[0]);
-    let unjailed = unjailed_vmm(&orbs[0]);
+    #[cfg(target_os = "linux")]
+    let pid = vmm_pid(&orbs[0]);
     c.kill_agent("agent-a");
-    new(&mut c);
+    set(&mut c, false);
     start_again(&mut c, "");
     assert_ok(
         &c.dispatch("spawn", "amp-1", &[]),
-        "spawn adopts the old VMM",
+        "spawn adopts the running VMM",
     );
-    assert_eq!(
-        unjailed_vmm(&orbs[0]),
-        unjailed,
-        "the old VMM adopted, not restarted"
-    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(vmm_pid(&orbs[0]), pid, "the VMM adopted, not restarted");
     wait_progress(&orbs[0], running);
     assert_continuous(&orbs[0]);
+    if jailed_before {
+        assert_eq!(
+            assert_isolated(&c, &orbs[0]),
+            first[0],
+            "adopted in its jail"
+        );
+    } else {
+        unjailed_vmm(&orbs[0]);
+        let log = std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap();
+        assert!(
+            !cfg!(target_os = "linux") || log.contains("adopted a VMM that runs unjailed"),
+            "the unjailed VMM is reported"
+        );
+    }
 
-    // Asleep under the old agent: woken jailed from its checkpoint.
+    // Asleep under the earlier agent: woken from its checkpoint, in its jail.
     assert_ok(
         &c.dispatch("spawn", "amp-2", &[]),
-        "wake 2 from the old checkpoint",
+        "wake 2 from the earlier agent's checkpoint",
     );
     wait_progress(&orbs[1], asleep);
     assert_continuous(&orbs[1]);
     let uid2 = assert_isolated(&c, &orbs[1]);
-
-    // The adopted VMM is jailed from its next start (saved unjailed, restored jailed).
-    let before = counts(&orbs[0]);
-    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause the adopted VMM");
-    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake it jailed");
-    wait_progress(&orbs[0], before);
-    assert_continuous(&orbs[0]);
-    let uid1 = assert_isolated(&c, &orbs[0]);
+    if jailed_before {
+        assert_eq!(uid2, first[1], "each orb keeps its uid");
+    } else {
+        // The adopted VMM moves into its jail at its next start.
+        let progress = counts(&orbs[0]);
+        assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause the adopted VMM");
+        assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake it in its jail");
+        wait_progress(&orbs[0], progress);
+        assert_continuous(&orbs[0]);
+    }
+    let uids: Vec<u32> = orbs.iter().map(|o| assert_isolated(&c, o)).collect();
     if cfg!(target_os = "linux") {
-        assert_ne!(uid1, uid2, "each orb's VMM has its own uid");
+        assert_ne!(uids[0], uids[1], "each orb's VMM has its own uid");
     }
-    assert_network(&orbs, &[uid1, uid2]);
 
-    // Downgrade and upgrade again through graceful stops: each agent restores what the
-    // other checkpointed.
-    let before: Vec<(usize, usize)> = orbs.iter().map(|o| counts(o)).collect();
-    assert!(
-        c.terminate_agent("agent-a", Duration::from_secs(300))
-            .success()
-    );
-    assert!(vmm_pids(c.root()).is_empty(), "drained orbs hold no VMM");
-    old(&mut c);
-    start_again(&mut c, "");
-    assert_eq!(vmm_pids(c.root()).len(), 2, "the old agent restored both");
-    for (i, o) in orbs.iter().enumerate() {
-        wait_progress(o, before[i]);
-        assert_continuous(o);
-        unjailed_vmm(o);
+    // Graceful stops both ways: each agent restores what the other checkpointed.
+    for earlier in [true, false] {
+        let progress: Vec<(usize, usize)> = orbs.iter().map(|o| counts(o)).collect();
+        assert!(
+            c.terminate_agent("agent-a", Duration::from_secs(300))
+                .success()
+        );
+        assert!(vmm_pids(c.root()).is_empty(), "drained orbs hold no VMM");
+        for o in &orbs {
+            assert_eq!(checkpoint_files(o).len(), 1, "one checkpoint per orb");
+        }
+        set(&mut c, earlier);
+        start_again(&mut c, "");
+        assert_eq!(vmm_pids(c.root()).len(), 2, "both orbs restored");
+        for (i, o) in orbs.iter().enumerate() {
+            wait_progress(o, progress[i]);
+            assert_continuous(o);
+        }
     }
-    let before: Vec<(usize, usize)> = orbs.iter().map(|o| counts(o)).collect();
-    assert!(
-        c.terminate_agent("agent-a", Duration::from_secs(300))
-            .success()
-    );
-    assert!(vmm_pids(c.root()).is_empty(), "drained orbs hold no VMM");
     for o in &orbs {
-        assert_eq!(
-            checkpoint_files(o).len(),
-            1,
-            "checkpointed by the old agent"
+        assert!(
+            checkpoint_files(o).is_empty(),
+            "restored checkpoints are discarded"
         );
     }
-    new(&mut c);
-    start_again(&mut c, "");
-    assert_eq!(vmm_pids(c.root()).len(), 2, "the new agent restored both");
-    for (i, o) in orbs.iter().enumerate() {
-        wait_progress(o, before[i]);
-        assert_continuous(o);
-    }
-    let uids = [assert_isolated(&c, &orbs[0]), assert_isolated(&c, &orbs[1])];
-    assert_eq!(uids, [uid1, uid2], "each orb keeps its uid");
-    assert_network(&orbs, &uids);
+    let now: Vec<u32> = orbs.iter().map(|o| assert_isolated(&c, o)).collect();
+    assert_eq!(now, uids, "each orb keeps its uid");
+    assert_deleted(&c, "amp-2", &orbs[1]);
 }
 
-/// The QEMU half of [`upgrade_jails_the_orbs_of_an_unjailed_agent`]. Without
-/// `ORBD_KVM_LEGACY_AGENT` the older orb's recipe is made as an older agent wrote it.
-fn legacy_qemu_orbs_are_refused() {
+/// A copy of the test root disk (`ORBD_KVM_ROOTFS`) at `out` with `guest` as its
+/// `orbd-guest`.
+fn with_guest(guest: &Path, out: &Path) {
+    let rootfs = std::env::var("ORBD_KVM_ROOTFS").expect("set ORBD_KVM_ROOTFS");
+    let ok = |c: &mut std::process::Command| assert!(c.status().unwrap().success(), "{c:?}");
+    ok(std::process::Command::new("cp")
+        .arg("--sparse=always")
+        .arg(&rootfs)
+        .arg(out));
+    ok(std::process::Command::new("chmod").arg("644").arg(out));
+    let path = format!("/{}", orbd::image::GUEST_HELPER_PATH);
+    for req in [
+        format!("rm {path}"),
+        format!("write {} {path}", guest.display()),
+        format!("sif {path} mode 0100755"),
+        format!("sif {path} uid 0"),
+        format!("sif {path} gid 0"),
+    ] {
+        ok(std::process::Command::new("debugfs")
+            .args(["-w", "-R", &req])
+            .arg(out)
+            .stdout(std::process::Stdio::null()));
+    }
+    // debugfs exits 0 whether its request worked or not: read the helper back.
+    let back = out.with_extension("guest");
+    ok(std::process::Command::new("debugfs")
+        .args(["-R", &format!("dump {path} {}", back.display())])
+        .arg(out)
+        .stdout(std::process::Stdio::null()));
+    use sha2::{Digest, Sha256};
+    let sum = |p: &Path| Sha256::digest(std::fs::read(p).unwrap_or_default());
+    assert_eq!(
+        sum(&back),
+        sum(guest),
+        "{path} in {} is {}",
+        out.display(),
+        guest.display()
+    );
+    let _ = std::fs::remove_file(back);
+}
+
+/// On Linux the orb's VMM runs unjailed, as root (started by an agent with
+/// `ORBD_VMM_JAIL=off`); returns its uid.
+fn unjailed_vmm(orb: &Path) -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = vmm_pid(orb).expect("the orb's VMM runs");
+        let uid: u32 = status(pid, "Uid:")[0].parse().unwrap();
+        assert_eq!(uid, 0, "VMM {pid} runs unjailed");
+        uid
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = orb;
+        0
+    }
+}
+
+/// Deletes the restricted orb `amp_id` (at `orb`) and checks that nothing of it is left
+/// on the host: its directory, network namespace, veth, network index and jail uid
+/// claims, and its egress chain.
+fn assert_deleted(c: &Cluster, amp_id: &str, orb: &Path) {
+    let id = orb.file_name().unwrap().to_string_lossy().into_owned();
+    let claim = |kind: &str| {
+        std::fs::read_dir(state(c).join(kind))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find(|e| std::fs::read_to_string(e.path()).is_ok_and(|o| o.trim() == id))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+    };
+    let index = cfg!(target_os = "linux").then(|| claim("net").expect("a network index"));
+    let table = || {
+        let out = std::process::Command::new("nft")
+            .args(["list", "table", "inet", "orbd"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    if let Some(i) = &index {
+        let t = table();
+        assert!(
+            t.contains(&format!("chain egress{i} {{")),
+            "egress{i} exists:\n{t}"
+        );
+    }
+    assert_ok(&c.dispatch("delete", amp_id, &[]), "delete");
+    assert!(!orb.exists(), "{} is gone", orb.display());
+    assert_eq!(
+        (claim("net"), claim("uids")),
+        (None, None),
+        "claims released"
+    );
+    if let Some(i) = index {
+        assert!(
+            !Path::new(&format!("/run/netns/orbd-{id}")).exists(),
+            "netns gone"
+        );
+        let link = std::process::Command::new("ip")
+            .args(["link", "show", &format!("orbd{i}")])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!link.success(), "veth orbd{i} gone");
+        let t = table();
+        assert!(
+            !t.contains(&format!("egress{i} ")) && !t.contains(&format!("\"orbd{i}\"")),
+            "egress{i} and its map entry are gone:\n{t}"
+        );
+    }
+}
+
+/// A QEMU recipe on QEMU's unfiltered user-mode network is refused on Linux with one
+/// clear error, starts nothing, and can be deleted.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+fn qemu_user_network_recipes_are_refused() {
+    if runtime() != "qemu" || !cfg!(target_os = "linux") {
+        eprintln!("NOTICE: Linux QEMU only: skipped");
+        return;
+    }
     let mut c = cluster(1);
     let _vms = Vms(c.root().to_owned());
-    let legacy = std::env::var_os("ORBD_KVM_LEGACY_AGENT").map(PathBuf::from);
-    if let Some(bin) = &legacy {
-        eprintln!("older agent: {}", bin.display());
-        c.agent_bin = Some(bin.clone());
-    }
     c.start_all();
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn");
     let orb = orb_dir(&c);
@@ -1353,32 +1520,12 @@ fn legacy_qemu_orbs_are_refused() {
     let recipe = orb.join("vm.json");
     let mut r: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&recipe).unwrap()).unwrap();
-    if legacy.is_some() {
-        assert!(
-            c.terminate_agent("agent-a", Duration::from_secs(300))
-                .success()
-        );
-        c.agent_bin = None;
-        start_again(&mut c, "");
-    } else {
-        eprintln!(
-            "NOTICE: no ORBD_KVM_LEGACY_AGENT: the orb's recipe is rewritten to QEMU's user-mode network"
-        );
-        r["net"]["backend"] = serde_json::json!({ "kind": "user" });
-        std::fs::write(&recipe, r.to_string()).unwrap();
-    }
-    assert_eq!(r["net"]["backend"]["kind"], "user", "{r}");
+    r["net"]["backend"] = serde_json::json!({ "kind": "user" });
+    std::fs::write(&recipe, r.to_string()).unwrap();
     let job = c.dispatch("spawn", "amp-1", &[]);
     let out = format!("{}\n{}", job.stdout, job.stderr);
     assert_ne!(job.code, 0, "{out}");
-    assert!(out.contains("orbd 0.2.8 or earlier"), "{out}");
-    eprintln!(
-        "refused: {}",
-        out.lines()
-            .find(|l| l.contains("0.2.8"))
-            .unwrap_or_default()
-            .trim()
-    );
+    assert!(out.contains("unfiltered user-mode network"), "{out}");
     assert!(vmm_pids(c.root()).is_empty(), "nothing was started");
     assert_ok(
         &c.dispatch("delete", "amp-1", &[]),
@@ -1390,32 +1537,6 @@ fn legacy_qemu_orbs_are_refused() {
             .next()
             .is_none()
     );
-}
-
-/// On Linux the orb's VMM runs unjailed, as root (started by an older or unjailed
-/// agent); returns its pid.
-fn unjailed_vmm(orb: &Path) -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        let pid = vmm_pid(orb).expect("the orb's VMM runs");
-        assert_eq!(uid_of(pid), 0, "VMM {pid} runs unjailed");
-        pid
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = orb;
-        0
-    }
-}
-
-/// On Linux each orb's VMM runs on its orb's own filtered network, owning its TAP.
-fn assert_network(orbs: &[PathBuf], uids: &[u32]) {
-    #[cfg(target_os = "linux")]
-    for (o, uid) in orbs.iter().zip(uids) {
-        assert_own_network(o, vmm_pid(o).expect("the orb's VMM runs"), Some(*uid));
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = (orbs, uids);
 }
 
 /// An agent started with `ORBD_NESTED_KVM=false` gets no new orb with `/dev/kvm`, and

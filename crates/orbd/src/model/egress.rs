@@ -97,7 +97,7 @@ impl std::str::FromStr for EgressRule {
         };
         if addr == "*" {
             return Err(bad(
-                "`*` would allow every private destination: ORBD_ALLOW_PRIVATE_EGRESS does that",
+                "`*` would allow every private destination: list the ones orbs need",
             ));
         }
         let (ip, prefix) = match addr.split_once('/') {
@@ -110,8 +110,7 @@ impl std::str::FromStr for EgressRule {
         }
         if prefix < 8 {
             return Err(bad(
-                "prefixes shorter than /8 are refused: ORBD_ALLOW_PRIVATE_EGRESS allows every \
-                 private destination",
+                "prefixes shorter than /8 are refused: list the private ranges orbs need",
             ));
         }
         if u32::from(net) & !mask(prefix) != 0 {

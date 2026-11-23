@@ -497,12 +497,7 @@ fn disk_report(hb: &pb::Heartbeat) -> crate::model::DiskReport {
         free_bytes: hb.disk_free_bytes,
         total_bytes: hb.disk_total_bytes,
         allocated_bytes: hb.disk_allocated_bytes,
-        // An agent that reports no filesystem size predates the reserve.
-        reserve_bytes: if hb.disk_total_bytes == 0 {
-            crate::model::disk_reserve(0)
-        } else {
-            hb.disk_reserve_bytes
-        },
+        reserve_bytes: hb.disk_reserve_bytes,
     }
 }
 

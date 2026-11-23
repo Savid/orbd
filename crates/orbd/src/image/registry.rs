@@ -248,8 +248,7 @@ impl BlobCache {
 
     /// Whether `desc` is in the cache with its full size; if so, marks it used so garbage
     /// collection keeps it. A wrong-sized entry is reported as missing, and the download
-    /// that follows renames a good copy over it: older orbd emptied the cached blob of a
-    /// layer that a manifest lists twice.
+    /// that follows renames a good copy over it.
     fn cached(&self, desc: &OciDescriptor) -> Result<bool, String> {
         let path = self.path(&desc.digest)?;
         let Ok(meta) = std::fs::metadata(&path) else {
@@ -316,8 +315,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Counting<W> {
 mod tests {
     use super::*;
 
-    /// A cache entry shorter than its descriptor (as older orbd left the blob of a
-    /// repeated layer) is downloaded again instead of reused.
+    /// A cache entry shorter than its descriptor is downloaded again instead of reused.
     #[test]
     fn only_a_full_sized_cached_blob_is_reused() {
         let tmp = tempfile::tempdir().unwrap();

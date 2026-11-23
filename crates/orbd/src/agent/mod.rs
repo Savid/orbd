@@ -287,13 +287,10 @@ pub async fn run(
     #[cfg(target_os = "linux")]
     let flow_log = flow_log_socket(&mut config.agent);
     detect::runtime(&mut config).await?;
-    // Only orbs in orbd's network namespaces are logged: Firecracker's, and QEMU's on an
-    // agent running as root (QEMU orbs created before that keep QEMU's user network).
+    // Only orbs in orbd's network namespaces are logged: every Linux VM orb.
     #[cfg(target_os = "linux")]
-    let flow_log = flow_log.filter(|_| {
-        config.runtime.firecracker.is_some()
-            || (config.runtime.qemu.is_some() && nix::unistd::geteuid().is_root())
-    });
+    let flow_log =
+        flow_log.filter(|_| config.runtime.firecracker.is_some() || config.runtime.qemu.is_some());
     let allow = config.agent.image_allow.clone();
     if allow.is_empty() {
         tracing::info!("ORBD_IMAGE_ALLOW is empty: any image may be prepared and run");

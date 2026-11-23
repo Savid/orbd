@@ -57,7 +57,6 @@ impl Admin for AdminService {
         tracing::info!(agent = %r.agent_id, ttl_secs = ttl.as_secs(), "join token created");
         Ok(Response::new(pb::CreateJoinTokenResponse {
             token: encoded,
-            expires_unix_ms: expires,
         }))
     }
 

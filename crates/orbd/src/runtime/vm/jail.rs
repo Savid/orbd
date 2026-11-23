@@ -17,17 +17,17 @@
 //!   nothing the agent later writes or reads. What the VMM writes is its own (`0600`):
 //!   the disk, the log or console it opens itself, a save's memory file. What it only
 //!   reads (a checkpoint being restored) is `root:<orb gid> 0640`. Each launch puts this
-//!   in place first, so orbs created or saved before the jail existed are fixed up on
-//!   their first jailed start. Base disks are world-readable files inside root-only
+//!   in place first, so orbs created or saved with the jail off are fixed up on their
+//!   first jailed start. Base disks are world-readable files inside root-only
 //!   directories.
 //! * **Sockets.** The VMM creates its sockets in `<run>/<runtime>/<orb>/vmm/` (its
 //!   own), mounted at `<run>/<runtime>/<orb>` in the jail; the run directory itself,
 //!   holding the agent's launch record, stays root's, with links to the sockets under
 //!   their usual names.
 //!
-//! A jail that cannot be set up fails the launch: nothing silently runs unjailed. VMMs
-//! that an older agent left running unjailed are adopted as before and jailed from
-//! their next start.
+//! A jail that cannot be set up fails the launch: nothing silently runs unjailed. A VMM
+//! left running unjailed (by this agent with `ORBD_VMM_JAIL=off`, outside a container
+//! that stops it) is adopted as it is and jailed from its next start.
 
 use crate::config::agent::{JailMode, VmmJail};
 use crate::model::OrbId;
@@ -520,12 +520,14 @@ pub fn vmm_file(run_dir: &Path, name: &str) -> PathBuf {
     }
 }
 
-/// Logs once per orb that its VMM, adopted from an older agent, runs unjailed.
+/// Logs once per orb, and counts (`orbd_vmm_unjailed_adopted_total`), that a jailing
+/// agent adopted its VMM running unjailed.
 pub fn warn_unjailed(orb: OrbId, pid: i32) {
     static WARNED: Mutex<Option<HashSet<OrbId>>> = Mutex::new(None);
     let mut w = WARNED.lock().unwrap_or_else(|e| e.into_inner());
     if w.get_or_insert_with(HashSet::new).insert(orb) {
-        tracing::warn!(orb = %orb, pid, "adopted a VMM that runs unjailed (started by an older or unjailed agent); it is jailed from its next start");
+        metrics::counter!("orbd_vmm_unjailed_adopted_total").increment(1);
+        tracing::warn!(orb = %orb, pid, "adopted a VMM that runs unjailed (started with ORBD_VMM_JAIL=off, or by an older orbd); it is jailed from its next start");
     }
 }
 

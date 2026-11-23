@@ -96,14 +96,13 @@ Static binaries for x86_64 and aarch64 are attached to each release.
    when no amd64 one has room. An orb keeps the architecture it was placed with. arm64
    orbs run on [macOS agents](#macos-agents), without `kvm`.
    `retired_token_files` under `provider` lists tokens of providers you are moving
-   away from, e.g. per-offering ones: they are still served, so their threads keep their
-   orbs, and new orbs from them get the default orb type.
+   away from: they are still served, so their threads keep their orbs, and new orbs from
+   them get the default orb type.
 
    Files without `config_version` are v1: `offerings`, each with a `runtime` (`qemu`,
    `firecracker`, `docker`, `boat`) and `resources`, served by `providers` (`id`,
-   `token_file`, `orb_types` naming offerings) or by a per-offering
-   `provider_token_file`, and spilling by `spill_to`. A v2 file is turned into the same
-   offerings when it is loaded.
+   `token_file`, `orb_types` naming offerings), and spilling by `spill_to`. A v2 file is
+   turned into the same offerings when it is loaded.
 
    ```sh
    docker run -d --name orbd -p 7443:7443 -v orbd:/var/lib/orbd \
@@ -165,15 +164,11 @@ metadata endpoints (link-local, Azure's `168.63.129.16`, Alibaba's `100.100.100.
 the host's Tailscale resolver `100.100.100.100`, whatever is allowed. Allow what orbs need
 with `ORBD_EGRESS_ALLOW`, comma-separated `<tcp|udp|any>:<address or CIDR>[:<port or
 range>]` entries, e.g. `udp:192.168.2.201:41641` (direct Tailscale to a LAN host) or
-`tcp:10.0.0.0/8:8000-8100`; the orbs' DNS servers are allowed on port 53.
-`ORBD_ALLOW_PRIVATE_EGRESS=true` allows every private destination, as orbd did before
-0.2: **upgrading from 0.1 cuts running orbs off the LAN** (their open connections to it
-too), so list what they need first. The agent's own traffic is not affected, other
-firewalls on the host still apply, and the host's public addresses are internet
-addresses to orbs (keep services there firewalled). An orb cannot pass as another: its
-traffic must come from its own guest subnet and veth. Linux QEMU orbs (orb types with
-`kvm`) created by orbd 0.2.8 or earlier used QEMU's unfiltered user-mode network and are
-refused: delete them (`orbd orb delete`) and Amp starts new ones. On macOS, see below.
+`tcp:10.0.0.0/8:8000-8100`; the orbs' DNS servers are allowed on port 53. The agent's
+own traffic is not affected, other firewalls on the host still apply, and the host's
+public addresses are internet addresses to orbs (keep services there firewalled). An orb
+cannot pass as another: its traffic must come from its own guest subnet and veth. On
+macOS, see below.
 
 On Linux each VMM (QEMU, Firecracker) runs jailed: as its orb's own uid and gid
 (`ORBD_VMM_JAIL_UID_BASE`, default 1300000000, plus a per-orb index, up to 2^24 of them;
@@ -189,11 +184,7 @@ to another orb. Making a project snapshot reads the orb's disk in its jail too
 (`qemu-img` through the orb's own base only, `e2fsck`, `resize2fs`). A Linux agent with
 VM runtimes must run as root (it refuses to start otherwise) and launches no VMM its
 jail cannot hold. `ORBD_VMM_JAIL=off` runs VMMs unjailed as the agent's user: unsafe,
-for development only. Firecracker orbs of older agents, sleeping and running ones
-included, move into their jail on their next start; a VMM an older agent left running is
-adopted as before and runs unjailed until then. Downgrade only after a drain (`docker
-stop` checkpoints running orbs): an older agent cannot put to sleep a jailed VMM this
-one left running.
+for development only.
 
 `ORBD_FLOW_LOG=true` logs every new connection an orb in its own network namespace
 (every Linux VM orb) starts as one event
@@ -331,10 +322,10 @@ guest integration. A new orb whose spawn image is of another lineage starts from
 image instead, and snapshots taken from it carry the new lineage. Amp's routine image
 rebuilds keep the lineage; a new Debian release or a guest integration change that must
 reach existing projects changes it, which costs each project one start without its
-snapshot. Snapshots from orbd before 0.2.8 record no lineage, so every project starts
-once from its image after an upgrade. An agent deletes a project snapshot or prepared
-image once no orb on it is built on it and nothing has used it for 72 hours (the current
-image of a prewarmed reference is kept), and image layers no build has used for as long.
+snapshot. A snapshot that records no lineage is passed over too, once the image's
+lineage is known. An agent deletes a project snapshot or prepared image once no orb on
+it is built on it and nothing has used it for 72 hours (the current image of a
+prewarmed reference is kept), and image layers no build has used for as long.
 Only QEMU orbs are built on their base, since their disks read through to it; a
 Firecracker orb's disk is a standalone copy and keeps nothing. It checks at startup,
 hourly and after each orb delete.
@@ -452,11 +443,11 @@ only while that file is unchanged. Replacing it (a new orbd image does, as does 
 took of running ones when it stopped for the upgrade: these orbs cold-boot once, on
 their next spawn, with their disks and without their processes. A Firecracker restore
 does not read the kernel, so its orbs wake on the kernel they slept with and get the new
-one at their next cold boot. The sysctl file reaches new disks only; an existing orb
-keeps its disk without it, though its kernel still boots with Yama, the `dmesg`
-restriction, unprivileged eBPF off and no `TIOCSTI`. Adding it bumped the guest lineage
-(above), so after the upgrade each project starts one orb from its image instead of its
-project snapshot.
+one at their next cold boot. The guest integration (`orbd-guest`, the sysctl file)
+reaches only new disks made from the image: an existing orb keeps its disk as it was,
+and a disk made from a project snapshot of the same lineage keeps the snapshot's, though
+its kernel still boots with Yama, the `dmesg` restriction, unprivileged eBPF off and no
+`TIOCSTI`.
 
 ### macOS agents
 
@@ -508,10 +499,10 @@ then has `orbd-netgroup` run `orbd fence-probe`, the same connection with the gr
 QEMU orb starts only when pf blocks that one and not the agent's; a passing test counts
 for 30 s, and the agent repeats it every 30 s, logging when the fence comes or goes
 (metric `orbd_egress_fence_verified`). Otherwise, or without `network_group`, spawns and
-wakes fail with the reason (orbs already running keep running); earlier versions started
-them unfenced. `orbd doctor -c <agent config>` runs the same test. It proves that pf
-blocks the group from the Mac itself; that your rules also cover the LAN and tailnet is
-yours to check, as is UDP (the test connects over TCP; block both, as above):
+wakes fail with the reason (orbs already running keep running). `orbd doctor -c <agent
+config>` runs the same test. It proves that pf blocks the group from the Mac itself;
+that your rules also cover the LAN and tailnet is yours to check, as is UDP (the test
+connects over TCP; block both, as above):
 `orbd-netgroup nc -z -G 3 <LAN host> <port>` connects as an orb would, and must fail.
 `ORBD_ALLOW_UNFENCED_EGRESS=true` starts QEMU orbs without a fence.
 
@@ -548,8 +539,8 @@ orb_types:
 - `allow`: destinations by address, `<tcp|udp|any>:<address or CIDR>[:<port or
   range>]`. At most 64. Link-local (cloud metadata) never. Public addresses as listed;
   private ones (the LAN, a tailnet, documentation ranges, ...) only as far as the
-  agent's own `ORBD_EGRESS_ALLOW` (or `ORBD_ALLOW_PRIVATE_EGRESS`) allows them too: the
-  agent's setting wins, so a coordinator's config cannot open an agent's LAN.
+  agent's own `ORBD_EGRESS_ALLOW` allows them too: the agent's setting wins, so a
+  coordinator's config cannot open an agent's LAN.
 - `egress: {}` reaches nothing.
 
 Everything else is dropped for these orbs: the rest of the internet, the LAN and every
@@ -587,7 +578,7 @@ to the agent too, with `egress: restricted`.
 
 Placement fails closed. Such an orb type runs only on agents that enforce it, Linux
 agents with a VM runtime (Firecracker, or QEMU for `kvm`), never on Docker or macOS
-agents, older agents or Boat (`prefer` skips Boat for it). An agent refuses to start
+agents or Boat (`prefer` skips Boat for it). An agent refuses to start
 one it cannot enforce, whatever the coordinator sends, and the coordinator does not
 wake one on a host that no longer enforces it. The orb's recipe on its agent records
 that it is restricted, so it is for life: it never launches unrestricted, whatever a
@@ -614,11 +605,10 @@ controls it decides what restricted orbs may reach (within what the agents' own
 `ORBD_EGRESS_ALLOW` allows of private destinations); agents only refuse what they
 cannot enforce.
 
-Agents from before restricted egress cannot read a restricted orb's recipe: they refuse
-to start such an orb, and their image cleanup deletes nothing while one is there. Before
-downgrading an agent below this version, though, stop its restricted orbs (`docker stop`
-drains them, or pause or delete them): an older agent replaces orbd's nftables table
-without their rules, so a VMM still running would run unrestricted.
+Rolling an agent back to a version without restricted egress while restricted orbs run
+on it leaves their VMMs unrestricted: such an agent replaces orbd's nftables table
+without their rules. Drain the agent first (`docker stop` checkpoints them), or pause
+or delete those orbs; that agent cannot read their recipes, so it never starts them.
 
 Caveats. Enforcement is by address after DNS, not by name: an opened address is open on
 the policy's ports whatever host the orb then asks it for (TLS SNI and HTTP Host are

@@ -5,8 +5,7 @@
 //! `Wake.network`.
 //!
 //! * `User`: QEMU's built-in slirp. No host privileges, guest-initiated traffic only,
-//!   not filtered by orbd: macOS QEMU orbs (fenced by pf). Linux agents refuse the QEMU
-//!   orbs orbd 0.2.8 and earlier created with it.
+//!   not filtered by orbd: macOS QEMU orbs (fenced by pf), never Linux ones.
 //! * `Tap`: every Linux VM orb. A per-orb network namespace `orbd-<orb>` holding the VM's `tap0`
 //!   (the guest's gateway, e.g. `10.0.2.2/24`) and one end of a veth pair; the other
 //!   end, `orbd<i>`, sits in the agent's namespace with a `/30` from `169.254.0.0/16`
@@ -373,20 +372,13 @@ pub fn prepare_host(
              for {DNS_PROXY}, the DNS proxy's address, on its other interfaces"
         );
     }
-    if egress.allow_private {
-        tracing::warn!(
-            "VM orbs may reach every private destination, the host's LAN included \
-             (ORBD_ALLOW_PRIVATE_EGRESS)"
-        );
-    } else {
-        let allowed: Vec<String> = egress.allow.iter().map(|r| r.to_string()).collect();
-        tracing::info!(
-            allowed = %allowed.join(","),
-            dns = %dns_servers.join(","),
-            "VM orbs reach the internet, their DNS servers and only these private \
-             destinations (more with ORBD_EGRESS_ALLOW)"
-        );
-    }
+    let allowed: Vec<String> = egress.allow.iter().map(|r| r.to_string()).collect();
+    tracing::info!(
+        allowed = %allowed.join(","),
+        dns = %dns_servers.join(","),
+        "VM orbs reach the internet, their DNS servers and only these private destinations \
+         (more with ORBD_EGRESS_ALLOW)"
+    );
     Ok(())
 }
 
@@ -427,16 +419,14 @@ fn egress_rules(egress: &Egress, dns_servers: &[String]) -> Vec<Rule> {
         false,
         None,
     );
-    if !egress.allow_private {
-        for r in &egress.allow {
-            rule(rule_match(r), true, Some(r.to_string()));
-        }
-        rule(
-            format!("ip daddr {{ {} }}", PRIVATE_NETS.join(", ")),
-            false,
-            None,
-        );
+    for r in &egress.allow {
+        rule(rule_match(r), true, Some(r.to_string()));
     }
+    rule(
+        format!("ip daddr {{ {} }}", PRIVATE_NETS.join(", ")),
+        false,
+        None,
+    );
     rules
 }
 
@@ -473,7 +463,7 @@ fn allow_matches(policy: &EgressPolicy, agent: &Egress) -> Vec<(String, String)>
         let overlaps = private
             .iter()
             .any(|p| contains(*p, net) || contains(net, *p));
-        if !overlaps || agent.allow_private {
+        if !overlaps {
             out.push((rule_match(r), r.to_string()));
             continue;
         }
@@ -985,7 +975,7 @@ fn build_namespace(
         && tap_owner(netns)? != Some((Some(u64::from(o.uid)), Some(u64::from(o.gid))))
     {
         // An unprivileged VMM attaches only to a TAP it owns, and the owner of a TAP
-        // cannot change while it exists (e.g. one built before VMMs were jailed). One
+        // cannot change while it exists (e.g. one built with the jail off). One
         // whose owner `ip` does not show (an older iproute2) is built again too: no VMM
         // is attached now.
         ip(&["-n", netns, "link", "delete", TAP])?;
@@ -1182,11 +1172,7 @@ mod tests {
     use super::*;
 
     fn egress(allow: &[&str]) -> Egress {
-        Egress::new(
-            false,
-            &allow.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        )
-        .unwrap()
+        Egress::new(&allow.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
     }
 
     fn forward(t: &str) -> Vec<String> {
@@ -1253,15 +1239,6 @@ mod tests {
                  198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4 } drop",
             ]
         );
-        // Everything private allowed: metadata, spoofing, invalid packets and IPv6 are
-        // still dropped.
-        let open = forward(&host_table(&Egress::new(true, &[]).unwrap(), &[], &[]));
-        assert!(!open.iter().any(|l| l.contains("10.0.0.0/8")), "{open:?}");
-        assert!(open.iter().any(|l| l.contains("168.63.129.16")), "{open:?}");
-        assert!(
-            open.iter().any(|l| l.contains("ct state invalid")),
-            "{open:?}"
-        );
     }
 
     /// The table loads into nftables, in a throwaway user and network namespace. Skipped
@@ -1324,7 +1301,6 @@ mod tests {
                 ]),
                 &restricted[..],
             ),
-            (Egress::new(true, &[]).unwrap(), &restricted[..1]),
             (
                 logged(egress(&[
                     "udp:192.168.2.201:41641",
@@ -1332,7 +1308,7 @@ mod tests {
                 ])),
                 &restricted[..],
             ),
-            (logged(Egress::new(true, &[]).unwrap()), &[][..]),
+            (logged(egress(&[])), &restricted[..1]),
         ] {
             let script = host_table(&e, &["1.1.1.1".into(), "10.0.0.53".into()], restricted);
             let script = format!("{script}{}", arp_table());
@@ -1646,10 +1622,6 @@ mod tests {
                 "ip daddr 34.5.0.0/16 meta l4proto tcp".to_owned(),
             ]
         );
-        // ORBD_ALLOW_PRIVATE_EGRESS: everything as listed.
-        let all = rules(&Egress::new(true, &[]).unwrap());
-        assert_eq!(all[0], "ip daddr 10.0.0.0/8 tcp dport 443");
-        assert_eq!(all.len(), 4);
         // Intersections.
         let r = |s: &str| s.parse::<EgressRule>().unwrap();
         let i = |a: &str, b: &str| intersect(&r(a), &r(b)).map(|x| x.to_string());

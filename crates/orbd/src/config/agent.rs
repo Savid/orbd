@@ -314,9 +314,6 @@ impl std::str::FromStr for GuestNetwork {
 /// `QemuRuntimeConfig::network_group`) are not filtered by orbd.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Egress {
-    /// Orbs may reach every private destination (`ORBD_ALLOW_PRIVATE_EGRESS`): orbd
-    /// before this setting existed.
-    pub allow_private: bool,
     /// Private destinations orbs may reach anyway (`ORBD_EGRESS_ALLOW`).
     pub allow: Vec<EgressRule>,
     /// Log every new connection an orb starts, with the verdict (`ORBD_FLOW_LOG`; see
@@ -325,24 +322,15 @@ pub struct Egress {
 }
 
 impl Egress {
-    /// From `ORBD_EGRESS_ALLOW` entries (empty ones are skipped) and
-    /// `ORBD_ALLOW_PRIVATE_EGRESS`.
-    pub fn new(allow_private: bool, allow: &[String]) -> Result<Self, String> {
+    /// From `ORBD_EGRESS_ALLOW` entries (empty ones are skipped).
+    pub fn new(allow: &[String]) -> Result<Self, String> {
         let allow = allow
             .iter()
             .map(|e| e.trim())
             .filter(|e| !e.is_empty())
             .map(str::parse)
             .collect::<Result<Vec<EgressRule>, String>>()?;
-        if allow_private && !allow.is_empty() {
-            return Err(
-                "set ORBD_EGRESS_ALLOW or ORBD_ALLOW_PRIVATE_EGRESS, not both: the latter \
-                 already allows every private destination"
-                    .into(),
-            );
-        }
         Ok(Self {
-            allow_private,
             allow,
             flow_log: false,
         })
@@ -880,7 +868,7 @@ mod tests {
             "udp:192.168.2.201:1:2",  // too many parts
             "udp:192.168.2.1/24:53",  // host bits
             "udp:192.168.2.0/33",     // prefix
-            "tcp:*:443",              // every private address: ORBD_ALLOW_PRIVATE_EGRESS
+            "tcp:*:443",              // every private address
             "any:0.0.0.0/0",          // the same
             "any:96.0.0.0/3",         // shorter than /8
             "tcp:169.254.169.254:80", // link-local: cloud metadata
@@ -899,15 +887,10 @@ mod tests {
     fn egress_lists_skip_empty_entries() {
         let list = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // `ORBD_EGRESS_ALLOW=` and a trailing comma.
-        assert_eq!(Egress::new(false, &list(&[""])).unwrap(), Egress::default());
-        let e = Egress::new(false, &list(&["udp:10.0.0.1:53", " "])).unwrap();
+        assert_eq!(Egress::new(&list(&[""])).unwrap(), Egress::default());
+        let e = Egress::new(&list(&["udp:10.0.0.1:53", " "])).unwrap();
         assert_eq!(e.allow.len(), 1);
-        assert!(Egress::new(true, &list(&[""])).unwrap().allow_private);
-        assert!(
-            Egress::new(true, &list(&["udp:10.0.0.1:53"])).is_err(),
-            "both settings"
-        );
-        assert!(Egress::new(false, &list(&["udp:10.0.0.1:53", "bad"])).is_err());
+        assert!(Egress::new(&list(&["udp:10.0.0.1:53", "bad"])).is_err());
     }
 
     fn allow(entries: &[&str]) -> ImageAllow {

@@ -244,7 +244,7 @@ pub async fn reuse_project(
 }
 
 /// The image lineage ([`crate::image::lineage`]) project snapshot `key` descends from,
-/// as recorded at publication; None for snapshots published by older orbd.
+/// as recorded at publication; None if none was.
 pub fn project_lineage(state_dir: &Path, key: &ProjectSnapshotKey) -> Option<String> {
     let meta = std::fs::read(
         state_dir

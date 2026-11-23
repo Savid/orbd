@@ -255,10 +255,11 @@ struct AgentArgs {
     /// is. Their DNS servers are allowed on port 53.
     #[arg(long, env = "ORBD_EGRESS_ALLOW", value_delimiter = ',')]
     egress_allow: Vec<String>,
-    /// Let VM orbs reach every private destination, the host's LAN included (orbd
-    /// before 0.2; cloud metadata stays blocked).
-    #[arg(long, env = "ORBD_ALLOW_PRIVATE_EGRESS")]
-    allow_private_egress: bool,
+    /// Removed: `true` (or the bare flag), which let VM orbs reach every private
+    /// destination, makes an agent refuse to start; any other value is ignored. See
+    /// `ORBD_EGRESS_ALLOW`.
+    #[arg(long, env = "ORBD_ALLOW_PRIVATE_EGRESS", hide = true, num_args = 0..=1, default_missing_value = "true")]
+    allow_private_egress: Option<String>,
     /// Jail each VMM on Linux (`on`, `off`): its orb's own uid, no capabilities, only its
     /// orb's files mounted. On, a Linux VM agent must run as root and launches no VMM the
     /// jail cannot hold; `off` runs VMMs unjailed as the agent's user (unsafe; for
@@ -268,7 +269,7 @@ struct AgentArgs {
     /// First uid and gid of jailed VMMs; each orb's VMM gets its own above it.
     #[arg(long, env = "ORBD_VMM_JAIL_UID_BASE", default_value_t = orbd::config::agent::DEFAULT_JAIL_UID_BASE)]
     vmm_jail_uid_base: u32,
-    /// Log every new connection an orb in orbd's network namespaces (Firecracker) starts:
+    /// Log every new connection an orb in orbd's network namespaces (Linux VMs) starts:
     /// one `orbd::flow` event with the orb, its Amp orb and thread, protocol,
     /// destination and whether the egress policy accepted or dropped it.
     #[arg(long, env = "ORBD_FLOW_LOG")]
@@ -513,8 +514,21 @@ fn main() -> anyhow::Result<()> {
             s.checkpoint_max_age = orbd::config::agent::AgentSection::checkpoint_max_age_hours(
                 a.checkpoint_max_age_hours,
             );
-            s.egress = orbd::config::agent::Egress::new(a.allow_private_egress, &a.egress_allow)
-                .map_err(anyhow::Error::msg)?;
+            // Only `true` turned it on (0.3.0 took `true` or `false`).
+            match a.allow_private_egress.as_deref() {
+                Some("true") => anyhow::bail!(
+                    "ORBD_ALLOW_PRIVATE_EGRESS was removed: list the private destinations VM \
+                     orbs need in ORBD_EGRESS_ALLOW"
+                ),
+                Some(v) => tracing::warn!(
+                    value = v,
+                    "ORBD_ALLOW_PRIVATE_EGRESS is ignored (removed): ORBD_EGRESS_ALLOW lists the \
+                     private destinations VM orbs may reach"
+                ),
+                None => {}
+            }
+            s.egress =
+                orbd::config::agent::Egress::new(&a.egress_allow).map_err(anyhow::Error::msg)?;
             s.vmm_jail = a.vmm_jail;
             s.vmm_jail_uid_base = a.vmm_jail_uid_base;
             s.egress.flow_log = a.flow_log;
