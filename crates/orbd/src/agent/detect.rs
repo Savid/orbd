@@ -117,7 +117,24 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
                 r.qemu = Some(QemuRuntimeConfig::default());
                 match firecracker_usable() {
                     Ok(()) => r.firecracker = Some(FirecrackerRuntimeConfig::default()),
-                    Err(why) => tracing::info!("firecracker runtime off: {why}"),
+                    // Expected on macOS. On Linux, orb types without kvm get only
+                    // Firecracker (a v2 config's offerings), which placement matches
+                    // exactly: without it this agent takes none of them.
+                    Err(why) if cfg!(target_os = "linux") && config.agent.refuse_nested_kvm => {
+                        tracing::warn!(
+                            "firecracker runtime off ({why}): this agent takes no orb types \
+                             without kvm until `firecracker` is on its PATH (or run orbd's \
+                             container image, which ships it), and with nested KVM off (the \
+                             default) no orbs at all; ORBD_NESTED_KVM=true lets it run kvm \
+                             orb types"
+                        )
+                    }
+                    Err(why) if cfg!(target_os = "linux") => tracing::warn!(
+                        "firecracker runtime off ({why}): this agent takes no orb types \
+                         without kvm until `firecracker` is on its PATH (or run orbd's \
+                         container image, which ships it)"
+                    ),
+                    Err(why) => tracing::debug!("firecracker runtime off: {why}"),
                 }
             }
             other => bail!("the {} runtime is never detected", other.as_str()),

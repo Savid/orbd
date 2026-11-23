@@ -365,6 +365,7 @@ pub fn prepare_host(
         .map_err(|e| format!("enabling IPv4 forwarding: {e}"))?;
     ip(&["addr", "replace", &format!("{DNS_PROXY}/32"), "dev", "lo"])?;
     nft(&host_table(egress, dns_servers, restricted))?;
+    probe_forwarding_in_background(dns_servers);
     if let Err(e) = nft(&arp_table()) {
         tracing::warn!(
             error = %e,
@@ -821,6 +822,219 @@ fn counter_packets(listing: &str) -> Option<u64> {
     let mut words = listing.split_whitespace();
     words.find(|w| *w == "packets")?;
     words.next()?.parse().ok()
+}
+
+/// What to do when a firewall drops forwarded orb traffic (the agent's warning, `orbd
+/// doctor`).
+pub const FORWARD_FIX: &str = "allow traffic from orbd* out and its replies back (ufw: \
+     `ufw route allow in on orbd+`; Docker hosts: `iptables -I DOCKER-USER -i orbd+ -j \
+     ACCEPT` and `iptables -I DOCKER-USER -o orbd+ -m conntrack --ctstate \
+     RELATED,ESTABLISHED -j ACCEPT`, saved to survive a reboot; firewalld: `firewall-cmd \
+     --permanent --zone=trusted --add-interface=orbd+` and `--reload`; nftables: \
+     `iifname \"orbd*\" accept` and `oifname \"orbd*\" ct state established,related accept` \
+     in your forward chain), or run the agent in a container of its own; see \"Host \
+     firewalls\" in orbd's README";
+
+/// A probe of the path orb traffic takes out of this network namespace: a veth whose
+/// name matches orbd's `orbd*` rules and a namespace behind it, on a /30 of
+/// `169.254.169.0/24`, which no orb gets ([`index_of`] skips it). So the probe takes the
+/// plain path of an unrestricted orb (forwarding, anti-spoofing, masquerade, and every
+/// other firewall's forward chains), and stays out of the restricted orbs' map and the
+/// flow log.
+#[derive(Clone, Copy, Debug)]
+pub struct ForwardProbe {
+    /// The veth's and the namespace's name.
+    pub name: &'static str,
+    /// The /30's first address: the veth has `.+1`, the namespace `.+2`.
+    pub base: Ipv4Addr,
+}
+
+/// The agent's own probe, at startup.
+pub const AGENT_PROBE: ForwardProbe = ForwardProbe {
+    name: "orbdprobe",
+    base: Ipv4Addr::new(169, 254, 169, 0),
+};
+/// `orbd doctor`'s, apart from the agent's.
+pub const DOCTOR_PROBE: ForwardProbe = ForwardProbe {
+    name: "orbdprobe1",
+    base: Ipv4Addr::new(169, 254, 169, 4),
+};
+
+/// How long each DNS query waits for its answer (less in tests, between local
+/// namespaces), and how many are sent.
+const PROBE_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 300 } else { 2500 });
+const PROBE_TRIES: u16 = 2;
+
+/// What [`ForwardProbe::run`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Forwarding {
+    /// A DNS query sent as an orb's traffic got its answer from `server`.
+    Works { server: Ipv4Addr },
+    /// `server` answers the agent itself, but not the same query sent as an orb's
+    /// traffic: something here drops forwarded orb traffic.
+    Dropped { server: Ipv4Addr },
+    /// Not known: no orb DNS server answered the agent itself, or the probe could not be
+    /// set up.
+    Unknown(String),
+}
+
+impl ForwardProbe {
+    fn addr(&self, n: u8) -> Ipv4Addr {
+        let [a, b, c, d] = self.base.octets();
+        Ipv4Addr::new(a, b, c, d + n)
+    }
+
+    /// Asks the orbs' DNS servers (`dns_servers`, IPv4 ones, port 53) the same question
+    /// from the agent itself (the control) and from behind the probe's veth (the test),
+    /// on the first server that answers the control. Needs orbd's table here (its
+    /// masquerade), root, and `/run/netns`. Takes up to [`PROBE_TRIES`] ×
+    /// [`PROBE_WAIT`] per query; removes its veth and namespace before returning.
+    pub fn run(&self, dns_servers: &[String]) -> Forwarding {
+        let servers: Vec<Ipv4Addr> = dns_servers
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .filter(|a| forwardable(*a))
+            .collect();
+        if servers.is_empty() {
+            return Forwarding::Unknown(format!(
+                "no orb DNS server ({}) that orb traffic is forwarded to",
+                dns_servers.join(", ")
+            ));
+        }
+        let Some(server) = servers.iter().take(2).copied().find(|s| dns_answers(*s)) else {
+            return Forwarding::Unknown(format!(
+                "no orb DNS server ({}) answered the agent itself",
+                dns_servers.join(", ")
+            ));
+        };
+        let _cleanup = ProbeCleanup(*self);
+        if let Err(e) = self.set_up() {
+            return Forwarding::Unknown(format!("setting up the probe: {e}"));
+        }
+        match in_netns(self.name, || Ok(dns_answers(server))) {
+            Ok(true) => Forwarding::Works { server },
+            Ok(false) => Forwarding::Dropped { server },
+            Err(e) => Forwarding::Unknown(e),
+        }
+    }
+
+    fn set_up(&self) -> Result<(), String> {
+        self.tear_down();
+        let (veth, ns) = (self.addr(1).to_string(), self.addr(2).to_string());
+        ip(&["netns", "add", self.name])?;
+        ip(&[
+            "link", "add", self.name, "type", "veth", "peer", "name", "eth0", "netns", self.name,
+        ])?;
+        ip(&["addr", "add", &format!("{veth}/30"), "dev", self.name])?;
+        ip(&["link", "set", self.name, "up"])?;
+        ip(&[
+            "-n",
+            self.name,
+            "addr",
+            "add",
+            &format!("{ns}/30"),
+            "dev",
+            "eth0",
+        ])?;
+        ip(&["-n", self.name, "link", "set", "eth0", "up"])?;
+        ip(&["-n", self.name, "route", "add", "default", "via", &veth])
+    }
+
+    /// Removes the veth (both ends) and the namespace, if there; errors are ignored.
+    fn tear_down(&self) {
+        let _ = ip(&["link", "delete", self.name]);
+        let _ = ip(&["netns", "delete", self.name]);
+        let _ = std::fs::remove_file(Path::new("/run/netns").join(self.name));
+    }
+}
+
+/// Whether orb traffic to `a` would be forwarded out of this namespace: not loopback,
+/// link-local, multicast or the like, and not one of this host's own addresses (orbs
+/// cannot reach the agent, so a question to those tells nothing about forwarding).
+fn forwardable(a: Ipv4Addr) -> bool {
+    !(a.is_loopback()
+        || a.is_link_local()
+        || a.is_unspecified()
+        || a.is_multicast()
+        || a.is_broadcast())
+        && std::net::UdpSocket::bind((a, 0)).is_err()
+}
+
+/// Tears a probe down when dropped, also on early returns.
+struct ProbeCleanup(ForwardProbe);
+
+impl Drop for ProbeCleanup {
+    fn drop(&mut self) {
+        self.0.tear_down();
+    }
+}
+
+/// Whether `server` answers a DNS query (the root's NS records; any answer counts)
+/// sent from this thread's network namespace, within [`PROBE_TRIES`] tries.
+fn dns_answers(server: Ipv4Addr) -> bool {
+    let Ok(s) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return false;
+    };
+    if s.connect((server, 53)).is_err() || s.set_read_timeout(Some(PROBE_WAIT)).is_err() {
+        return false;
+    }
+    let base = (std::process::id() as u16)
+        ^ (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() as u16));
+    for t in 0..PROBE_TRIES {
+        let id = base.wrapping_add(t);
+        let [hi, lo] = id.to_be_bytes();
+        // Header (id, RD, one question), then `.` NS IN.
+        let q = [hi, lo, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1];
+        if s.send(&q).is_err() {
+            continue;
+        }
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + PROBE_WAIT;
+        while std::time::Instant::now() < deadline {
+            match s.recv(&mut buf) {
+                // An answer (QR set) to this query, whatever its code.
+                Ok(n) if n >= 12 && buf[..2] == [hi, lo] && buf[2] & 0x80 != 0 => return true,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    false
+}
+
+/// Runs [`AGENT_PROBE`] once per process, on a thread of its own, and logs what it
+/// finds: a warning when a firewall drops forwarded orb traffic.
+fn probe_forwarding_in_background(dns_servers: &[String]) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dns = dns_servers.to_vec();
+        let spawned = std::thread::Builder::new()
+            .name("orbd-fwprobe".into())
+            .spawn(move || match AGENT_PROBE.run(&dns) {
+                Forwarding::Works { server } => tracing::info!(
+                    %server,
+                    "checked: forwarded orb traffic gets out of this network namespace"
+                ),
+                Forwarding::Dropped { server } => tracing::warn!(
+                    %server,
+                    "forwarded orb traffic does not get out: this agent reaches {server} (DNS), \
+                     but the same query sent as an orb's traffic gets no answer, so a firewall \
+                     in this network namespace drops what orbd forwards. VM orbs reach \
+                     nothing until you {FORWARD_FIX}"
+                ),
+                Forwarding::Unknown(why) => tracing::info!(
+                    reason = %why,
+                    "could not check that forwarded orb traffic gets out of this network \
+                     namespace"
+                ),
+            });
+        if let Err(e) = spawned {
+            tracing::info!(error = %e, "could not start the forwarding check");
+        }
+    });
 }
 
 /// The network index whose namespace side has `addr` (its orb's traffic leaves with that
@@ -1697,6 +1911,146 @@ mod tests {
     /// on across a rebuild of the table with its mark (an agent restart). Real namespaces, veths, NAT and conntrack, in a throwaway user, network
     /// and mount namespace (this test runs itself again inside `unshare -rnm`). Skipped
     /// where that or nft is unavailable, unless `ORBD_TEST_NFT=1` requires it.
+    /// The forwarding probe, through orbd's real table in real namespaces: it works
+    /// alone; another firewall's forward chain with policy drop (as iptables-nft sets one
+    /// up for ufw or Docker), or with a final iptables REJECT under policy accept (RHEL's
+    /// firewalld-less iptables), drops it; the README's nftables rules make it work again;
+    /// a DNS server that answers nobody leaves it unknown; and it leaves nothing behind.
+    /// In a throwaway user, network and mount namespace (this test runs itself again
+    /// inside `unshare -rnm`). Skipped where that or nft is unavailable, unless
+    /// `ORBD_TEST_NFT=1` requires it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forwarding_probe_finds_what_drops_orb_traffic() {
+        const INNER: &str = "ORBD_TEST_FW_INNER";
+        const NAME: &str = "forwarding_probe_finds_what_drops_orb_traffic";
+        if std::env::var_os(INNER).is_none() {
+            let probe = Command::new("unshare")
+                .args([
+                    "-rnm",
+                    "sh",
+                    "-c",
+                    "mount -t tmpfs none /run && nft list ruleset",
+                ])
+                .output();
+            if !probe.is_ok_and(|o| o.status.success()) {
+                assert!(
+                    std::env::var("ORBD_TEST_NFT").is_err(),
+                    "ORBD_TEST_NFT is set but `unshare -rnm` with nft does not work"
+                );
+                eprintln!("skipped: no unprivileged namespaces with nft");
+                return;
+            }
+            let out = Command::new("unshare")
+                .arg("-rnm")
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("runtime::vm::net::tests::{NAME}"),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(INNER, "1")
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                out.status.success() && text.contains("1 passed"),
+                "inner test failed:\n{text}"
+            );
+            return;
+        }
+        let sh = |script: &str| {
+            let o = Command::new("sh").args(["-ec", script]).output().unwrap();
+            assert!(
+                o.status.success(),
+                "{script}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        // "The internet" with a DNS server at 8.8.8.8, behind wan0.
+        sh(
+            "mount -t tmpfs none /run && mkdir -p /run/netns && ip link set lo up \
+            && ip netns add inet && ip link add wan0 type veth peer name eth0 netns inet \
+            && ip addr add 8.8.8.1/24 dev wan0 && ip link set wan0 up \
+            && ip -n inet addr add 8.8.8.8/24 dev eth0 && ip -n inet link set eth0 up \
+            && ip -n inet link set lo up",
+        );
+        let dns = ["8.8.8.8".to_owned()];
+        nft(&host_table(&Egress::default(), &dns, &[])).unwrap();
+        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+        // Answers every query (QR set, the rest as asked).
+        let server = in_netns("inet", || {
+            std::net::UdpSocket::bind("8.8.8.8:53").map_err(|e| e.to_string())
+        })
+        .unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok((n, from)) = server.recv_from(&mut buf) {
+                buf[2] |= 0x80;
+                let _ = server.send_to(&buf[..n], from);
+            }
+        });
+        let probe = || AGENT_PROBE.run(&dns);
+        let works = Forwarding::Works {
+            server: Ipv4Addr::new(8, 8, 8, 8),
+        };
+        let dropped = Forwarding::Dropped {
+            server: Ipv4Addr::new(8, 8, 8, 8),
+        };
+        assert_eq!(probe(), works, "orbd's table alone forwards orb traffic");
+        // As iptables-nft builds it for `ufw default deny routed`, or Docker.
+        nft("table ip filter {\n\
+               chain FORWARD { type filter hook forward priority filter; policy drop; }\n\
+             }\n")
+        .unwrap();
+        assert_eq!(probe(), dropped, "a forward policy drop");
+        // Out alone is not enough: the replies are dropped.
+        nft("add rule ip filter FORWARD iifname \"orbd*\" accept\n").unwrap();
+        assert_eq!(probe(), dropped, "replies dropped");
+        // The README's nftables rules.
+        nft("add rule ip filter FORWARD oifname \"orbd*\" ct state established,related accept\n")
+            .unwrap();
+        assert_eq!(probe(), works, "the README's rules");
+        // Policy accept with a final REJECT: iptables-nft's own where it is installed
+        // (an xt target to nft), else nftables' reject.
+        nft("delete table ip filter\n").unwrap();
+        let iptables = Command::new("iptables")
+            .args(["-A", "FORWARD", "-j", "REJECT"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !iptables {
+            eprintln!("NOTICE: no working iptables: nftables' reject instead");
+            nft("table ip filter {\n\
+                   chain FORWARD { type filter hook forward priority filter; policy accept; reject; }\n\
+                 }\n")
+            .unwrap();
+        }
+        assert_eq!(probe(), dropped, "a final REJECT (iptables {iptables})");
+        // No answer even for the agent: unknown, not dropped.
+        assert!(matches!(
+            AGENT_PROBE.run(&["8.8.8.9".to_owned()]),
+            Forwarding::Unknown(_)
+        ));
+        assert!(matches!(AGENT_PROBE.run(&[]), Forwarding::Unknown(_)));
+        // Servers orb traffic is never forwarded to: this host's own (loopback, or one
+        // of its addresses) and link-local ones.
+        for local in ["127.0.0.1", "8.8.8.1", "169.254.169.254"] {
+            assert!(
+                matches!(AGENT_PROBE.run(&[local.to_owned()]), Forwarding::Unknown(_)),
+                "{local}"
+            );
+        }
+        // Nothing left behind.
+        let links = Command::new("ip").args(["link", "show"]).output().unwrap();
+        assert!(!String::from_utf8_lossy(&links.stdout).contains(AGENT_PROBE.name));
+        assert!(!Path::new("/run/netns").join(AGENT_PROBE.name).exists());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn established_flows_count_only_with_the_launch_mark() {
