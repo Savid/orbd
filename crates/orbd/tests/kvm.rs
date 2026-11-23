@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const IMAGE: &str = "example.invalid/amp-orb:latest";
-const MEMORY_MIB: u64 = 2048;
+const MEMORY_MIB: u64 = 1024;
 
 /// The runtime under test: `qemu` or `firecracker`.
 fn runtime() -> String {
@@ -387,7 +387,7 @@ fn assert_probes_dropped(orb: &Path, targets: &[String]) {
     let deadline = Instant::now() + Duration::from_secs(60);
     for t in targets {
         let result = loop {
-            let found = console(orb).lines().rev().find_map(|l| {
+            let found = printed(orb).lines().rev().find_map(|l| {
                 l.strip_prefix(&format!("probe {t} "))
                     .map(|r| r.trim().to_owned())
             });
@@ -411,7 +411,8 @@ fn assert_probes_dropped(orb: &Path, targets: &[String]) {
 
 /// The console without the kernel's own messages (`[    1.801470] ...` to the end of its
 /// line): printk can land in the middle of a line a guest service is printing, splitting
-/// it (Yama reports the very ptrace denial the security check provokes).
+/// it (Yama reports the very ptrace denial the security check provokes). orbd-guest's
+/// lines (through journald, with the same prefix) go too: read those from [`console`].
 fn without_kernel_messages(console: &str) -> String {
     let mut out = String::with_capacity(console.len());
     let mut rest = console;
@@ -479,7 +480,7 @@ fn assert_guest_security(orb: &Path) {
         .collect();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let console = without_kernel_messages(&console(orb));
+        let console = printed(orb);
         let reported: Vec<&str> = console
             .lines()
             .filter_map(|l| l.trim().strip_prefix("security: "))
@@ -517,19 +518,52 @@ fn orb_dir(c: &Cluster) -> PathBuf {
     dirs.pop().unwrap()
 }
 
+/// The orb's serial console. A VMM killed mid-character leaves invalid UTF-8 behind.
 fn console(orb: &Path) -> String {
-    std::fs::read_to_string(orb.join("logs/console.log")).unwrap_or_default()
+    String::from_utf8_lossy(&std::fs::read(orb.join("logs/console.log")).unwrap_or_default())
+        .into_owned()
+}
+
+/// What the guest's test services printed: the console without kernel messages.
+fn printed(orb: &Path) -> String {
+    without_kernel_messages(&console(orb))
+}
+
+/// `text` from byte `from` on (from the character there, if it starts inside one).
+fn since(text: &str, from: usize) -> &str {
+    let mut i = from.min(text.len());
+    while !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    &text[i..]
+}
+
+/// The agent's log, without colours (`\x1b[...m`).
+fn agent_log(c: &Cluster) -> String {
+    let log = std::fs::read(c.root().join("agent-agent-a.log")).unwrap_or_default();
+    let log = String::from_utf8_lossy(&log);
+    let mut plain = String::with_capacity(log.len());
+    let mut chars = log.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            chars.by_ref().find(|c| c.is_ascii_alphabetic());
+        } else {
+            plain.push(ch);
+        }
+    }
+    plain
 }
 
 /// Counter samples in console order: `(pid, n)` for the process counter and `n` for
-/// the nested guest. Lines garbled by interleaving are skipped.
+/// the nested guest. A kernel message inside a counter line would otherwise read as a
+/// counter going back.
 fn samples(console: &str) -> (Vec<(u32, u64)>, Vec<u64>) {
     let num = |s: &str| -> Option<u64> {
         let d: String = s.chars().take_while(char::is_ascii_digit).collect();
         d.parse().ok()
     };
     let (mut counter, mut l2) = (Vec::new(), Vec::new());
-    for line in console.lines() {
+    for line in without_kernel_messages(console).lines() {
         if let Some(rest) = line.strip_prefix("counter pid=")
             && let Some((pid, n)) = rest.split_once(" n=")
             && let (Some(pid), Some(n)) = (num(pid), num(n))
@@ -650,16 +684,17 @@ fn sleep_preserves_processes_and_nested_guest() {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         let console = console(&orb_dir(&c));
+        let unit = without_kernel_messages(&console);
         // The unit's own line can reach the console before orbd-guest's (via journald).
-        if console.contains("stale-dns: restored")
+        if unit.contains("stale-dns: restored")
             && console.contains("dns: tailscaled is not running but its /etc/resolv.conf")
         {
             break;
         }
         assert!(
             Instant::now() < deadline
-                && !console.contains("stale-dns: still stale")
-                && !console.contains("stale-dns: orbd-guest never wrote"),
+                && !unit.contains("stale-dns: still stale")
+                && !unit.contains("stale-dns: orbd-guest never wrote"),
             "orbd-guest's watcher did not restore a stale Tailscale resolv.conf; console tail:\n{}",
             tail(&console)
         );
@@ -698,7 +733,8 @@ fn sleep_preserves_processes_and_nested_guest() {
     let uid = assert_isolated(&c, &orb_dir(&c));
     assert_probes_dropped(&orb_dir(&c), &targets);
 
-    for round in 1..=3 {
+    // The second round saves a VM that was itself restored.
+    for round in 1..=2 {
         let before = counts(&orb_dir(&c));
         let t = Instant::now();
         assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
@@ -783,20 +819,6 @@ fn agent_crash_at_publication_boundaries_never_replays_stale_ram() {
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "first spawn");
     wait_progress(&orb_dir(&c), (0, 0));
 
-    let agent_log = |c: &Cluster| {
-        let log = std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap_or_default();
-        // Without colours (`\x1b[...m`).
-        let mut plain = String::with_capacity(log.len());
-        let mut chars = log.chars();
-        while let Some(ch) = chars.next() {
-            if ch == '\x1b' {
-                chars.by_ref().find(|c| c.is_ascii_alphabetic());
-            } else {
-                plain.push(ch);
-            }
-        }
-        plain
-    };
     // Every boundary below runs against a VM that was itself restored.
     let before = counts(&orb_dir(&c));
     assert_ok(&c.dispatch("pause", "amp-1", &[]), "warm-up pause");
@@ -977,7 +999,16 @@ fn graceful_agent_restart_keeps_running_orbs() {
             bootstraps[i],
             "Amp's bootstrap must not be restarted without a spawn"
         );
-        assert!(line_count(o, "orbd-guest: resync") >= 1, "guest resynced");
+    }
+    // Acknowledged by the guest; its own console line comes later, through journald.
+    let log = agent_log(&c);
+    for o in &orbs {
+        let orb = format!("orb={}", o.file_name().unwrap().to_string_lossy());
+        assert!(
+            log.lines()
+                .any(|l| l.contains("guest resynced (clock, network)") && l.contains(&orb)),
+            "{orb} resynced"
+        );
     }
     let uids: Vec<u32> = orbs.iter().map(|o| assert_isolated(&c, o)).collect();
     if cfg!(target_os = "linux") {
@@ -988,13 +1019,17 @@ fn graceful_agent_restart_keeps_running_orbs() {
     assert_continuous(&orbs[0]);
 
     // Drain cut short: the first save is slowed down (1 MiB/s, so it is still running
-    // after 5 s however little memory the guest touched), the agent is killed mid-save
-    // and every VMM dies with it.
+    // however little memory the guest touched), the agent is killed once it started and
+    // every VMM dies with it.
     c.terminate_agent("agent-a", Duration::from_secs(300));
     start_again(&mut c, &point("save::throttle=return(1)"));
     assert_eq!(vmm_pids(c.root()).len(), 2);
+    let mark = agent_log(&c).len();
     c.signal_agent("agent-a", "TERM");
-    std::thread::sleep(Duration::from_secs(5));
+    wait_until(Duration::from_secs(60), "the drain's first save", || {
+        let log = agent_log(&c);
+        since(&log, mark).contains("saving memory checkpoint")
+    });
     c.kill_agent("agent-a");
     for pid in vmm_pids(c.root()) {
         let _ = std::process::Command::new("kill")
@@ -1036,7 +1071,7 @@ fn graceful_agent_restart_keeps_running_orbs() {
 
 /// The marker an orb's disk reported on its last boot: (created on this boot, id).
 fn marker(orb: &Path) -> Option<(bool, String)> {
-    console(orb).lines().rev().find_map(|l| {
+    printed(orb).lines().rev().find_map(|l| {
         let (created, id) = l
             .strip_prefix("marker created ")
             .map(|id| (true, id))
@@ -1459,7 +1494,7 @@ fn flow_log_records_orb_connections() {
     assert_ok(&c.dispatch("spawn", "amp-1", &env), "spawn");
     let orb = orb_dir(&c);
     wait_until(Duration::from_secs(90), "the orb's probes", || {
-        console(&orb).contains(&format!("probe {dropped} "))
+        printed(&orb).contains(&format!("probe {dropped} "))
     });
     let log = c.root().join("agent-agent-a.log");
     let flows = |dst: &str| -> Vec<serde_json::Value> {
@@ -1587,7 +1622,7 @@ fn probes(orb: &Path, from: usize, targets: &[&str]) -> std::collections::HashMa
     let deadline = Instant::now() + Duration::from_secs(150);
     loop {
         let text = console(orb);
-        let new = text.get(from..).unwrap_or_default();
+        let new = without_kernel_messages(since(&text, from));
         let found: std::collections::HashMap<String, String> = targets
             .iter()
             .filter_map(|t| {
@@ -1757,7 +1792,7 @@ fn restricted_egress_reaches_only_its_allowlist() {
         let line = |prefix: &str| {
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
-                if let Some(l) = console(&orb)
+                if let Some(l) = printed(&orb)
                     .lines()
                     .rev()
                     .find_map(|l| l.strip_prefix(prefix).map(str::to_owned))

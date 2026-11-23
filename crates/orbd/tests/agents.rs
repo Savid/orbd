@@ -208,12 +208,10 @@ fn removed_agent_cannot_connect_and_keeps_its_orbs() {
     );
 
     // The still-running agent process keeps retrying and is refused every time.
-    std::thread::sleep(Duration::from_secs(2));
+    wait_until(Duration::from_secs(20), "the removed agent refused", || {
+        c.logs().contains("not an active agent")
+    });
     assert_eq!(c.connected_agents(), Some(1));
-    assert!(
-        c.logs().contains("not an active agent"),
-        "refusal not logged"
-    );
 
     let job = c.dispatch("spawn", "amp-x", &[]);
     assert_eq!(job.code, 75, "orb on a removed agent: {}", job.stderr);

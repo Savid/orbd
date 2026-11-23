@@ -31,7 +31,7 @@ fn sleeps_when_idle_and_wakes_for_a_spawn() {
         &c,
         &format!(
             "  timeout_secs: 60\n  sleep_command: [sh, -c, \"echo sleep >> {}\"]\n  \
-             sleep_after_idle_secs: 5\n",
+             sleep_after_idle_secs: 2\n",
             c.root().join("hooks.log").display()
         ),
         false,
@@ -73,7 +73,7 @@ fn sleeps_when_idle_and_wakes_for_a_spawn() {
 #[test]
 fn spawn_fails_when_no_agent_connects_after_the_wake() {
     let mut c = Cluster::new(&["agent-a"], 2);
-    let log = with_wake(&c, "  timeout_secs: 3\n", true);
+    let log = with_wake(&c, "  timeout_secs: 1\n", true);
     c.start_all();
     c.terminate_agent("agent-a", Duration::from_secs(30));
 
@@ -81,7 +81,7 @@ fn spawn_fails_when_no_agent_connects_after_the_wake() {
     assert_ne!(job.code, 0, "spawn without an agent must fail");
     assert!(
         job.stderr.contains(
-            "no agent connected within 3s of the wake command (it failed: exit status: 1"
+            "no agent connected within 1s of the wake command (it failed: exit status: 1"
         ),
         "stderr:\n{}",
         job.stderr
@@ -98,7 +98,7 @@ fn spawn_after_a_non_blocking_sleep_waits_for_the_agent_to_go() {
         &c,
         &format!(
             "  timeout_secs: 60\n  sleep_command: [sh, -c, \"echo sleep >> {}\"]\n  \
-             sleep_after_idle_secs: 2\n",
+             sleep_after_idle_secs: 1\n",
             c.root().join("hooks.log").display()
         ),
         false,
@@ -109,7 +109,7 @@ fn spawn_after_a_non_blocking_sleep_waits_for_the_agent_to_go() {
         hooks(&log) == "sleep\n"
     });
     let job = c.dispatch_bg("spawn", "amp-1", &[]);
-    std::thread::sleep(Duration::from_secs(3));
+    std::thread::sleep(Duration::from_secs(1));
     assert!(
         !job.is_finished(),
         "spawn must wait while the agent is going down"
@@ -133,15 +133,15 @@ fn hook_timeout_is_configurable() {
     let log = with_wake(
         &c,
         &format!(
-            "  sleep_command: [sh, -c, \"sleep 3; echo sleep >> {}\"]\n  \
-             sleep_after_idle_secs: 1\n  hook_timeout_secs: 2\n",
+            "  sleep_command: [sh, -c, \"sleep 2; echo sleep >> {}\"]\n  \
+             sleep_after_idle_secs: 1\n  hook_timeout_secs: 1\n",
             c.root().join("hooks.log").display()
         ),
         false,
     );
     c.start_all();
     wait_until(Duration::from_secs(20), "sleep hook killed", || {
-        c.logs().contains("timed out after 2s")
+        c.logs().contains("timed out after 1s")
     });
     assert_eq!(hooks(&log), "", "the command was killed before it finished");
 }

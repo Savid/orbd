@@ -16,12 +16,28 @@ use std::time::{Duration, Instant};
 pub const OFFERING: &str = "fake-2vcpu-2gb";
 pub const TOKEN: &str = "orb-token-value-that-must-never-be-logged";
 
+/// A port no other cluster of this process was given, free when it was handed out. Taken
+/// from below the ephemeral ranges (Linux 32768-60999, macOS 49152-65535): a port that
+/// `bind(:0)` handed out and released can be any outbound connection's before the
+/// coordinator binds it ("Address already in use").
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const FIRST: u32 = 20000;
+    const PORTS: u32 = 12000;
+    // A different start per test process, so concurrent test binaries rarely meet.
+    static NEXT: AtomicU32 = AtomicU32::new(u32::MAX);
+    let _ = NEXT.compare_exchange(
+        u32::MAX,
+        std::process::id().wrapping_mul(7919) % PORTS,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    loop {
+        let port = (FIRST + NEXT.fetch_add(1, Ordering::Relaxed) % PORTS) as u16;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn write(path: &Path, contents: impl AsRef<[u8]>) {
@@ -70,18 +86,19 @@ impl Cluster {
         )
     }
 
-    /// A cluster whose single offering (2 vCPUs, 2 GiB, 4 GiB disk) runs on `runtime`;
-    /// every agent reads `agent_yaml` as its optional config file.
+    /// A cluster whose single offering (2 vCPUs, 4 GiB disk; 2 GiB, or 1 GiB on a real VM
+    /// runtime, whose checkpoints write it all) runs on `runtime`; every agent reads
+    /// `agent_yaml` as its optional config file.
     pub fn with_runtime(
         agent_ids: &[&str],
         agent_orbs: u64,
         runtime: &str,
         agent_yaml: &str,
     ) -> Self {
-        let offering = if runtime == "fake" {
-            OFFERING.to_owned()
+        let (offering, memory_mib) = if runtime == "fake" {
+            (OFFERING.to_owned(), 2048)
         } else {
-            format!("{runtime}-2vcpu-2gb")
+            (format!("{runtime}-2vcpu-1gb"), 1024)
         };
         // On arm64 hosts (Macs) QEMU orbs are arm64 orbs.
         let arch = if runtime == "qemu" && cfg!(target_arch = "aarch64") {
@@ -106,7 +123,7 @@ running_orb_disk_headroom_gib: 1
 offerings:
   - id: {offering}
     runtime: {runtime}
-    resources: {{ vcpus: 2, memory_mib: 2048, disk_gib: 4 }}{arch}
+    resources: {{ vcpus: 2, memory_mib: {memory_mib}, disk_gib: 4 }}{arch}
 "#,
                 root = root.display(),
             ),
@@ -337,10 +354,18 @@ offerings:
     /// Stops an agent gracefully (SIGTERM, as a container stop does) and waits for it.
     pub fn terminate_agent(&mut self, id: &str, within: Duration) -> std::process::ExitStatus {
         let mut child = self.agents.get_mut(id).unwrap().take().unwrap();
-        let _ = Command::new("kill")
+        let sent = Command::new("kill")
             .args(["-TERM", &child.id().to_string()])
             .status();
-        wait_exit(&mut child, within).expect("agent did not stop in time")
+        let status = wait_exit(&mut child, within);
+        if status.is_none() {
+            // Not left running: it would hold the agent's lock and state for every
+            // test after this one.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("agent did not stop within {within:?} of SIGTERM (kill: {sent:?})");
+        }
+        status.unwrap()
     }
 
     pub fn kill_coordinator(&mut self) {
@@ -440,6 +465,16 @@ offerings:
             c.env(k, v);
         }
         c
+    }
+
+    /// Waits until the coordinator has a command open for `amp_orb`: a job dispatched
+    /// after this queues behind it, or attaches to it.
+    pub fn wait_open_command(&self, amp_orb: &str) {
+        wait_until(Duration::from_secs(10), "an open command", || {
+            self.admin(&["orb", "show", amp_orb, "--json"])
+                .stdout
+                .contains("\"open_command\": {")
+        });
     }
 
     /// Runs one job to completion.

@@ -17,9 +17,8 @@ fn duplicate_spawns_attach_and_conflicting_commands_serialize() {
     c.wait_connected(1);
 
     let first = c.dispatch_bg("spawn", "amp-1", &[]);
-    std::thread::sleep(Duration::from_millis(300));
+    c.wait_open_command("amp-1");
     let retry = c.dispatch_bg("spawn", "amp-1", &[]);
-    std::thread::sleep(Duration::from_millis(300));
     let pause = c.dispatch_bg("pause", "amp-1", &[]);
 
     for (name, j) in [("first", first), ("retry", retry), ("pause", pause)] {
@@ -124,12 +123,12 @@ fn deadlines_cancel_work_and_expire_queued_requests() {
     c.start_agent("agent-a", "fake::start::delay=return(60000)");
     c.wait_connected(1);
 
-    // 50 s dispatch budget → work deadline 10 s after start.
-    let budget = [("ORBD_DISPATCH_BUDGET_MS", "50000")];
+    // 46 s dispatch budget → work deadline 6 s after start.
+    let budget = [("ORBD_DISPATCH_BUDGET_MS", "46000")];
     let slow = c.dispatch_bg("spawn", "amp-1", &budget);
-    std::thread::sleep(Duration::from_millis(500));
-    // 45 s budget → work deadline ~5.5 s, while the spawn holds the orb for 10 s.
-    let queued = c.dispatch_bg("pause", "amp-1", &[("ORBD_DISPATCH_BUDGET_MS", "45000")]);
+    c.wait_open_command("amp-1");
+    // 43 s budget → work deadline 3 s after it, while the spawn holds the orb until 6 s.
+    let queued = c.dispatch_bg("pause", "amp-1", &[("ORBD_DISPATCH_BUDGET_MS", "43000")]);
 
     let slow = slow.join().unwrap();
     assert_ne!(slow.code, 0, "spawn past its deadline must fail");

@@ -33,6 +33,13 @@ console() { # RUNTIME
     docker run --rm --network none -v "$agent:/s:ro" --entrypoint sh "$image" -c \
         "for d in /s/orbs/*/; do [ ! -e \$d/$disk ] || cat \$d/logs/console.log; done" 2>/dev/null || true
 }
+# What the orb's test services printed: the console without kernel messages (`[    1.801470]
+# ...` to the end of its line), which can land in the middle of a service's line.
+# orbd-guest's lines (through journald, with the same prefix) go too: read them from
+# console.
+printed() { # RUNTIME
+    console "$1" | perl -0pe 's/\[ *\d+\.\d+\][^\n]*\n?//g'
+}
 cleanup() {
     local status=$?
     if [ "$status" != 0 ]; then
@@ -69,7 +76,7 @@ wait_for() { # SECONDS WHAT COMMAND...
 # gives `orbd dispatch`.
 dispatch() { # OPERATION RUNTIME
     local orb=e2e-$2
-    local env=(-e ORBD_DISPATCH_SOCKET=/var/lib/orbd/dispatch.sock -e "ORBD_OFFERING_ID=$2-1vcpu-2gb"
+    local env=(-e ORBD_DISPATCH_SOCKET=/var/lib/orbd/dispatch.sock -e "ORBD_OFFERING_ID=$2-1vcpu-1gb"
         -e "ORB_OPERATION=$1" -e "ORB_ID=$orb" -e "ORB_SANDBOX_ID=sandbox-$orb"
         -e AMP_URL=https://ampcode.com -e "AMP_THREAD_ID=T-$orb" -e "AMP_SANDBOX_ID=orb-provider:e2e:$orb")
     [ "$1" != spawn ] || env+=(-e "ORB_IMAGE=$orb_image" -e ORB_TOKEN=e2e-orb-token
@@ -84,7 +91,7 @@ dispatch() { # OPERATION RUNTIME
 # came from one process with a strictly increasing count: a count that restarts means
 # processes were lost, one that repeats or goes back means stale RAM was replayed.
 counter() { # RUNTIME
-    console "$1" | grep -aoE '^counter pid=[0-9]+ n=[0-9]+' | awk -F'[= ]' '
+    printed "$1" | grep -aoE '^counter pid=[0-9]+ n=[0-9]+' | awk -F'[= ]' '
         NR > 1 && ($3 != pid || $5 <= n) {
             printf "counter broke: pid=%s n=%s after pid=%s n=%s\n", $3, $5, pid, n > "/dev/stderr"
             bad = 1
@@ -105,7 +112,7 @@ wait_counter() { # RUNTIME N
 vmms() { docker top "$agent" -eo pid,args | grep -cE '[q]emu-system|[f]irecracker --api-sock' || true; }
 connected() { docker exec "$coord" orbd agent list | has -P '^agent-1\tconnected\t'; }
 probe() { # RUNTIME TARGET -> open|refused|dropped (last report)
-    console "$1" | grep -aoE "^probe $2 [a-z]+" | tail -n 1 | cut -d' ' -f3
+    printed "$1" | grep -aoE "^probe $2 [a-z]+" | tail -n 1 | cut -d' ' -f3
 }
 
 # CI runners have little free disk: hold less of it per running orb and in reserve.
@@ -113,12 +120,12 @@ cat >"$work/orbd.yaml" <<EOF
 public_url: https://$coord:7443
 running_orb_disk_headroom_gib: 1
 offerings:
-  - id: qemu-1vcpu-2gb
+  - id: qemu-1vcpu-1gb
     runtime: qemu
-    resources: { vcpus: 1, memory_mib: 2048, disk_gib: 4 }
-  - id: firecracker-1vcpu-2gb
+    resources: { vcpus: 1, memory_mib: 1024, disk_gib: 4 }
+  - id: firecracker-1vcpu-1gb
     runtime: firecracker
-    resources: { vcpus: 1, memory_mib: 2048, disk_gib: 4 }
+    resources: { vcpus: 1, memory_mib: 1024, disk_gib: 4 }
 EOF
 # No runtime section: the agent detects QEMU and Firecracker.
 cat >"$work/agent.yaml" <<EOF
@@ -154,10 +161,15 @@ for rt in $runtimes; do
     echo "== $rt counter pid=${pid[$rt]} n=${n[$rt]}"
 done
 
-# VM orbs reach the internet through NAT, never the agent's own namespace. Probes run in
-# order, each dropped one taking 5 s: wait for the last.
+# VM orbs reach the internet through NAT, never the agent's own namespace. Probes run at
+# once, a dropped one taking 5 s: wait for all of them.
 for rt in $runtimes; do
-    probed() { [ -n "$(probe "$rt" "$coord_ip:9")" ]; }
+    probed() {
+        local t
+        for t in 1.1.1.1:53 "$agent_ip:9" "$coord_ip:7443" "$coord_ip:9"; do
+            [ -n "$(probe "$rt" "$t")" ] || return 1
+        done
+    }
     wait_for 30 "the $rt orb's network probes" probed
     egress=$(probe "$rt" 1.1.1.1:53) inward=$(probe "$rt" "$agent_ip:9")
     echo "== $rt orb: internet $egress, agent namespace $inward"

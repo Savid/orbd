@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Builds the raw ext4 test root disk for the opt-in KVM tests (tests/qemu_kvm.rs):
+# Builds the raw ext4 test root disk for the opt-in KVM tests (tests/kvm.rs):
 # Debian 12 with systemd, the real `orbd-guest` and its units, a stand-in for Amp's
 # `amp-headless-bootstrap` unit, and workloads that print to the serial console:
 #   orbd-test-counter  `counter pid=<pid> n=<n>` every second (must survive sleep)
 #   orbd-test-nested   a nested KVM guest (QEMU as `user`) printing `l2: l2counter n=<n>`
-#   orbd-test-blob     with `orbd.blob=<MiB>` on the kernel command line: dirty RAM
 #   orbd-test-marker   `marker created|present <id>`: a disk's identity, kept by snapshots
 #   orbd-test-dns      `stale-dns: ...`: leaves resolv.conf as a killed tailscaled would
 #   orbd-test-security `security: <name>=<value>`: LSMs, hardening sysctls, and what an
@@ -37,7 +36,7 @@ work=$(mktemp -d)
 chmod 0755 "$work"   # read by the unprivileged namespace root
 trap 'rm -rf "$work"' EXIT
 
-units="orbd-guest.service amp-headless-bootstrap.service orbd-test-counter.service orbd-test-blob.service orbd-test-marker.service orbd-test-dns.service orbd-test-security.service"
+units="orbd-guest.service amp-headless-bootstrap.service orbd-test-counter.service orbd-test-marker.service orbd-test-dns.service orbd-test-security.service"
 nested_hooks=()
 if [ "$nested" = 1 ]; then
     # Nested (L2) guest: the same kernel (built without initrd support) booting a tiny
