@@ -287,6 +287,18 @@ pub struct QemuRuntime {
     locks: OrbLocks,
 }
 
+/// QEMU's `-cpu` for a cold boot: on x86_64 the host CPU with VMX and SVM hidden unless
+/// `nested` (the orb's type has kvm and this agent allows nested KVM). Other
+/// architectures (Apple Silicon under Hypervisor.framework) always get the host CPU:
+/// those flags are x86's.
+fn cpu_model(nested: bool) -> &'static str {
+    if nested || cfg!(not(target_arch = "x86_64")) {
+        DEFAULT_CPU_MODEL
+    } else {
+        NO_NESTED_CPU_MODEL
+    }
+}
+
 impl QemuRuntime {
     /// Checks host prerequisites and identifies the QEMU binary and host CPU. Running
     /// VMs are adopted lazily, by the first `inspect` of each orb (agent recovery).
@@ -700,11 +712,7 @@ impl QemuRuntime {
         };
         let machine_args = Machine {
             machine_type: &self.machine,
-            cpu_model: if nested || cfg!(not(target_arch = "x86_64")) {
-                DEFAULT_CPU_MODEL
-            } else {
-                NO_NESTED_CPU_MODEL
-            },
+            cpu_model: cpu_model(nested),
             vcpus: recipe.vcpus,
             memory_mib: recipe.memory_bytes / MIB,
             kernel: &kernel.path,
@@ -1756,6 +1764,19 @@ fn qmp_err(e: qmp::QmpError) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VMX and SVM are hidden only on x86_64, and only from orbs without kvm; an arm64
+    /// agent (a Mac under Hypervisor.framework) never passes x86 CPU flags to QEMU.
+    #[test]
+    fn nested_virtualization_is_hidden_only_on_x86() {
+        assert_eq!(cpu_model(true), DEFAULT_CPU_MODEL);
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(cpu_model(false), NO_NESTED_CPU_MODEL);
+        } else {
+            assert_eq!(cpu_model(false), DEFAULT_CPU_MODEL);
+            assert!(!cpu_model(false).contains("vmx") && !cpu_model(false).contains("svm"));
+        }
+    }
 
     fn manifest(guest_boot_id: Option<String>) -> CheckpointManifest {
         CheckpointManifest {

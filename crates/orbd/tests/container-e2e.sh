@@ -15,7 +15,8 @@
 # only what ORBD_EGRESS_ALLOW allows (the coordinator's 7443). The agent sets a
 # non-default ORBD_GUEST_NETWORK, which both orbs must be addressed in. Every VMM runs
 # jailed, as an unprivileged uid of its own. Needs Docker, /dev/kvm and the internet;
-# nested virtualization is not needed.
+# nested virtualization is not needed (the agent allows the QEMU orb its /dev/kvm,
+# ORBD_NESTED_KVM=true, but the test does not use it).
 set -euo pipefail
 image=$1
 rootfs=$(realpath "$2")
@@ -141,14 +142,15 @@ docker run -d --name "$coord" --network "$id" -v "$coord:/var/lib/orbd" \
 wait_for 30 "the dispatch socket" docker exec "$coord" test -S /var/lib/orbd/dispatch.sock
 coord_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$coord")
 token=$(docker exec "$coord" orbd join-token agent-1)
-# Exactly the documented agent flags (README): no --privileged.
+# Exactly the documented agent flags (README): no --privileged. The amd64 QEMU offering
+# gives its orb /dev/kvm, which agents allow only with ORBD_NESTED_KVM=true.
 docker run -d --name "$agent" --network "$id" --stop-timeout 300 \
     --cap-add SYS_ADMIN --cap-add NET_ADMIN --device /dev/kvm --device /dev/net/tun \
     --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
     -v "$agent:/var/lib/orbd" -v "$work/agent.yaml:/etc/orbd/agent.yaml:ro" \
     -v "$rootfs:/fixture/rootfs.ext4:ro" -e "ORBD_JOIN=$token" -e ORBD_DISK_RESERVE_GIB=2 \
     -e ORBD_AGENT_CONFIG=/etc/orbd/agent.yaml -e ORBD_GUEST_NETWORK=10.200.0.0/24 \
-    -e "ORBD_EGRESS_ALLOW=tcp:$coord_ip:7443," \
+    -e "ORBD_EGRESS_ALLOW=tcp:$coord_ip:7443," -e ORBD_NESTED_KVM=true \
     "$image" agent >/dev/null
 wait_for 60 "the agent to connect" connected
 agent_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$agent")

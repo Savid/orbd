@@ -46,8 +46,9 @@ dev/docker-hosts/hostctl ssh 1 journalctl -fu orbd-agent
 ```
 
 This installs `/usr/local/bin/orbd` and the token (`/etc/orbd/agent.env`, 0600) and
-(re)starts `orbd-agent.service` ([orbd-agent.service](orbd-agent.service)). The agent
-detects Docker and its capacity. Give the coordinator `public_url:
+(re)starts `orbd-agent.service` ([orbd-agent.service](orbd-agent.service)), which sets
+`ORBD_VM_ONLY=false` so the agent may run Docker orbs. It then detects Docker (these hosts
+have no QEMU) and its capacity. Give the coordinator `public_url:
 https://10.0.2.2:<port>`, the address guests reach this orb on.
 
 ### Talking to a host's dockerd from the orb

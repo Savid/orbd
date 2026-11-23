@@ -620,15 +620,15 @@ mod tests {
         }
     }
 
-    /// ORBD_NESTED_KVM=false: an orb with /dev/kvm is never started, whatever the
-    /// coordinator sends, but can still be paused and deleted.
+    /// Without ORBD_NESTED_KVM=true (the default) an orb with /dev/kvm is never started,
+    /// whatever the coordinator sends, but can still be paused and deleted.
     #[test]
     fn nested_kvm_off_refuses_spawning_kvm_orbs_only() {
-        let off = AgentSection {
-            refuse_nested_kvm: true,
+        let off = AgentSection::new("/s".into());
+        let on = AgentSection {
+            refuse_nested_kvm: false,
             ..AgentSection::new("/s".into())
         };
-        let on = AgentSection::new("/s".into());
         let kvm = orb(NestedKvmRequirement::GuestDevice);
         let preserved = orb(NestedKvmRequirement::GuestDeviceAndPreservedNestedState);
         let plain = orb(NestedKvmRequirement::NotRequired);

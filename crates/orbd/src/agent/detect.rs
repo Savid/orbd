@@ -7,9 +7,10 @@
 //! `firecracker` works (it does in orbd's image); an agent whose orbs need a runtime it
 //! no longer has refuses to start (see `executor::recover`).
 //!
-//! A VM-only agent (`ORBD_VM_ONLY`) never uses Docker: detection then fails unless QEMU
-//! is usable, and a configured or recorded Docker runtime is refused, so an agent meant
-//! to isolate orbs in VMs never falls back to containers sharing the host's kernel.
+//! Agents are VM-only by default (`ORBD_VM_ONLY`): detection fails unless QEMU is
+//! usable, and a configured or recorded Docker runtime is refused, so an agent never
+//! falls back to containers sharing the host's kernel. Docker orbs, however the agent
+//! would come to run them, take `ORBD_VM_ONLY=false`.
 
 use crate::config::agent::{
     AgentConfig, DockerRuntimeConfig, FirecrackerRuntimeConfig, QemuRuntimeConfig,
@@ -71,8 +72,9 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
     let r = &mut config.runtime;
     if vm_only && r.docker.is_some() {
         bail!(
-            "ORBD_VM_ONLY is set but the agent config enables the Docker runtime \
-             (runtime.docker): remove it, or unset ORBD_VM_ONLY"
+            "the agent config enables the Docker runtime (runtime.docker), whose orbs are \
+             containers sharing the host's kernel: set ORBD_VM_ONLY=false to run them, or \
+             remove runtime.docker"
         );
     }
     if r.fake.is_none() && r.docker.is_none() && r.qemu.is_none() && r.firecracker.is_none() {
@@ -83,10 +85,10 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
                     .with_context(|| format!("unrecognised runtime in {}", record.display()))?;
                 if vm_only && kind == RuntimeKind::Docker {
                     bail!(
-                        "ORBD_VM_ONLY is set but this agent runs Docker orbs ({} records \
-                         docker): it never switches runtime, so its orbs would be lost; \
-                         unset ORBD_VM_ONLY, or delete its orbs and start it with a new \
-                         state directory",
+                        "this agent runs Docker orbs ({} records docker), containers sharing \
+                         the host's kernel: set ORBD_VM_ONLY=false to keep running them, or \
+                         delete its orbs and start it with a new state directory to run VM \
+                         orbs (it never switches runtime, so its orbs would be lost)",
                         record.display()
                     );
                 }
@@ -154,11 +156,18 @@ pub(crate) async fn runtime(config: &mut AgentConfig) -> Result<()> {
              this agent's orbs have no network namespaces of their own"
         );
     }
-    if config.agent.refuse_nested_kvm {
-        tracing::info!(
-            "ORBD_NESTED_KVM=false: this agent advertises no nested KVM and starts no orb whose \
-             type has kvm"
-        );
+    // Only amd64 QEMU orbs can have /dev/kvm (Hypervisor.framework does not nest).
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && config.runtime.qemu.is_some() {
+        if config.agent.refuse_nested_kvm {
+            tracing::info!(
+                "nested KVM off (the default): this agent starts no orb whose type has kvm; \
+                 ORBD_NESTED_KVM=true allows them"
+            );
+        } else {
+            tracing::info!(
+                "nested KVM on (ORBD_NESTED_KVM=true): orbs whose type has kvm get /dev/kvm"
+            );
+        }
     }
     Ok(())
 }
@@ -183,11 +192,17 @@ where
         return Ok(RuntimeKind::Qemu);
     }
     if vm_only {
+        let fix = if cfg!(target_os = "macos") {
+            "install QEMU (Homebrew's qemu) and put it on the agent's PATH"
+        } else {
+            "give the agent /dev/kvm (in Docker: --device /dev/kvm)"
+        };
         bail!(
-            "no usable VM runtime and ORBD_VM_ONLY refuses Docker: QEMU needs {} and {} ({})",
+            "no usable VM runtime: QEMU needs {} and {} ({}). To run VM orbs, {fix}; or set \
+             ORBD_VM_ONLY=false to run Docker orbs, containers sharing the host's kernel",
             crate::doctor::ACCEL_NAME,
             orbd_qemu::probe::QEMU_SYSTEM,
-            qemu.err().unwrap_or_default()
+            qemu.err().unwrap_or_default(),
         );
     }
     match docker().await {
@@ -336,35 +351,50 @@ mod tests {
     use super::*;
     use crate::config::agent::AgentSection;
 
-    fn vm_only_config(dir: &std::path::Path) -> AgentConfig {
-        let mut agent = AgentSection::new(dir.to_owned());
-        agent.vm_only = true;
+    /// An agent config with the defaults (VM-only).
+    fn default_config(dir: &std::path::Path) -> AgentConfig {
         AgentConfig {
-            agent,
+            agent: AgentSection::new(dir.to_owned()),
             ..Default::default()
         }
     }
 
-    #[tokio::test]
-    async fn vm_only_refuses_a_configured_docker_runtime() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = vm_only_config(dir.path());
-        config.runtime.docker = Some(DockerRuntimeConfig::default());
-        let e = runtime(&mut config).await.unwrap_err().to_string();
-        assert!(
-            e.contains("ORBD_VM_ONLY") && e.contains("runtime.docker"),
-            "{e}"
-        );
+    /// However a config is made (flags, a default, a file), it is VM-only and allows no
+    /// nested KVM unless told otherwise.
+    #[test]
+    fn agents_are_vm_only_without_nested_kvm_by_default() {
+        for agent in [AgentSection::new("/s".into()), AgentSection::default()] {
+            assert!(agent.vm_only && agent.refuse_nested_kvm);
+        }
+        assert!(QemuRuntimeConfig::default().refuse_nested_kvm);
+        let file: QemuRuntimeConfig = serde_saphyr::from_str("kernel: /k").unwrap();
+        assert!(file.refuse_nested_kvm);
     }
 
     #[tokio::test]
-    async fn vm_only_refuses_a_recorded_docker_runtime() {
+    async fn docker_orbs_take_vm_only_false() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("runtime"), "docker").unwrap();
-        let mut config = vm_only_config(dir.path());
+        let mut config = default_config(dir.path());
+        config.runtime.docker = Some(DockerRuntimeConfig::default());
         let e = runtime(&mut config).await.unwrap_err().to_string();
         assert!(
-            e.contains("ORBD_VM_ONLY") && e.contains("Docker orbs"),
+            e.contains("ORBD_VM_ONLY=false") && e.contains("runtime.docker"),
+            "{e}"
+        );
+        // Opting in keeps the configured Docker runtime.
+        config.agent.vm_only = false;
+        runtime(&mut config).await.unwrap();
+        assert!(config.runtime.docker.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_recorded_docker_runtime_takes_vm_only_false() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("runtime"), "docker").unwrap();
+        let mut config = default_config(dir.path());
+        let e = runtime(&mut config).await.unwrap_err().to_string();
+        assert!(
+            e.contains("ORBD_VM_ONLY=false") && e.contains("Docker orbs"),
             "{e}"
         );
         assert!(config.runtime.docker.is_none());
@@ -391,7 +421,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            e.contains("ORBD_VM_ONLY") && e.contains("no /dev/kvm"),
+            e.contains("ORBD_VM_ONLY=false") && e.contains("no /dev/kvm"),
             "{e}"
         );
         assert!(!probed.get(), "a VM-only agent never probes Docker");

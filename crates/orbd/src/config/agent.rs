@@ -131,7 +131,7 @@ fn default_refresh_secs() -> u64 {
     3600
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AgentSection {
     /// Holds `agent.sqlite`, the agent's identity, images, orb disks, checkpoints.
     pub state_dir: PathBuf,
@@ -161,11 +161,12 @@ pub struct AgentSection {
     pub vmm_jail: JailMode,
     /// Jailed VMMs run as `vmm_jail_uid_base + <index>` (`ORBD_VMM_JAIL_UID_BASE`).
     pub vmm_jail_uid_base: u32,
-    /// Never use the Docker runtime (`ORBD_VM_ONLY`): detection fails unless a VM
-    /// runtime is usable, and a configured or recorded Docker runtime is refused.
+    /// Never use the Docker runtime (`ORBD_VM_ONLY`, on by default): detection fails
+    /// unless a VM runtime is usable, and a configured or recorded Docker runtime is
+    /// refused.
     pub vm_only: bool,
-    /// Run no orb with `/dev/kvm` (`ORBD_NESTED_KVM=false`): advertise no nested KVM and
-    /// refuse to start an orb whose type has `kvm`, whatever the coordinator sends.
+    /// Run no orb with `/dev/kvm` (unless `ORBD_NESTED_KVM=true`): advertise no nested
+    /// KVM and refuse to start an orb whose type has `kvm`, whatever the coordinator sends.
     pub refuse_nested_kvm: bool,
     /// macOS: start QEMU orbs without a verified pf fence (`ORBD_ALLOW_UNFENCED_EGRESS`);
     /// they then reach whatever the Mac can, its LAN included.
@@ -538,6 +539,18 @@ impl ImageSandbox {
     }
 }
 
+impl Default for AgentSection {
+    /// [`AgentSection::new`]'s settings (VM-only, no nested KVM, VMMs jailed) with no
+    /// paths.
+    fn default() -> Self {
+        Self {
+            run_dir: PathBuf::new(),
+            secret_key_file: PathBuf::new(),
+            ..Self::new(PathBuf::new())
+        }
+    }
+}
+
 impl AgentSection {
     pub fn new(state_dir: PathBuf) -> Self {
         Self {
@@ -554,8 +567,8 @@ impl AgentSection {
             checkpoint_max_age: None,
             vmm_jail: JailMode::On,
             vmm_jail_uid_base: DEFAULT_JAIL_UID_BASE,
-            vm_only: false,
-            refuse_nested_kvm: false,
+            vm_only: true,
+            refuse_nested_kvm: true,
             allow_unfenced_egress: false,
             image_allow: ImageAllow::default(),
             image_sandbox: ImageSandbox::default(),
@@ -635,12 +648,17 @@ pub struct QemuRuntimeConfig {
     #[serde(skip)]
     pub jail: Option<VmmJail>,
     /// Start no orb whose type has `kvm` (from `agent.refuse_nested_kvm`).
-    #[serde(skip)]
+    #[serde(skip, default = "refuse_nested_kvm")]
     pub refuse_nested_kvm: bool,
     /// macOS: start orbs without a verified egress fence (from
     /// `agent.allow_unfenced_egress`).
     #[serde(skip)]
     pub allow_unfenced_egress: bool,
+}
+
+/// Agents allow no nested KVM unless `ORBD_NESTED_KVM=true`.
+fn refuse_nested_kvm() -> bool {
+    true
 }
 
 impl Default for QemuRuntimeConfig {
@@ -655,7 +673,7 @@ impl Default for QemuRuntimeConfig {
             guest_network: GuestNetwork::default(),
             egress: Egress::default(),
             jail: None,
-            refuse_nested_kvm: false,
+            refuse_nested_kvm: refuse_nested_kvm(),
             allow_unfenced_egress: false,
         }
     }

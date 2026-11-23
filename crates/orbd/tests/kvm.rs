@@ -1539,9 +1539,11 @@ fn qemu_user_network_recipes_are_refused() {
     );
 }
 
-/// An agent started with `ORBD_NESTED_KVM=false` gets no new orb with `/dev/kvm`, and
-/// refuses to start its own sleeping one when the coordinator sends a spawn for it to its
-/// recorded host anyway, but still deletes it. Only amd64 QEMU orbs have `/dev/kvm`.
+/// An agent without `ORBD_NESTED_KVM=true` (the default) gets no new orb with
+/// `/dev/kvm`, and refuses to start its own sleeping one when the coordinator sends a
+/// spawn for it to its recorded host anyway, but still deletes them, and loses nothing:
+/// with the setting back the sleeping orb wakes with its processes. Only amd64 QEMU orbs
+/// have `/dev/kvm`.
 #[test]
 #[ignore = "needs KVM; see the module docs"]
 fn nested_kvm_off_refuses_kvm_orbs() {
@@ -1552,17 +1554,31 @@ fn nested_kvm_off_refuses_kvm_orbs() {
     let mut c = cluster(2);
     let _vms = Vms(c.root().to_owned());
     c.start_all();
-    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn");
-    wait_progress(&orb_dir(&c), (0, 0));
-    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
+    for amp in ["amp-1", "amp-3"] {
+        assert_ok(&c.dispatch("spawn", amp, &[]), "spawn");
+    }
+    let orbs = orb_dirs(&c);
+    for o in &orbs {
+        wait_progress(o, (0, 0));
+    }
+    for amp in ["amp-1", "amp-3"] {
+        assert_ok(&c.dispatch("pause", amp, &[]), "pause");
+    }
+    let before = counts(&orbs[0]);
 
     c.kill_agent("agent-a");
-    c.agent_env.push(("ORBD_NESTED_KVM".into(), "false".into()));
+    // The default: no ORBD_NESTED_KVM.
+    c.agent_env.retain(|(k, _)| k != "ORBD_NESTED_KVM");
     start_again(&mut c, "");
     let job = c.dispatch("spawn", "amp-2", &[]);
     assert_ne!(
         job.code, 0,
         "a new kvm orb was placed on an agent without nested KVM"
+    );
+    let out = format!("{}{}", job.stdout, job.stderr);
+    assert!(
+        out.contains("needs ORBD_NESTED_KVM=true on a host whose KVM nests"),
+        "the coordinator says why: {out}"
     );
     let job = c.dispatch("spawn", "amp-1", &[]);
     assert_ne!(
@@ -1570,8 +1586,21 @@ fn nested_kvm_off_refuses_kvm_orbs() {
         "an orb with /dev/kvm woke on an agent without nested KVM"
     );
     let out = format!("{}{}", job.stdout, job.stderr);
-    assert!(out.contains("ORBD_NESTED_KVM=false"), "{out}");
+    assert!(
+        out.contains("this agent runs no orbs with /dev/kvm"),
+        "the agent refused it itself: {out}"
+    );
     assert!(vmm_pids(c.root()).is_empty(), "no VMM may have started");
+    assert_ok(&c.dispatch("delete", "amp-3", &[]), "delete");
+    assert_eq!(orb_dirs(&c), orbs[..1], "only the deleted orb is gone");
+
+    // Nothing was lost: with nested KVM allowed, amp-1 wakes from its checkpoint.
+    c.kill_agent("agent-a");
+    c.agent_env.push(("ORBD_NESTED_KVM".into(), "true".into()));
+    start_again(&mut c, "");
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake with nested KVM");
+    wait_progress(&orbs[0], before);
+    assert_continuous(&orbs[0]);
     assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete");
     assert!(orb_dirs(&c).is_empty());
 }
