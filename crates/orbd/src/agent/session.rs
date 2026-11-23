@@ -329,6 +329,22 @@ fn refused_by_policy(
     None
 }
 
+/// How many of the orbs here (`defs`, those `live` says are not deleted) have a type
+/// with `kvm` that this agent never starts or wakes (nested KVM off, the default since
+/// 0.4) until it runs with `ORBD_NESTED_KVM=true`.
+pub(crate) fn kvm_orbs_held(
+    agent: &crate::config::agent::AgentSection,
+    defs: &[OrbDefinition],
+    live: impl Fn(&OrbDefinition) -> bool,
+) -> usize {
+    if !agent.refuse_nested_kvm {
+        return 0;
+    }
+    defs.iter()
+        .filter(|d| crate::runtime::needs_nested_kvm(d) && live(d))
+        .count()
+}
+
 async fn handle_delivery(sh: &Arc<Shared>, d: pb::CommandDelivery) -> anyhow::Result<()> {
     let raw_key = d
         .command
@@ -618,6 +634,26 @@ mod tests {
             command_digest: CommandDigest("d".into()),
             action,
         }
+    }
+
+    /// An agent with nested KVM off counts the live orbs it will not start (its startup
+    /// warning); one with it on, or with no kvm orbs, counts none.
+    #[test]
+    fn kvm_orbs_held_counts_live_kvm_orbs_when_nested_kvm_is_off() {
+        let off = AgentSection::new("/s".into());
+        let on = AgentSection {
+            refuse_nested_kvm: false,
+            ..AgentSection::new("/s".into())
+        };
+        let kvm = orb(NestedKvmRequirement::GuestDevice);
+        let preserved = orb(NestedKvmRequirement::GuestDeviceAndPreservedNestedState);
+        let deleted = orb(NestedKvmRequirement::GuestDevice);
+        let plain = orb(NestedKvmRequirement::NotRequired);
+        let defs = [kvm, preserved, deleted.clone(), plain];
+        let live = |d: &OrbDefinition| d.id != deleted.id;
+        assert_eq!(kvm_orbs_held(&off, &defs, live), 2);
+        assert_eq!(kvm_orbs_held(&on, &defs, live), 0);
+        assert_eq!(kvm_orbs_held(&off, &defs[3..], live), 0);
     }
 
     /// Without ORBD_NESTED_KVM=true (the default) an orb with /dev/kvm is never started,

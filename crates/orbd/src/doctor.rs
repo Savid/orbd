@@ -146,6 +146,47 @@ fn nested_kvm() -> Result<String, String> {
     Ok(nested)
 }
 
+/// Linux: forwarded orb traffic gets out of this network namespace, past every firewall
+/// here (`runtime::vm::net::ForwardProbe`): the agent's own check, which needs orbd's
+/// table, so run it where the agent runs (`docker exec <agent> orbd doctor` for one in a
+/// container). The orbs' DNS servers are `ORBD_DNS`'s, as the agent's.
+#[cfg(target_os = "linux")]
+fn host_firewall() -> Result<String, String> {
+    use crate::runtime::vm::net::{DOCTOR_PROBE, FORWARD_FIX, Forwarding};
+    if !nix::unistd::geteuid().is_root() {
+        return Err("not checked: it takes root".into());
+    }
+    let table = Command::new("nft")
+        .args(["list", "table", "inet", "orbd"])
+        .output();
+    if !table.is_ok_and(|o| o.status.success()) {
+        return Err(
+            "not checked: no orbd table in this network namespace (run it where the \
+                    agent runs)"
+                .into(),
+        );
+    }
+    let dns: Vec<String> = match std::env::var("ORBD_DNS") {
+        Ok(v) => v.split(',').map(|s| s.trim().to_owned()).collect(),
+        Err(_) => crate::config::agent::DEFAULT_DNS.map(String::from).to_vec(),
+    };
+    match DOCTOR_PROBE.run(&dns) {
+        Forwarding::Works { server } => Ok(format!(
+            "orb traffic forwarded through this namespace reaches {server}"
+        )),
+        Forwarding::Dropped { server } => Err(format!(
+            "this namespace reaches {server}, but not as forwarded orb traffic: a firewall \
+             drops it, so VM orbs reach nothing; {FORWARD_FIX}"
+        )),
+        Forwarding::Unknown(why) => Err(format!("not checked: {why}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn host_firewall() -> Result<String, String> {
+    Ok("not checked".into())
+}
+
 /// macOS: pf blocks QEMU's network group (`runtime::qemu::fence`), probed as the agent
 /// does before starting a QEMU orb.
 fn egress_fence(group: Option<&str>) -> Result<String, String> {
@@ -268,6 +309,7 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
         let root = nix::unistd::geteuid().is_root();
         r.line(first_line(Path::new("ip"), &["-V"]), "ip", root);
         r.line(first_line(Path::new("nft"), &["--version"]), "nft", root);
+        r.line(host_firewall(), "host firewall", false);
     }
     r.line(accel(), ACCEL_NAME, true);
     #[cfg(not(target_os = "macos"))]

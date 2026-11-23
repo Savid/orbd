@@ -80,6 +80,39 @@ pub(crate) enum Work {
 /// drain checkpointed (unless their own operations or later commands supersede that).
 pub(crate) async fn recover(sh: &Arc<Shared>) -> anyhow::Result<()> {
     let defs = sh.db.call(|c| db::list_orb_definitions(c)).await?;
+    // Orbs whose type has kvm, which an agent with nested KVM off (the default since
+    // 0.4) never starts or wakes: say how many there are.
+    let kvm: Vec<OrbDefinition> = match sh.config.agent.refuse_nested_kvm {
+        true => defs
+            .iter()
+            .filter(|d| crate::runtime::needs_nested_kvm(d))
+            .cloned()
+            .collect(),
+        false => Vec::new(),
+    };
+    if !kvm.is_empty() {
+        let live = sh
+            .db
+            .call(move |c| {
+                let mut live = std::collections::HashSet::new();
+                for d in &kvm {
+                    if db::get_orb(c, d.id)?.is_some_and(|r| !r.is_deleted()) {
+                        live.insert(d.id);
+                    }
+                }
+                Ok(live)
+            })
+            .await?;
+        let n = super::session::kvm_orbs_held(&sh.config.agent, &defs, |d| live.contains(&d.id));
+        if n > 0 {
+            tracing::warn!(
+                orbs = n,
+                "{n} orb(s) here have a type with kvm, which this agent won't start or wake \
+                 (nested KVM is off by default since 0.4): run it with ORBD_NESTED_KVM=true \
+                 to run them, or delete them"
+            );
+        }
+    }
     for d in defs {
         let Some(rt) = runtime_for(sh, &d) else {
             // Running without the runtime would leave the orb's VMM unrecovered.

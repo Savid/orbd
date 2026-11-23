@@ -138,8 +138,12 @@ Static binaries for x86_64 and aarch64 are attached to each release.
    `CAP_FOWNER`, `CAP_DAC_OVERRIDE` and `CAP_KILL`. Outside Docker, e.g. under systemd,
    run it as root with that capability set (`CapabilityBoundingSet=`), those devices
    (`DeviceAllow=`), `ReadWritePaths=/var/lib/orbd /run/netns` and `KillMode=process`
-   (VMMs outlive a restart and are adopted). Docker's user-namespace remapping is
-   unsupported: jails and image sandboxes use host uids from 1300000000 up.
+   (VMMs outlive a restart and are adopted), with `firecracker` on its `PATH` (below), and
+   allow its orbs' traffic through the host's firewall ([Host
+   firewalls](#host-firewalls)). Docker's user-namespace remapping is unsupported: jails
+   and image sandboxes use host uids from 1300000000 up. The container image is the
+   simplest way to run an agent: it brings the Firecracker, QEMU and guest kernel each
+   release is tested with, and its own network namespace.
 
 Threads you create on that provider in Amp then run on your hosts.
 
@@ -172,10 +176,10 @@ the host's Tailscale resolver `100.100.100.100`, whatever is allowed. Allow what
 with `ORBD_EGRESS_ALLOW`, comma-separated `<tcp|udp|any>:<address or CIDR>[:<port or
 range>]` entries, e.g. `udp:192.168.2.201:41641` (direct Tailscale to a LAN host) or
 `tcp:10.0.0.0/8:8000-8100`; the orbs' DNS servers are allowed on port 53. The agent's
-own traffic is not affected, other firewalls on the host still apply, and the host's
-public addresses are internet addresses to orbs (keep services there firewalled). An orb
-cannot pass as another: its traffic must come from its own guest subnet and veth. On
-macOS, see below.
+own traffic is not affected, other firewalls on the host still apply ([Host
+firewalls](#host-firewalls)), and the host's public addresses are internet addresses to
+orbs (keep services there firewalled). An orb cannot pass as another: its traffic must
+come from its own guest subnet and veth. On macOS, see below.
 
 On Linux each VMM (QEMU, Firecracker) runs jailed: as its orb's own uid and gid
 (`ORBD_VMM_JAIL_UID_BASE`, default 1300000000, plus a per-orb index, up to 2^24 of them;
@@ -405,12 +409,54 @@ raise it too, e.g. a drop-in `/etc/systemd/system/docker.service.d/orbd.conf` wi
 (~5 GiB).
 
 The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Linux 7.3
-guest kernel; an agent run outside it needs QEMU 9.0 or newer, and `ip` and `nft`
-(`orbd doctor` checks). VM orbs run in their own network namespace behind NAT and cannot
-reach the agent itself, each other or private networks (see above). A sleeping orb wakes
-only on the VMM build and CPU it slept on, so after an upgrade it cold-boots once; the
-agent deletes such memory checkpoints when it starts, as it deletes every checkpoint that
-was restored or superseded.
+guest kernel; an agent run outside it needs QEMU 9.0 or newer, `ip` and `nft`, and
+Firecracker as `firecracker` on its `PATH` (`orbd doctor` checks). Orb types without
+`kvm` run only in Firecracker, so an agent without it takes none of them, and with nested
+KVM off (the default) no orbs at all; it warns when it starts. VM orbs run in their own
+network namespace behind NAT and cannot reach the agent itself, each other or private
+networks (see above). A sleeping orb wakes only on the VMM build and CPU it slept on, so
+after an upgrade it cold-boots once; the agent deletes such memory checkpoints when it
+starts, as it deletes every checkpoint that was restored or superseded.
+
+### Host firewalls
+
+An agent forwards its VM orbs' traffic: each orb's tap sits in a network namespace of its
+own, behind the agent's namespace, which NATs it onwards. In a container of its own
+(above), that forwarding stays inside the container and the host sees ordinary container
+traffic. An agent in the host's network namespace (under systemd, or a container with
+`--network host`) forwards through the host's firewall instead, and a packet that any
+firewall's forward chain drops is dropped, whatever orbd's table accepts. ufw (`deny
+(routed)`, its default), Docker (it sets iptables' FORWARD policy to DROP when it turns
+forwarding on) and firewalld (it rejects forwarding between interfaces it has not been
+told about) all do that by default, cutting every orb off. Allow traffic from `orbd*` out,
+and its replies back:
+
+- ufw: `ufw route allow in on orbd+` (ufw already passes replies), or
+  `-A ufw-before-forward -i orbd+ -j ACCEPT` after the `RELATED,ESTABLISHED` line of
+  `ufw-before-forward` in `/etc/ufw/before.rules`, then `ufw reload`.
+- Docker hosts: both `iptables -I DOCKER-USER -i orbd+ -j ACCEPT` and `iptables -I
+  DOCKER-USER -o orbd+ -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT` (Docker
+  passes replies only to its own bridges). They survive a Docker restart, not a reboot:
+  save them the way your host saves iptables rules.
+- firewalld: `firewall-cmd --permanent --zone=trusted --add-interface=orbd+`, then
+  `firewall-cmd --reload`.
+- nftables: `iifname "orbd*" accept` and `oifname "orbd*" ct state established,related
+  accept` in your forward chain, before what drops.
+
+This does not widen what orbs reach: orbd's own table still drops their traffic to
+private ranges, the host and metadata endpoints (above). Firecracker orbs have always
+taken this path; since 0.3.0, Linux QEMU orbs (`kvm` types) do too, where 0.2's used
+QEMU's user-mode network, whose traffic was QEMU's own. QEMU orbs created by 0.2.x are
+refused and must be deleted, and upgrades from 0.2 go through 0.3.0.
+
+An agent with VM runtimes checks this path shortly after it starts, without delaying
+it: it asks one of the orbs' DNS servers (`ORBD_DNS`; not loopback, link-local or the
+host's own) a question itself, and the same question from a namespace behind a veth
+named like an orb's (`orbdprobe`, on `169.254.169.0/30`, which no orb gets). If only its
+own question is answered, it warns that a firewall drops forwarded orb traffic, with
+these fixes; if neither is, it says the check was inconclusive. `orbd doctor` runs the
+same check where the agent runs (as root; `docker exec <agent> orbd doctor` for one in a
+container).
 
 ### Upgrading to 0.4
 
@@ -421,7 +467,8 @@ Agents are VM-only and allow no nested KVM unless told otherwise:
   orbs of those types find no agent. Running ones are checkpointed when the agent stops,
   as always, but the new agent refuses to restore or wake them: they stay asleep with
   their checkpoint until it runs with `ORBD_NESTED_KVM=true` (unless the checkpoint is
-  dropped meanwhile, by `ORBD_CHECKPOINT_MAX_AGE_HOURS` or a new QEMU or kernel).
+  dropped meanwhile, by `ORBD_CHECKPOINT_MAX_AGE_HOURS` or a new QEMU or kernel). An
+  agent holding such orbs says how many when it starts.
 
 ### Inside an orb
 
