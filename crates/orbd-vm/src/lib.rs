@@ -16,5 +16,6 @@ pub mod checkpoint;
 pub mod fsutil;
 pub mod jail;
 pub mod process;
+pub mod seccomp;
 #[cfg(target_os = "macos")]
 pub mod sysctl;

@@ -145,6 +145,20 @@ Static binaries for x86_64 and aarch64 are attached to each release.
    simplest way to run an agent: it brings the Firecracker, QEMU and guest kernel each
    release is tested with, and its own network namespace.
 
+   The agent also seccomp-filters itself when it starts, and every process it starts
+   (VMMs, image and disk tools, `nft`, `ip`) inherits the filter. These calls fail with
+   `EPERM`: `bpf`, `perf_event_open`, `init_module`, `finit_module`, `delete_module`,
+   `kexec_load`, `kexec_file_load`, `open_by_handle_at`, `fanotify_init`, `syslog`,
+   `reboot`, `swapon`, `swapoff`, `acct`, `settimeofday`, `clock_settime`, and on x86
+   `iopl` and `ioperm`; so does every call of another ABI (32-bit, x32). orbd uses none
+   of them. An agent that cannot install the filter does not start. Without
+   `CAP_SYS_ADMIN` the kernel takes the filter only with `no_new_privs`, which a root
+   agent or one with any capability then sets; an agent with no capabilities at all (an
+   unprivileged development agent) runs without it, and what it runs through `sudo` is
+   not filtered. The filter narrows what the agent's children can do to the host kernel;
+   the agent itself stays root-equivalent on the host (`CAP_SYS_ADMIN` with a writable
+   `/proc/sys`).
+
 Threads you create on that provider in Amp then run on your hosts.
 
 Agents that cannot dial `public_url` (another network, or one reached over a VPN such as
@@ -185,7 +199,10 @@ On Linux each VMM (QEMU, Firecracker) runs jailed: as its orb's own uid and gid
 (`ORBD_VMM_JAIL_UID_BASE`, default 1300000000, plus a per-orb index, up to 2^24 of them;
 nothing else on the host may use these uids, so two agents on one host, each in its own
 network namespace (see above), need bases 2^24 apart, clear of `/etc/subuid` ranges),
-with no capabilities and `no_new_privs`, in a
+with no capabilities and `no_new_privs`, unable to create namespaces (a seccomp filter
+the jail installs under the VMM's own refuses `unshare`, `setns` and `clone` with
+namespace flags, `clone3` and the new mount API, so no user namespace brings
+capabilities back), in a
 mount namespace holding only its orb's disk, logs, checkpoints and sockets, the VMM and
 its libraries, the kernel, QEMU's backing image and `/dev/{kvm,net/tun,null,urandom}`:
 no `/proc`, `/sys`, agent state or other orbs. A VMM escape is an unprivileged process
@@ -233,7 +250,8 @@ it: an Amp project's image is otherwise whatever its owner names.
 On Linux, umoci, `du` and `mkfs.ext4` handle the image's files in a sandbox
 (`ORBD_IMAGE_SANDBOX=on`, the default): as root of a user namespace whose ids 0-65535
 are the host's 1400000000-1400065535 (`ORBD_IMAGE_SANDBOX_UID_BASE`; nothing on the host
-may use them), without network and seeing only the tools and the build's own files.
+may use them), without network, unable to create further namespaces (the jails'
+filter), and seeing only the tools and the build's own files.
 Owners, modes, xattrs and file capabilities come out as before; an image with device
 nodes, `trusted.*` xattrs or owners above 65535 fails to build instead (common images
 have none: in a container `/dev` is the runtime's). The agent tries the sandbox when it
@@ -640,7 +658,23 @@ rebinding): the proxy leaves them out of the answer and logs it, and the orb's n
 chain drops them anyway; the agent's own addresses are never reachable. The proxy bounds
 its work (256 queries in flight, 32 per orb; 64 TCP connections, 4 per orb, each at most
 30 s and 10 s idle; 5 s per query; 1024 open addresses per orb) and runs on a thread of
-its own. Refused names and addresses are logged (target `orbd::egress`, a few a second
+its own. What orbs send it is read only by codecs, `orbd dns-codec`: child processes,
+one per restricted orb's launch (started at its first query, stopped when the launch is
+over or after 10 minutes without queries), jailed like VMMs (their own uid above every
+orb's, no capabilities, an empty read-only root, a network namespace with nothing in
+it), undumpable, at the lowest CPU priority, with 32 MiB of memory and a CPU minute
+each, under a seccomp filter that lets them only
+read and write their socket to the agent, signal themselves and exit. The agent receives
+and sends every packet; it hands the orb's codec each query, gets back the question,
+decides, and has the codec build the answer from its records, which it sends only to
+that orb. It parses its upstream servers' answers itself. So a codec taken over by an
+orb can at most answer that orb's own queries wrongly, or look up names on that orb's
+own list: nothing the orb could not do to its own DNS anyway. It opens nothing and sees
+no other orb's queries (a TCP connection serves only the orb launch it was accepted
+from). A codec that sends anything malformed, takes over a second or
+exits is killed and started again (after 0.1 s, doubling up to 10 s while it keeps
+failing; `orbd_egress_dns_codec_restarts_total`), and its orb gets no DNS answers
+meanwhile. Refused names and addresses are logged (target `orbd::egress`, a few a second
 per orb), with metrics `orbd_egress_dns_queries_total{result}` and
 `orbd_egress_dns_blocked_addresses_total`. The flow log shows these orbs' connections,
 to the agent too, with `egress: restricted`.
@@ -688,8 +722,9 @@ HTTPS or TLS to an opened address (an allowlisted resolver, or one sharing a CDN
 address) resolves other names but still reaches only opened addresses. A wildcard
 sends lookups of any name below it upstream, so an orb can encode data in such names
 for that domain's servers; names off the list are never sent. Nothing stops an orb from
-sending data to what is allowed (a listed code host takes uploads too). The DNS proxy
-runs inside the agent, not jailed.
+sending data to what is allowed (a listed code host takes uploads too). The proxy's
+sockets, limits and upstream lookups (whose answers it parses) are the agent's; only
+what orbs send is left to the jailed codec.
 
 An example for Amp orbs (**needs confirming** against your Amp version: derived from
 what the amp-orb image's bootstrap units fetch and the hosts the Amp CLI names; a name

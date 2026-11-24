@@ -20,7 +20,12 @@
 //!   the namespace's (an abstract unix socket is the lock).
 //! * The proxy listens on [`net::DNS_PROXY`] port 53 (UDP and TCP) on a thread of its
 //!   own, and answers only restricted orbs, known by their veth address (which their
-//!   traffic cannot fake: see `net`). A name the orb's policy does not list gets
+//!   traffic cannot fake: see `net`). What they send is read only by codecs
+//!   ([`super::codec`]), jailed child processes, one per restricted orb's launch
+//!   (started at its first query, stopped when the launch is over or after
+//!   [`CODEC_IDLE`] without queries), which turn a query into its question and build the
+//!   answer from the records the proxy decided on; the proxy itself only moves the
+//!   bytes, and parses only its upstreams' answers. A name the orb's policy does not list gets
 //!   NXDOMAIN and is never sent upstream. For a listed name, A queries go to the agent's
 //!   DNS servers (`ORBD_DNS`) over UDP, then TCP when truncated, from a fresh port with
 //!   a random id, to the next server on SERVFAIL or REFUSED; a response must match the
@@ -73,7 +78,10 @@ pub const TCP_QUERIES: usize = 32;
 pub const QUERY_BUDGET: Duration = Duration::from_secs(5);
 pub const MAX_OPEN_PER_ORB: usize = 1024;
 /// Largest query read from an orb.
-const MAX_QUERY: usize = 4096;
+const MAX_QUERY: usize = super::codec::MAX_QUERY;
+/// A restricted orb's codec stops after this long without queries (it starts again at
+/// the next).
+pub const CODEC_IDLE: Duration = Duration::from_secs(600);
 /// UDP size advertised to upstream servers.
 const EDNS_SIZE: u16 = 1232;
 // Addresses outlive every answer that named them.
@@ -345,10 +353,16 @@ fn scan(state_dir: &Path) -> Vec<(u32, OrbId, Applied)> {
 
 /// Installs orbd's table (see [`net::prepare_host`]) with the chains of the restricted
 /// orbs on this host, keeping the addresses their sets hold, and starts the DNS proxy
-/// (once; upstreams `dns_servers`). Run by each Linux VM runtime when it starts. Fails
-/// if another agent runs in this network namespace. A proxy that cannot start is
-/// logged, and restricted orbs are then refused (`enforced` is false).
-pub fn prepare(state_dir: &Path, egress: &Egress, dns_servers: &[String]) -> Result<(), String> {
+/// (once; upstreams `dns_servers`; its codec in `jail`'s codec jail). Run by each Linux
+/// VM runtime when it starts. Fails if another agent runs in this network namespace. A
+/// proxy that cannot start is logged, and restricted orbs are then refused (`enforced`
+/// is false).
+pub fn prepare(
+    state_dir: &Path,
+    egress: &Egress,
+    dns_servers: &[String],
+    jail: Option<&super::jail::Jailer>,
+) -> Result<(), String> {
     lock_netns()?;
     *AGENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(egress.clone());
     let found = scan(state_dir);
@@ -398,7 +412,7 @@ pub fn prepare(state_dir: &Path, egress: &Egress, dns_servers: &[String]) -> Res
             );
         }
     }
-    match PROXY.get_or_init(|| proxy::start(dns_servers)) {
+    match PROXY.get_or_init(|| codec_spawner(jail).and_then(|c| proxy::start(dns_servers, c))) {
         Ok(()) => {}
         Err(e) => tracing::error!(
             error = %e,
@@ -406,6 +420,58 @@ pub fn prepare(state_dir: &Path, egress: &Egress, dns_servers: &[String]) -> Res
         ),
     }
     Ok(())
+}
+
+/// Starts the DNS proxy's codecs: this binary, in `jail`'s codec jail (unjailed without
+/// one: `ORBD_VMM_JAIL=off`).
+#[cfg(target_os = "linux")]
+fn codec_spawner(jail: Option<&super::jail::Jailer>) -> Result<super::codec::Spawner, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("finding orbd's binary: {e}"))?;
+    let jail = match jail {
+        Some(j) => Some(j.codec_jail(&exe)?),
+        None => {
+            tracing::warn!(
+                "ORBD_VMM_JAIL=off: the DNS proxy's codecs run unjailed as this agent's user \
+                 (under their own seccomp filter only)"
+            );
+            None
+        }
+    };
+    let jailed = jail.is_some();
+    let spawner = super::codec::process_spawner(jail);
+    if !jailed {
+        // It runs /proc/self/exe.
+        return Ok(spawner);
+    }
+    // A jailed codec runs the binary at `exe`: only while it is still the agent's own.
+    Ok(std::sync::Arc::new(move || {
+        let exe = exe.clone();
+        let mut spawn = spawner();
+        Box::new(move || {
+            same_binary(&exe)?;
+            spawn()
+        })
+    }))
+}
+
+/// Fails unless `exe` is still the file this process runs.
+#[cfg(target_os = "linux")]
+fn same_binary(exe: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino()));
+    match (id(exe), id(Path::new("/proc/self/exe"))) {
+        (Ok(a), Ok(b)) if a == b => Ok(()),
+        _ => Err(format!(
+            "{} is no longer the binary this agent runs (replaced or removed): restart the \
+             agent",
+            exe.display()
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn codec_spawner(_jail: Option<&super::jail::Jailer>) -> Result<super::codec::Spawner, String> {
+    Err("the DNS proxy runs on Linux only".into())
 }
 
 async fn blocking(
@@ -740,7 +806,9 @@ fn settle(entry: &mut OrbEntry, r: &Reservation, ok: bool) {
 
 mod proxy {
     use super::*;
-    use crate::runtime::vm::dns::{self, Answer, AnswerData, QueryError};
+    use crate::runtime::vm::codec::{self, Codec, Decoded};
+    use crate::runtime::vm::dns::{self, Answer, AnswerData};
+    use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Semaphore, mpsc, oneshot};
 
@@ -761,6 +829,85 @@ mod proxy {
         pub inflight: Arc<Semaphore>,
         pub tcp: Arc<Semaphore>,
         pub source: Source,
+        pub codecs: Codecs,
+    }
+
+    /// A restricted orb launch's codec.
+    struct OrbCodec {
+        orb: OrbId,
+        launch: u64,
+        codec: Codec,
+        used: Instant,
+    }
+
+    /// The codecs of restricted orbs' launches, by network index: each started at its
+    /// launch's first query, stopped when the launch is over or idle.
+    pub(super) struct Codecs {
+        spawner: codec::Spawner,
+        by_orb: Mutex<HashMap<u32, OrbCodec>>,
+    }
+
+    impl Codecs {
+        pub(super) fn new(spawner: codec::Spawner) -> Self {
+            Self {
+                spawner,
+                by_orb: Mutex::new(HashMap::new()),
+            }
+        }
+
+        /// The codec of `slot`'s launch, started if it has none (None once the launch is
+        /// over).
+        fn get(&self, slot: &Slot) -> Option<Codec> {
+            let mut m = self.by_orb.lock().unwrap_or_else(|e| e.into_inner());
+            // A query of a launch that is over gets nothing, and stops nothing.
+            slot.entry(&mut orbs())?;
+            if let Some(e) = m.get_mut(&slot.index) {
+                if e.orb == slot.orb && e.launch == slot.launch {
+                    e.used = Instant::now();
+                    return Some(e.codec.clone());
+                }
+                e.codec.stop();
+                m.remove(&slot.index);
+            }
+            let codec = codec::run((self.spawner)(), &slot.orb.to_string());
+            m.insert(
+                slot.index,
+                OrbCodec {
+                    orb: slot.orb,
+                    launch: slot.launch,
+                    codec: codec.clone(),
+                    used: Instant::now(),
+                },
+            );
+            Some(codec)
+        }
+
+        /// Stops the codecs of launches that are over, and of those idle for
+        /// [`CODEC_IDLE`].
+        fn reap(&self) {
+            let now = Instant::now();
+            let mut m = self.by_orb.lock().unwrap_or_else(|e| e.into_inner());
+            let orbs = orbs();
+            m.retain(|index, e| {
+                let live = orbs
+                    .get(index)
+                    .is_some_and(|o| o.orb == e.orb && o.launch == e.launch);
+                let keep = live && now.saturating_duration_since(e.used) < CODEC_IDLE;
+                if !keep {
+                    e.codec.stop();
+                }
+                keep
+            });
+        }
+    }
+
+    impl Drop for Codecs {
+        fn drop(&mut self) {
+            let m = self.by_orb.lock().unwrap_or_else(|e| e.into_inner());
+            for e in m.values() {
+                e.codec.stop();
+            }
+        }
     }
 
     /// A query's restricted orb by its veth address.
@@ -770,8 +917,9 @@ mod proxy {
         orbs().contains_key(&index).then_some(index)
     }
 
-    /// Binds the proxy's sockets and serves them on a thread of its own.
-    pub(super) fn start(dns_servers: &[String]) -> Result<(), String> {
+    /// Binds the proxy's sockets and serves them on a thread of its own, its codecs
+    /// started by `spawner` (once there first: one that cannot start fails it).
+    pub(super) fn start(dns_servers: &[String], spawner: codec::Spawner) -> Result<(), String> {
         let upstreams: Vec<SocketAddr> = dns_servers
             .iter()
             .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
@@ -786,6 +934,7 @@ mod proxy {
         for r in [udp.set_nonblocking(true), tcp.set_nonblocking(true)] {
             r.map_err(|e| e.to_string())?;
         }
+        let (started, ready) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("orbd-dns".into())
             .spawn(move || {
@@ -795,32 +944,61 @@ mod proxy {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        tracing::error!(error = %e, "restricted egress: DNS proxy runtime");
+                        let _ = started.send(Err(format!("its runtime: {e}")));
                         return;
                     }
                 };
-                rt.block_on(serve(udp, tcp, upstreams));
+                rt.block_on(async move {
+                    let sockets = (
+                        tokio::net::UdpSocket::from_std(udp),
+                        tokio::net::TcpListener::from_std(tcp),
+                    );
+                    let (udp, tcp) = match sockets {
+                        (Ok(u), Ok(t)) => (Arc::new(u), t),
+                        (Err(e), _) | (_, Err(e)) => {
+                            let _ = started.send(Err(format!("its sockets: {e}")));
+                            return;
+                        }
+                    };
+                    // A codec as each orb's will run, checked (a few tries: a busy host).
+                    let mut tries = 1;
+                    loop {
+                        match codec::start((spawner)(), "startup check").await {
+                            Ok(c) => {
+                                c.stop();
+                                break;
+                            }
+                            Err(e) if tries < 5 => {
+                                tracing::warn!(error = %e, "restricted egress: the DNS codec's startup check failed; trying again");
+                                tries += 1;
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                            Err(e) => {
+                                let _ = started.send(Err(e));
+                                return;
+                            }
+                        }
+                    }
+                    if started.send(Ok(())).is_err() {
+                        return;
+                    }
+                    serve(udp, tcp, upstreams, spawner).await;
+                });
             })
             .map_err(|e| e.to_string())?;
+        ready
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| "its codec did not start within 30 s".to_owned())??;
         tracing::info!(listen = %at, upstreams = %dns_servers.join(","), "restricted egress: DNS proxy on");
         Ok(())
     }
 
     async fn serve(
-        udp: std::net::UdpSocket,
-        tcp: std::net::TcpListener,
+        udp: Arc<tokio::net::UdpSocket>,
+        tcp: tokio::net::TcpListener,
         upstreams: Vec<SocketAddr>,
+        spawner: codec::Spawner,
     ) {
-        let (udp, tcp) = match (
-            tokio::net::UdpSocket::from_std(udp),
-            tokio::net::TcpListener::from_std(tcp),
-        ) {
-            (Ok(u), Ok(t)) => (Arc::new(u), t),
-            (Err(e), _) | (_, Err(e)) => {
-                tracing::error!(error = %e, "restricted egress: DNS proxy sockets");
-                return;
-            }
-        };
         let (tx, rx) = mpsc::channel(1024);
         let p = Arc::new(Proxy {
             upstreams,
@@ -828,8 +1006,16 @@ mod proxy {
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT)),
             tcp: Arc::new(Semaphore::new(MAX_TCP)),
             source: Box::new(orb_source),
+            codecs: Codecs::new(spawner),
         });
         tokio::spawn(opener(rx));
+        let reaper = p.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                reaper.codecs.reap();
+            }
+        });
         tokio::spawn(serve_tcp(p.clone(), tcp));
         serve_udp(p, udp).await;
     }
@@ -890,15 +1076,24 @@ mod proxy {
             };
             let p = p.clone();
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(TCP_LIFETIME, connection(&p, index, stream)).await;
+                let launch = (slot.0.orb, slot.0.launch);
+                let _ =
+                    tokio::time::timeout(TCP_LIFETIME, connection(&p, index, launch, stream)).await;
                 drop(slot);
                 drop(conn);
             });
         }
     }
 
-    /// Answers the queries of one TCP connection (see the bounds in the module docs).
-    async fn connection(p: &Proxy, index: u32, mut stream: tokio::net::TcpStream) {
+    /// Answers the queries of one TCP connection (see the bounds in the module docs),
+    /// accepted from the orb launch `launch` on `index`: it ends once that launch is over,
+    /// so nothing an earlier orb sent reaches the index's next one.
+    async fn connection(
+        p: &Proxy,
+        index: u32,
+        launch: (OrbId, u64),
+        mut stream: tokio::net::TcpStream,
+    ) {
         for _ in 0..TCP_QUERIES {
             let mut len = [0u8; 2];
             if !matches!(
@@ -924,6 +1119,9 @@ mod proxy {
             let Some(slot) = Slot::take(index) else {
                 return;
             };
+            if (slot.0.orb, slot.0.launch) != launch {
+                return;
+            }
             let a = tokio::time::timeout(QUERY_BUDGET, answer(p, slot, &query, false)).await;
             drop(permit);
             let Ok(Some(a)) = a else { return };
@@ -943,7 +1141,7 @@ mod proxy {
     }
 
     /// The answer to `msg` from the orb of `slot` (`udp`: as large as its query allows,
-    /// else as TCP); None for no answer at all.
+    /// else as TCP); None for no answer at all. Only the codec reads `msg`.
     pub(super) async fn answer(
         p: &Proxy,
         (slot, policy): (Slot, Arc<EgressPolicy>),
@@ -951,59 +1149,63 @@ mod proxy {
         udp: bool,
     ) -> Option<Vec<u8>> {
         let orb = slot.orb;
-        let q = match dns::parse_query(msg) {
-            Ok(q) => q,
-            Err(QueryError::Ignore) => return None,
-            Err(QueryError::Malformed(h)) => {
+        let Some(codec) = p.codecs.get(&slot) else {
+            count("unavailable");
+            return None;
+        };
+        let q = match codec.decode(msg).await {
+            Some(Decoded::Question(q)) => q,
+            Some(Decoded::Ignore) => return None,
+            Some(Decoded::Reply(r)) => {
                 count("formerr");
-                return Some(dns::build_error(&h, dns::FORMERR));
+                return Some(r);
+            }
+            None => {
+                count("unavailable");
+                return None;
             }
         };
-        let limit = if udp { q.udp_limit() } else { 65535 };
-        let reply =
-            |rcode: u8, answers: &[Answer]| Some(dns::build_response(&q, rcode, answers, limit));
-        if q.header.opcode() != 0 {
+        let reply = |rcode: u8, answers: Vec<Answer>| {
+            let codec = codec.clone();
+            async move { codec.encode(msg, udp, rcode, &answers).await }
+        };
+        if q.opcode != 0 {
             count("notimp");
-            return reply(dns::NOTIMP, &[]);
+            return reply(dns::NOTIMP, vec![]).await;
         }
-        if q.question.qclass != dns::CLASS_IN {
+        if q.qclass != dns::CLASS_IN {
             count("refused");
-            return reply(dns::REFUSED, &[]);
+            return reply(dns::REFUSED, vec![]).await;
         }
-        let name = q.question.name.text();
-        let Some(name) = name.filter(|n| policy.allows_name(n)) else {
+        let Some(name) = q.name.clone().filter(|n| policy.allows_name(n)) else {
             count("refused");
-            let shown = q
-                .question
-                .name
-                .text()
-                .unwrap_or_else(|| "(not a hostname)".into());
+            let shown = q.name.as_deref().unwrap_or("(not a hostname)");
             if slot.entry(&mut orbs()).is_some_and(|e| e.may_log()) {
                 tracing::info!(target: "orbd::egress", %orb, name = %shown, "DNS query refused: not on the orb type's egress list");
             }
-            return reply(dns::NXDOMAIN, &[]);
+            return reply(dns::NXDOMAIN, vec![]).await;
         };
-        if q.question.qtype != dns::TYPE_A {
+        if q.qtype != dns::TYPE_A {
             count("nodata");
-            return reply(dns::NOERROR, &[]);
+            return reply(dns::NOERROR, vec![]).await;
         }
         let response = match resolve(&p.upstreams, &name).await {
             Ok(r) => r,
             Err(e) => {
                 count("servfail");
                 tracing::debug!(%orb, %name, error = %e, "restricted egress: upstream DNS");
-                return reply(dns::SERVFAIL, &[]);
+                return reply(dns::SERVFAIL, vec![]).await;
             }
         };
         match response.header.rcode() {
             dns::NOERROR => {}
             dns::NXDOMAIN => {
                 count("nxdomain");
-                return reply(dns::NXDOMAIN, &[]);
+                return reply(dns::NXDOMAIN, vec![]).await;
             }
             _ => {
                 count("servfail");
-                return reply(dns::SERVFAIL, &[]);
+                return reply(dns::SERVFAIL, vec![]).await;
             }
         }
         let (chain, addrs) = dns::answer_chain(&name, &response.answers);
@@ -1029,7 +1231,7 @@ mod proxy {
             Err(e) => {
                 count("servfail");
                 tracing::warn!(%orb, %name, error = %e, "restricted egress: opening resolved addresses");
-                return reply(dns::SERVFAIL, &[]);
+                return reply(dns::SERVFAIL, vec![]).await;
             }
         };
         let end = dns::chain_end(&name, &chain).to_owned();
@@ -1045,7 +1247,7 @@ mod proxy {
                 }),
         );
         count("allowed");
-        reply(dns::NOERROR, &answers)
+        reply(dns::NOERROR, answers).await
     }
 
     /// Rolls a reservation back unless it was settled: a query cancelled while it
@@ -1325,8 +1527,9 @@ mod proxy {
         type Opens = Arc<Mutex<Vec<(u32, Vec<(Ipv4Addr, u32)>)>>>;
 
         /// A proxy resolving with `upstreams` whose set updates are recorded and
-        /// succeed; queries come from 127.0.0.<n>, orb index 16000 + n.
-        fn proxy(upstreams: Vec<SocketAddr>) -> (Proxy, Opens) {
+        /// succeed; queries come from 127.0.0.<n>, orb index 16000 + n. Its codec runs on
+        /// a thread.
+        async fn proxy(upstreams: Vec<SocketAddr>) -> (Proxy, Opens) {
             let (tx, mut rx) = mpsc::channel::<Open>(16);
             let opened = Arc::new(Mutex::new(Vec::new()));
             let o = opened.clone();
@@ -1355,6 +1558,7 @@ mod proxy {
                     }
                     _ => None,
                 }),
+                codecs: Codecs::new(codec::thread_spawner()),
             };
             (p, opened)
         }
@@ -1412,7 +1616,7 @@ mod proxy {
                 None,
             )
             .await;
-            let (p, opened) = proxy(vec![at]);
+            let (p, opened) = proxy(vec![at]).await;
             let index = 16_001;
             restrict(index, r#"{"domains":["*.ampcode.com"]}"#);
             let ask = |msg: Vec<u8>, udp: bool| {
@@ -1503,13 +1707,12 @@ mod proxy {
             assert!(last.iter().all(|(_, t)| *t == MIN_OPEN + OPEN_GRACE));
 
             // A query of a launch that is over (the orb launched again, or another orb
-            // took the index) opens nothing for the new one.
+            // took the index) gets no answer and opens nothing for the new one.
             let slot = Slot::take(index).unwrap();
             restrict(index, r#"{"domains":["*.ampcode.com"]}"#);
             let before = opened.lock().unwrap().len();
             let q = build_query(11, "www.ampcode.com", TYPE_A, None);
-            let r = answer(&p, slot, &q, true).await.unwrap();
-            assert_eq!(rcode(&r), dns::SERVFAIL);
+            assert_eq!(answer(&p, slot, &q, true).await, None);
             assert_eq!(opened.lock().unwrap().len(), before);
             assert!(orbs()[&index].opened.is_empty(), "nothing reserved either");
 
@@ -1540,6 +1743,7 @@ mod proxy {
                 inflight: Arc::new(Semaphore::new(MAX_INFLIGHT)),
                 tcp: Arc::new(Semaphore::new(MAX_TCP)),
                 source: Box::new(|_| None),
+                codecs: Codecs::new(codec::thread_spawner()),
             };
             let index = 16_004;
             restrict(index, r#"{"domains":["a.example"]}"#);
@@ -1566,7 +1770,7 @@ mod proxy {
         #[cfg(target_os = "linux")]
         #[tokio::test]
         async fn tcp_connections_are_shared_between_orbs() {
-            let (p, _) = proxy(vec![]);
+            let (p, _) = proxy(vec![]).await;
             let (a, b) = (16_002, 16_003);
             restrict(a, r#"{"domains":["a.example"]}"#);
             restrict(b, r#"{"domains":["b.example"]}"#);
@@ -1617,6 +1821,62 @@ mod proxy {
             for i in [a, b] {
                 orbs().remove(&i);
             }
+        }
+
+        /// A query of a launch that is over gets no codec and stops none: the index's
+        /// current launch keeps its codec.
+        #[tokio::test]
+        async fn a_stale_query_leaves_the_current_codec() {
+            let (p, _) = proxy(vec![]).await;
+            let index = 16_005;
+            restrict(index, r#"{"domains":["a.example"]}"#);
+            let (old, _) = Slot::take(index).unwrap();
+            restrict(index, r#"{"domains":["a.example"]}"#);
+            let (current, _) = Slot::take(index).unwrap();
+            let q = build_query(1, "a.example", TYPE_A, None);
+            let codec = p.codecs.get(&current).unwrap();
+            assert!(matches!(codec.decode(&q).await, Some(Decoded::Question(_))));
+            assert!(p.codecs.get(&old).is_none());
+            assert!(matches!(codec.decode(&q).await, Some(Decoded::Question(_))));
+            drop((old, current));
+            orbs().remove(&index);
+        }
+
+        /// A TCP connection serves the orb launch it was accepted from only: once the
+        /// index has another launch, its next query ends it unanswered.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_tcp_connection_ends_with_its_launch() {
+            let (p, _) = proxy(vec![]).await;
+            let index = 16_006;
+            restrict(index, r#"{"domains":["a.example"]}"#);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            tokio::spawn(serve_tcp(Arc::new(p), listener));
+            let s = tokio::net::TcpSocket::new_v4().unwrap();
+            s.bind(SocketAddr::from(([127, 0, 0, 6], 0))).unwrap();
+            let mut s = s.connect(at).await.unwrap();
+            let ask = |id: u16| {
+                let q = build_query(id, "a.example", TYPE_A, None);
+                let mut out = (q.len() as u16).to_be_bytes().to_vec();
+                out.extend_from_slice(&q);
+                out
+            };
+            s.write_all(&ask(1)).await.unwrap();
+            let mut len = [0u8; 2];
+            tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut len))
+                .await
+                .expect("answered")
+                .unwrap();
+            let mut m = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            s.read_exact(&mut m).await.unwrap();
+            // Another orb (or launch) takes the index.
+            restrict(index, r#"{"domains":["a.example"]}"#);
+            s.write_all(&ask(2)).await.unwrap();
+            let mut b = [0u8; 1];
+            let r = tokio::time::timeout(Duration::from_secs(5), s.read(&mut b)).await;
+            assert!(matches!(r, Ok(Ok(0)) | Ok(Err(_))), "{r:?}");
+            orbs().remove(&index);
         }
 
         /// Upstream answers that are not for the query (another id or question, or

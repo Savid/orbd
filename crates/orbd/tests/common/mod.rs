@@ -339,6 +339,11 @@ offerings:
         );
     }
 
+    /// The pid of agent `id`, if it runs.
+    pub fn agent_pid(&self, id: &str) -> Option<u32> {
+        self.agents.get(id)?.as_ref().map(Child::id)
+    }
+
     /// Hard-kills (SIGKILL) a process, like a power cut.
     pub fn kill_agent(&mut self, id: &str) {
         if let Some(mut c) = self.agents.get_mut(id).unwrap().take() {

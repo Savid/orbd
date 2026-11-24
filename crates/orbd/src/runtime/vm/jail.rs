@@ -38,8 +38,13 @@ use std::sync::Mutex;
 
 pub use orbd_vm::jail::JailIdentity as Ids;
 
-/// Orbs get indexes 1..=MAX_INDEX above the base; index 0 is the startup self-test's.
+/// Orbs get indexes 1..=MAX_INDEX above the base; index 0 is the startup self-test's,
+/// [`CODEC_INDEX`] the DNS proxy's codec's.
 const MAX_INDEX: u32 = 1 << 24;
+/// The index of the restricted-egress DNS proxy's codec ([`super::codec`]).
+const CODEC_INDEX: u32 = MAX_INDEX + 1;
+/// How many ids above the base jails use.
+pub const JAIL_IDS: u32 = CODEC_INDEX;
 /// Bases below this would collide with system and login users.
 const MIN_BASE: u32 = 65_536;
 
@@ -85,13 +90,9 @@ fn settings_for(
                 .into(),
         );
     }
-    if uid_base < MIN_BASE
-        || uid_base
-            .checked_add(MAX_INDEX)
-            .is_none_or(|t| t == u32::MAX)
-    {
+    if uid_base < MIN_BASE || uid_base.checked_add(JAIL_IDS).is_none_or(|t| t == u32::MAX) {
         return Err(format!(
-            "ORBD_VMM_JAIL_UID_BASE={uid_base}: must be at least {MIN_BASE} and leave {MAX_INDEX} \
+            "ORBD_VMM_JAIL_UID_BASE={uid_base}: must be at least {MIN_BASE} and leave {JAIL_IDS} \
              ids below 4294967295"
         ));
     }
@@ -190,6 +191,33 @@ impl Jailer {
             binds,
             symlinks,
             // A tool needs no network: an exploited one must not reach the agent's.
+            new_netns: true,
+        })
+    }
+
+    /// The jail of the restricted-egress DNS proxy's codecs: a tool's, as their own uid
+    /// above every orb's, with orbd's system and its binary `exe` at
+    /// [`super::codec::JAILED_EXE`].
+    pub fn codec_jail(&self, exe: &Path) -> Result<Jail, String> {
+        let id = self.base + CODEC_INDEX;
+        let (mut binds, symlinks) = self.system(exe)?;
+        binds.push(Bind {
+            src: exe.to_owned(),
+            dst: super::codec::JAILED_EXE.into(),
+            access: Access::Exec,
+        });
+        binds.extend(
+            ["/dev/null", "/dev/urandom"]
+                .into_iter()
+                .map(|d| Bind::at(d, Access::Device)),
+        );
+        Ok(Jail {
+            uid: id,
+            gid: id,
+            groups: Vec::new(),
+            staging: self.staging.clone(),
+            binds,
+            symlinks,
             new_netns: true,
         })
     }
@@ -552,9 +580,10 @@ mod tests {
         // Bases that collide with ordinary users or overflow.
         assert!(settings_for(On, 1000, true, true).is_err());
         assert!(settings_for(On, u32::MAX - 10, true, true).is_err());
-        assert!(settings_for(On, u32::MAX - MAX_INDEX - 1, true, true).is_ok());
+        assert!(settings_for(On, u32::MAX - JAIL_IDS, true, true).is_err());
+        assert!(settings_for(On, u32::MAX - JAIL_IDS - 1, true, true).is_ok());
         // Never in the image builds' range above 1.4e9 with the default base.
-        assert!(base + MAX_INDEX < 1_400_000_000);
+        assert!(base + JAIL_IDS < 1_400_000_000);
     }
 
     #[test]

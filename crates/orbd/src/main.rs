@@ -115,6 +115,10 @@ enum Command {
         #[arg(long)]
         gid: u32,
     },
+    /// Reads and writes DNS messages for the agent's restricted-egress DNS proxy, jailed,
+    /// on stdin (internal).
+    #[command(hide = true)]
+    DnsCodec,
 }
 
 #[derive(Subcommand)]
@@ -386,6 +390,14 @@ fn main() -> anyhow::Result<()> {
     if let Command::FenceProbe { addr, gid } = cli.command {
         std::process::exit(orbd::runtime::qemu::fence::probe_main(addr, gid));
     }
+    if let Command::DnsCodec = cli.command {
+        std::process::exit(orbd::runtime::vm::codec::child_main());
+    }
+    // Before any thread starts: every process the agent starts inherits the filter.
+    let seccomp = match &cli.command {
+        Command::Agent { manage: None, .. } => Some(orbd::seccomp::harden_agent()),
+        _ => None,
+    };
     orbd::configure_failpoints();
     let rt = tokio::runtime::Runtime::new()?;
     use orbd::backend::fleet::admin;
@@ -395,7 +407,7 @@ fn main() -> anyhow::Result<()> {
             let code = rt.block_on(orbd::amp::dispatch::run_from_env());
             std::process::exit(code);
         }
-        Command::FenceProbe { .. } => unreachable!("handled above"),
+        Command::FenceProbe { .. } | Command::DnsCodec => unreachable!("handled above"),
         Command::Doctor { config, kernel } => {
             let ok = orbd::doctor::run(&orbd::doctor::DoctorOptions { config, kernel })?;
             std::process::exit(if ok { 0 } else { 1 });
@@ -502,6 +514,11 @@ fn main() -> anyhow::Result<()> {
         } => {
             let a = *a;
             orbd::telemetry::init_logging(cli.log_json);
+            match seccomp {
+                Some(Ok(h)) => orbd::seccomp::log(&h),
+                Some(Err(e)) => anyhow::bail!(e),
+                None => {}
+            }
             let mut config = match &a.config {
                 Some(p) => orbd::config::agent::AgentConfig::load(p)?,
                 None => Default::default(),
@@ -556,8 +573,8 @@ fn main() -> anyhow::Result<()> {
                 s.image_sandbox,
                 s.vmm_jail == orbd::config::agent::JailMode::Off,
             ) {
-                let jail =
-                    u64::from(s.vmm_jail_uid_base)..=u64::from(s.vmm_jail_uid_base) + (1 << 24);
+                let base = u64::from(s.vmm_jail_uid_base);
+                let jail = base..=base + u64::from(orbd::runtime::vm::jail::JAIL_IDS);
                 let sandbox = u64::from(sb)
                     ..u64::from(sb) + u64::from(orbd::config::agent::IMAGE_SANDBOX_IDS);
                 if jail.start() < &sandbox.end && &sandbox.start <= jail.end() {

@@ -392,8 +392,13 @@ impl QemuRuntime {
             None => None,
         };
         if cfg!(target_os = "linux") {
-            super::vm::egress::prepare(state_dir, &config.egress, &config.dns_servers)
-                .map_err(|e| other("network", &e))?;
+            super::vm::egress::prepare(
+                state_dir,
+                &config.egress,
+                &config.dns_servers,
+                jail.as_ref(),
+            )
+            .map_err(|e| other("network", &e))?;
         }
         let cpu = CpuIdentity::host();
         // Nested virtualization is on unless the loaded KVM module says it is off.

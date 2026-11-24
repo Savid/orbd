@@ -4,6 +4,7 @@
 //! interprets its VMM.
 
 pub mod checkpoints;
+pub mod codec;
 pub mod disktools;
 pub mod dns;
 pub mod egress;

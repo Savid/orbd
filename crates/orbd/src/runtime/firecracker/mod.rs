@@ -282,8 +282,6 @@ impl FirecrackerRuntime {
             path,
             version,
         };
-        super::vm::egress::prepare(state_dir, &config.egress, &config.dns_servers)
-            .map_err(|e| other("network", &e))?;
         let jail = match config.jail {
             Some(s) => {
                 let j = Jailer::new(s, state_dir, run_dir).map_err(|e| other("jail", &e))?;
@@ -303,6 +301,13 @@ impl FirecrackerRuntime {
             }
             None => None,
         };
+        super::vm::egress::prepare(
+            state_dir,
+            &config.egress,
+            &config.dns_servers,
+            jail.as_ref(),
+        )
+        .map_err(|e| other("network", &e))?;
         let cpu = CpuIdentity::host();
         tracing::info!(firecracker = %firecracker.version, cpu = %cpu.model, jailed = jail.is_some(), "firecracker runtime ready");
         Ok(Self {

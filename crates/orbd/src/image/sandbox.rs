@@ -188,6 +188,8 @@ mod linux {
         stderr: RawFd,
         /// Descriptors the child uses; closed in the parent once the child has its copy.
         _child_fds: Vec<OwnedFd>,
+        /// [`orbd_vm::seccomp::no_namespaces`], as the kernel takes it.
+        filter: Vec<libc::sock_filter>,
     }
 
     // SAFETY: the raw pointers point into `_argv` and `ENV`, owned or static.
@@ -217,6 +219,7 @@ mod linux {
         ClearAmbient,
         Capset,
         NoNewPrivs,
+        Seccomp,
         Signals,
         Stdio,
         CloseFds,
@@ -224,7 +227,7 @@ mod linux {
     }
 
     impl Step {
-        const ALL: [Step; 24] = [
+        const ALL: [Step; 25] = [
             Step::Sync,
             Step::OpenSource,
             Step::Setresgid,
@@ -245,6 +248,7 @@ mod linux {
             Step::ClearAmbient,
             Step::Capset,
             Step::NoNewPrivs,
+            Step::Seccomp,
             Step::Signals,
             Step::Stdio,
             Step::CloseFds,
@@ -278,6 +282,7 @@ mod linux {
                 Step::ClearAmbient => "clearing ambient capabilities".into(),
                 Step::Capset => "setting capabilities".into(),
                 Step::NoNewPrivs => "setting no_new_privs".into(),
+                Step::Seccomp => "refusing new namespaces (seccomp)".into(),
                 Step::Signals => "resetting signals".into(),
                 Step::Stdio => "setting up stdio".into(),
                 Step::CloseFds => "closing inherited descriptors".into(),
@@ -545,6 +550,7 @@ mod linux {
             stdout: stdout_w.as_raw_fd(),
             stderr: stderr_w.as_raw_fd(),
             _child_fds: vec![sync_r, report_w, stdin, stdout_w, stderr_w],
+            filter: orbd_vm::seccomp::sock_filters(&orbd_vm::seccomp::no_namespaces()),
         };
         Ok((
             plan,
@@ -1055,6 +1061,21 @@ mod linux {
                 libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0).into(),
                 Step::NoNewPrivs,
             )?;
+            // The tool creates no namespaces of its own (nested user namespaces would
+            // give it every capability over them).
+            let fprog = libc::sock_fprog {
+                len: p.filter.len() as libc::c_ushort,
+                filter: p.filter.as_ptr() as *mut libc::sock_filter,
+            };
+            ok(
+                libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER as libc::c_ulong,
+                    0,
+                    &fprog as *const libc::sock_fprog,
+                ),
+                Step::Seccomp,
+            )?;
 
             // As std's Command does: default SIGPIPE (Rust ignores it), nothing blocked.
             let mut empty: libc::sigset_t = std::mem::zeroed();
@@ -1102,8 +1123,8 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
 
     /// The sandbox's view and privileges: ns root mapped to the base, only the binds,
-    /// read-only root, no network, no new privileges, a reduced bounding set; writes in a
-    /// writable bind land owned by the base on the host. Needs root and util-linux
+    /// read-only root, no network, no new privileges, a reduced bounding set, no
+    /// namespaces of its own; writes in a writable bind land owned by the base on the host. Needs root and util-linux
     /// (`setpriv`) and iproute2 (`ip`), e.g. in orbd's container image.
     #[tokio::test]
     #[ignore = "needs root (CAP_SYS_ADMIN, CAP_SETUID, CAP_SETGID)"]
@@ -1171,6 +1192,16 @@ mod tests {
         assert_eq!(
             (made.uid(), made.gid()),
             (sandbox.host_id(1000), sandbox.host_id(1001))
+        );
+
+        // No namespaces of its own: a nested user namespace would bring every capability
+        // back, over it.
+        let out = sh("unshare -U true 2>&1 && echo nested || echo refused".into())
+            .await
+            .unwrap();
+        assert!(
+            out.trim_end().ends_with("refused") && out.contains("Operation not permitted"),
+            "{out}"
         );
 
         // A failing tool reports its stderr; a missing one, that it is missing.

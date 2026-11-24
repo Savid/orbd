@@ -247,6 +247,107 @@ fn assert_jailed(c: &Cluster, orb: &Path, pid: i32) -> u32 {
     n
 }
 
+/// The processes whose parent is `pid`.
+#[cfg(target_os = "linux")]
+fn children(pid: i32) -> Vec<i32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|p| {
+            // `pid (comm) state ppid ...`: comm may hold anything but the last `)`.
+            std::fs::read_to_string(format!("/proc/{p}/stat")).is_ok_and(|s| {
+                s.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<i32>().ok())
+                    == Some(pid)
+            })
+        })
+        .collect()
+}
+
+/// The DNS proxy's codecs the agent `agent` runs.
+#[cfg(target_os = "linux")]
+fn codecs(agent: i32) -> Vec<i32> {
+    children(agent)
+        .into_iter()
+        .filter(|p| {
+            std::fs::read(format!("/proc/{p}/cmdline"))
+                .is_ok_and(|c| c.split(|b| *b == 0).any(|a| a == b"dns-codec"))
+        })
+        .collect()
+}
+
+/// The agent `agent` runs under its own seccomp filter (one more than this test's,
+/// which started it), and its DNS proxy's codecs (one per restricted orb that asked
+/// something; at least one) jailed: the uid above every orb's, no capabilities,
+/// `no_new_privs`, two more filters than the agent (the jail's, their own), and their
+/// own network namespace and root holding only their binary. Returns their pids.
+#[cfg(target_os = "linux")]
+fn assert_hardened(c: &Cluster, agent: i32) -> Vec<i32> {
+    let filters = |pid: i32| -> u32 { status(pid, "Seccomp_filters:")[0].parse().unwrap() };
+    let me = filters(std::process::id() as i32);
+    assert_eq!(filters(agent), me + 1, "the agent's own seccomp filter");
+    let found = codecs(agent);
+    assert!(!found.is_empty(), "the agent runs no DNS codec");
+    for codec in &found {
+        assert_codec_jailed(c, agent, *codec);
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+fn assert_codec_jailed(c: &Cluster, agent: i32, codec: i32) {
+    let filters = |pid: i32| -> u32 { status(pid, "Seccomp_filters:")[0].parse().unwrap() };
+    let uid = status(codec, "Uid:");
+    let codec_uid = (JAIL_UID_BASE + (1 << 24) + 1).to_string();
+    assert_eq!(uid, [codec_uid.as_str(); 4], "the codec's uid");
+    assert_eq!(
+        status(codec, "Gid:"),
+        [codec_uid.as_str(); 4],
+        "the codec's gid"
+    );
+    assert_eq!(status(codec, "Groups:"), Vec::<String>::new());
+    for cap in ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"] {
+        assert_eq!(
+            status(codec, cap),
+            ["0000000000000000"],
+            "{cap} of the codec"
+        );
+    }
+    assert_eq!(status(codec, "NoNewPrivs:"), ["1"]);
+    assert_eq!(status(codec, "Seccomp:"), ["2"]);
+    assert_eq!(
+        filters(codec),
+        filters(agent) + 2,
+        "the jail's filter and the codec's own"
+    );
+    let ns = |pid: i32| std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap();
+    assert_ne!(
+        ns(codec),
+        ns(agent),
+        "the codec has a network namespace of its own"
+    );
+    let root = PathBuf::from(format!("/proc/{codec}/root"));
+    let st = state(c);
+    for hidden in [
+        st.clone(),
+        st.join("identity"),
+        "/proc/self".into(),
+        "/sys/kernel".into(),
+        "/etc/passwd".into(),
+        "/var/run/docker.sock".into(),
+        "/run/netns".into(),
+    ] {
+        let p: &Path = &hidden;
+        assert!(
+            !root.join(p.strip_prefix("/").unwrap()).exists(),
+            "the codec can see {}",
+            p.display()
+        );
+    }
+    assert!(root.join("orbd").exists(), "the codec's binary");
+}
+
 /// The orb's VMM runs in the orb's own network namespace on a TAP it owns, and a
 /// private destination this agent reaches (the container's gateway) is unreachable from
 /// there: orbd's egress filter.
@@ -1797,6 +1898,61 @@ fn probes(orb: &Path, from: usize, targets: &[&str]) -> std::collections::HashMa
     }
 }
 
+/// Jails create no namespaces: in an orb's disk-tool jail and in a VMM's (as the agent
+/// builds them, as root with the agent's capabilities), `unshare --user` is refused, so
+/// an exploited tool or an escaped VMM gets no user namespace whose capabilities reach
+/// more of the kernel. (No VM needed; run with the gates, where the agent runs.)
+#[test]
+#[ignore = "needs root; see the module docs"]
+fn jails_create_no_namespaces() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("NOTICE: jails are Linux-only: skipped");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use orbd::runtime::vm::jail::{Ids, Jailer};
+        use orbd_vm::jail::{Access, Bind};
+        let dir = tempfile::tempdir().unwrap();
+        let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        let jailer = Jailer::new(
+            orbd::config::agent::VmmJail {
+                uid_base: JAIL_UID_BASE + 500_000,
+            },
+            &state,
+            &run,
+        )
+        .unwrap();
+        let ids = Ids {
+            uid: JAIL_UID_BASE + 500_001,
+            gid: JAIL_UID_BASE + 500_001,
+        };
+        let unshare = Path::new("/usr/bin/unshare");
+        let tool = jailer.tool_jail(ids, unshare, Vec::new()).unwrap();
+        let (mut binds, links) = jailer.system(unshare).unwrap();
+        binds.push(Bind::at(unshare, Access::Exec));
+        binds.push(Bind::at("/dev/null", Access::Device));
+        let vmm = jailer.jail(ids, binds, links, &[]);
+        for (what, jail) in [("disk tool", &tool), ("VMM", &vmm)] {
+            for args in [["--user", "/usr/bin/true"], ["--user", "--map-root-user"]] {
+                let out = orbd_vm::jail::run(jail, unshare, &args).unwrap();
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    !out.status.success() && err.contains("Operation not permitted"),
+                    "a {what} jail let `unshare {}` through: {} {err}",
+                    args.join(" "),
+                    out.status
+                );
+            }
+            // The jail itself works: a program without namespaces runs.
+            let out = orbd_vm::jail::run(jail, unshare, &["--help"]).unwrap();
+            assert!(out.status.success(), "{what}: {out:?}");
+        }
+    }
+}
+
 /// Restricted egress (an orb type's `egress`): the orb's DNS is the agent's proxy, which
 /// resolves only allowlisted names (a CNAME chain as returned for one too, and answers
 /// too big for UDP over TCP) and never asks upstream about the rest; the orb reaches
@@ -1883,6 +2039,11 @@ fn restricted_egress_reaches_only_its_allowlist() {
             c.agent_env.push((k.into(), v.into()));
         }
         c.start_all();
+        let logs = std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap();
+        assert!(
+            logs.contains("seccomp: the agent and every process it starts are refused"),
+            "the agent installed its filter"
+        );
         let mut targets = vec![
             "allowed.orbd.test:443",
             "www.cdn.orbd.test:443",
@@ -1921,6 +2082,9 @@ fn restricted_egress_reaches_only_its_allowlist() {
         );
         let orb = orb_dir(&c);
         let got = probes(&orb, 0, &targets);
+        // The orb asked: its codec runs, jailed.
+        let agent = c.agent_pid("agent-a").unwrap() as i32;
+        assert_hardened(&c, agent);
         let want = |t: &str| -> &str {
             match t {
                 "allowed.orbd.test:443" | "www.cdn.orbd.test:443" | "9.9.9.9:443" => "open",
@@ -2066,8 +2230,19 @@ fn restricted_egress_reaches_only_its_allowlist() {
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
         assert!(table().contains(": goto egress"), "{}", table());
+        let old = assert_hardened(&c, agent);
         c.kill_agent("agent-a");
         assert!(table().contains(": goto egress"), "{}", table());
+        // The killed agent's codecs exit with it (their sockets close).
+        wait_until(Duration::from_secs(10), "the old codecs exit", || {
+            old.iter().all(|codec| {
+                !Path::new(&format!("/proc/{codec}")).exists()
+                    || std::fs::read_to_string(format!("/proc/{codec}/stat")).is_ok_and(|s| {
+                        s.rsplit_once(')')
+                            .is_some_and(|(_, r)| r.trim_start().starts_with('Z'))
+                    })
+            })
+        });
         start_again(&mut c, "");
         let t = table();
         assert_eq!(t.matches(": goto egress").count(), 2, "{t}");
@@ -2081,6 +2256,7 @@ fn restricted_egress_reaches_only_its_allowlist() {
         let got = probes(&orb, from, &["1.1.1.1:443", "allowed.orbd.test:443"]);
         assert_eq!(got["1.1.1.1:443"], "dropped");
         assert_eq!(got["allowed.orbd.test:443"], "open");
+        assert_hardened(&c, c.agent_pid("agent-a").unwrap() as i32);
 
         // The operator edits the list: the sleeping orb keeps its policy until its next
         // launch (here a memory restore), which applies the new one.

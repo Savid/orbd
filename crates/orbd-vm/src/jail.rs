@@ -4,6 +4,9 @@
 //! path is mounted at its original path (or a chosen one, [`Bind::dst`]), so paths in
 //! its arguments and in the snapshots it saved stay valid. Mounts are `nosuid`, data is
 //! `noexec`, and only device nodes lack `nodev`; there is no `/proc`, `/sys` or `/etc`.
+//! It can create no namespaces ([`crate::seccomp::no_namespaces`], installed last,
+//! under whatever filter the program installs itself): no user namespace of its own
+//! brings capabilities back.
 //!
 //! The launcher enters the jail between fork and exec ([`crate::process::Spawn::jail`]),
 //! after it moved the child into its cgroup and network namespace: every path and buffer
@@ -191,6 +194,8 @@ mod linux {
         pivot: bool,
         /// Unshare a network namespace too ([`Jail::new_netns`]).
         new_netns: bool,
+        /// [`crate::seccomp::no_namespaces`], as the kernel takes it.
+        filter: Vec<libc::sock_filter>,
     }
 
     fn cstring(p: &Path) -> std::io::Result<CString> {
@@ -319,6 +324,7 @@ mod linux {
                 max_fd,
                 pivot,
                 new_netns: self.new_netns,
+                filter: crate::seccomp::sock_filters(&crate::seccomp::no_namespaces()),
             })
         }
     }
@@ -602,6 +608,21 @@ mod linux {
                     "no_new_privs",
                     None,
                 )?;
+                // No namespaces from here on (the jail's own are made).
+                let fprog = libc::sock_fprog {
+                    len: self.filter.len() as libc::c_ushort,
+                    filter: self.filter.as_ptr() as *mut libc::sock_filter,
+                };
+                check(
+                    libc::syscall(
+                        libc::SYS_seccomp,
+                        libc::SECCOMP_SET_MODE_FILTER as libc::c_ulong,
+                        0,
+                        &fprog as *const libc::sock_fprog,
+                    ) as c_int,
+                    "seccomp",
+                    None,
+                )?;
                 if libc::getuid() == 0
                     || libc::geteuid() == 0
                     || libc::getgid() == 0
@@ -703,6 +724,79 @@ mod linux_tests {
         for pivot in [true, false] {
             jailed_program_sees_only_its_binds(pivot);
         }
+    }
+
+    /// Run in a jail by [`a_jailed_program_creates_no_namespaces`] (ignored otherwise):
+    /// no user namespace, no `setns` (EPERM, where unfiltered `setns(-1)` is EBADF),
+    /// `clone3` ENOSYS, and threads still start (libc falls back to `clone`).
+    #[test]
+    #[ignore = "run in a jail by a_jailed_program_creates_no_namespaces"]
+    fn ns_probe() {
+        use nix::libc;
+        // SAFETY: raw syscalls with harmless or invalid arguments.
+        unsafe {
+            let errno = || *libc::__errno_location();
+            let unshare = (libc::unshare(libc::CLONE_NEWUSER), errno());
+            assert_eq!(unshare, (-1, libc::EPERM), "unshare(CLONE_NEWUSER)");
+            let setns = (libc::setns(-1, 0), errno());
+            assert_eq!(setns, (-1, libc::EPERM), "setns");
+            let clone3 = (libc::syscall(libc::SYS_clone3, 0usize, 0usize), errno());
+            assert_eq!(clone3, (-1, libc::ENOSYS), "clone3");
+        }
+        std::thread::spawn(|| ()).join().unwrap();
+        println!("ns-probe ok");
+    }
+
+    /// As root (skipped otherwise unless `ORBD_TEST_JAIL=1` requires it): a program in a
+    /// jail cannot create namespaces (this test binary, run there as [`ns_probe`]).
+    #[test]
+    fn a_jailed_program_creates_no_namespaces() {
+        if !nix::unistd::geteuid().is_root() {
+            assert!(
+                std::env::var("ORBD_TEST_JAIL").is_err(),
+                "ORBD_TEST_JAIL is set but the test does not run as root"
+            );
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let mut j = jail(
+            &staging,
+            vec![
+                Bind::at("/usr", Access::Exec),
+                Bind::at(&exe, Access::Exec),
+                Bind::at("/dev/null", Access::Device),
+            ],
+        );
+        for l in ["lib", "lib64", "bin"] {
+            let p = Path::new("/").join(l);
+            match std::fs::read_link(&p) {
+                Ok(t) => j.symlinks.push((p, t)),
+                Err(_) if p.is_dir() => j.binds.push(Bind::at(p, Access::Exec)),
+                Err(_) => {}
+            }
+        }
+        let out = command(&j, &exe)
+            .unwrap()
+            .args([
+                "--ignored",
+                "--exact",
+                "jail::linux_tests::ns_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("ns-probe ok"),
+            "{}\n{stdout}\n{stderr}",
+            out.status
+        );
     }
 
     fn jailed_program_sees_only_its_binds(pivot: bool) {

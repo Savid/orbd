@@ -16,7 +16,11 @@
 //!   thread of its own, naming orbs from the network index and this agent's records.
 //! * On a Linux VM agent, the DNS proxy of orbs with restricted egress
 //!   ([`crate::runtime::vm::egress`]) also runs on a thread of its own, started with
-//!   the first VM runtime.
+//!   the first VM runtime; what orbs send it is read by codecs, jailed child processes,
+//!   one per restricted orb's launch ([`crate::runtime::vm::codec`]).
+//! * Before any of this, `orbd agent` seccomp-filters itself ([`crate::seccomp`]): it
+//!   and every process it starts are refused the system calls that act on the whole
+//!   kernel.
 //!
 //! Crash points (feature `failpoints`, `FAILPOINTS="<name>=return"` aborts):
 //! `agent::accepted_committed` (receipt durable, Accepted not yet sent),

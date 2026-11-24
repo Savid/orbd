@@ -130,7 +130,7 @@ jobs:
         run: |
           exes() { jq -r 'select(.profile.test == true) | "\(.target.name) \(.executable)"'; }
           {
-            cargo test --locked -p orbd --features failpoints --test kvm \
+            cargo test --locked -p orbd --features failpoints --test kvm --test dns_codec \
               --target x86_64-unknown-linux-musl --no-run --message-format=json | exes
             cargo test --locked -p orbd-vm -p orbd-qemu -p orbd --lib \
               --target x86_64-unknown-linux-musl --no-run --message-format=json | exes
@@ -293,7 +293,7 @@ jobs:
             "$PWD/$(awk '$1 == "kvm" { print $2 }' gates.txt)" $GATES
       - if: matrix.suite == 'qemu' && matrix.part == 'rest'
         name: Root-only unit tests in the image
-        # The VMM jail, the disk tools and image sandbox as deployed: root in the image with
+        # The VMM and DNS codec jails, the disk tools and image sandbox as deployed: root in the image with
         # the README's agent flags. ORBD_TEST_JAIL=1 turns a skipped test into a failure.
         # Docker's default seccomp refuses pivot_root, so the jail takes its fallback
         # there; seccomp=unconfined runs its pivot_root path too.
@@ -308,6 +308,7 @@ jobs:
                 set -e
                 $(exe orbd_vm) --test-threads=1 jail:: process::
                 $(exe orbd_qemu) --test-threads=1 qmp::
+                $(exe dns_codec) --test-threads=1
                 $(exe orbd) --test-threads=1 --include-ignored image::sandbox image::rootfs \
                   snapshots_read_only vmm_sockets_must uids_are ownership_fixups \
                   install_prefixes log_tails external_data"

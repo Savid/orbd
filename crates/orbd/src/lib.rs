@@ -20,6 +20,7 @@ pub mod image;
 pub mod model;
 pub mod pki;
 pub mod runtime;
+pub mod seccomp;
 pub mod secrets;
 pub mod telemetry;
 
