@@ -904,14 +904,20 @@ impl Core {
                     .as_deref()
                     .map(ProjectSnapshotKey::from_external);
                 // The offering's own hosts first, then its spill_to offerings in order.
-                let mut placed = self.place_new(offering, snap_key.as_ref()).await?;
+                let mut held = false;
+                let mut placed = self
+                    .place_new(offering, snap_key.as_ref(), &mut held)
+                    .await?;
                 if let Err(first) = &placed {
                     let mut tried = Vec::new();
                     for id in &offering.spill_to {
                         let Some(target) = self.offerings.get(id).cloned() else {
                             continue;
                         };
-                        match self.place_new(&target, snap_key.as_ref()).await? {
+                        match self
+                            .place_new(&target, snap_key.as_ref(), &mut held)
+                            .await?
+                        {
                             Ok(p) => {
                                 tracing::info!(
                                     offering = %offering.id,
@@ -937,6 +943,9 @@ impl Core {
                     Ok(p) => p,
                     Err(r) => return Ok(Err(r)),
                 };
+                let snapshot_placement = snap_key
+                    .as_ref()
+                    .map(|k| (k, SnapshotPlacement::of(chosen.has_project_snapshot, held)));
                 let initial_disk = match &snap_key {
                     Some(k) if chosen.has_project_snapshot => InitialDiskSource::ProjectSnapshot {
                         snapshot: ProjectSnapshotRef { key: k.clone() },
@@ -986,6 +995,9 @@ impl Core {
                         )));
                     }
                 }
+                if let Some((key, placement)) = snapshot_placement {
+                    placement.report(&head.amp_orb_id, key, &chosen.capacity_pool);
+                }
                 Ok(Ok(plan))
             }
         }
@@ -993,10 +1005,12 @@ impl Core {
 
     /// Places a new orb of `offering` on one of its backend's hosts: the chosen
     /// candidate, what the orb reserves there, and the spec template it runs with.
+    /// `held` becomes true if any of the backend's hosts holds `snap_key`.
     async fn place_new(
         &self,
         offering: &Offering,
         snap_key: Option<&ProjectSnapshotKey>,
+        held: &mut bool,
     ) -> Result<std::result::Result<(PlacementCandidate, Resources, SpecTemplate), Refusal>> {
         let Some(backend) = self.backends.get(&offering.backend_id).cloned() else {
             return Ok(Err(refuse(
@@ -1021,6 +1035,7 @@ impl Core {
                 "no available host can run this offering (the backend did not list its hosts)",
             )));
         };
+        *held |= cands.iter().any(|c| c.has_project_snapshot);
         let available: Vec<PlacementCandidate> = cands
             .iter()
             .filter(|c| {
@@ -2184,10 +2199,72 @@ fn command_digest(plan: &CreatePlan, spec_digest: &SpecDigest) -> String {
     hex::encode(Sha256::digest(body))
 }
 
+/// Where a new orb that names a project snapshot (`ORB_SNAPSHOT_ID`) was placed, as far
+/// as the snapshot goes. A host that held it may still start the orb from its image (it
+/// deleted the snapshot since, or passes it over for another lineage): the agent counts
+/// those in `orbd_project_snapshot_fallbacks_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotPlacement {
+    /// On a host that holds it.
+    Hit,
+    /// Elsewhere: the hosts holding it could not take the orb (full, unavailable,
+    /// overflow, or of another offering than the one that placed it).
+    Elsewhere,
+    /// No host holds it.
+    Absent,
+}
+
+impl SnapshotPlacement {
+    fn of(chosen_holds: bool, held: bool) -> Self {
+        match (chosen_holds, held) {
+            (true, _) => Self::Hit,
+            (false, true) => Self::Elsewhere,
+            (false, false) => Self::Absent,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Elsewhere => "elsewhere",
+            Self::Absent => "absent",
+        }
+    }
+
+    /// Counts the placement, and logs a miss: the orb starts from its image.
+    fn report(self, amp_orb_id: &impl std::fmt::Display, key: &ProjectSnapshotKey, host: &str) {
+        let result = self.label();
+        metrics::counter!("orbd_project_snapshot_placements_total", "result" => result)
+            .increment(1);
+        if self != Self::Hit {
+            let snapshot = key.as_str().get(..12).unwrap_or(key.as_str());
+            tracing::info!(
+                %amp_orb_id,
+                snapshot,
+                result,
+                host,
+                "project snapshot miss: the new orb starts from its image"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{AgentId, BackendId, DiskReport, MemoryReport, RuntimeKind};
+
+    /// A placement on a host holding the snapshot is a hit; elsewhere it is a miss,
+    /// told apart by whether any host held it.
+    #[test]
+    fn snapshot_placements_say_why_they_missed() {
+        use SnapshotPlacement as P;
+        assert_eq!(P::of(true, true), P::Hit);
+        assert_eq!(P::of(false, true), P::Elsewhere);
+        assert_eq!(P::of(false, false), P::Absent);
+        let labels: Vec<_> = [P::Hit, P::Elsewhere, P::Absent].map(P::label).into();
+        assert_eq!(labels, ["hit", "elsewhere", "absent"]);
+    }
 
     /// A new orb no host can take says why: hosts that could run it but are not
     /// available, by name; what the others lack, once each; nested KVM's switch only when

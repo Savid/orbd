@@ -305,6 +305,7 @@ pub async fn initial_source(
     );
     tracing::info!(current, "{why}");
     log(ctx, &why);
+    metrics::counter!("orbd_project_snapshot_fallbacks_total", "reason" => "lineage").increment(1);
     InitialDiskSource::Image { image_ref }
 }
 
@@ -312,7 +313,8 @@ pub async fn initial_source(
 /// `write_raw` fills a standalone raw disk in staging (an empty file lent to `tools`),
 /// which is shrunk to its used size (by `tools`), taken back, made read-only (0444),
 /// fsynced and renamed into place. The format is the same for every VM runtime.
-/// `lineage` is the source orb's (see [`project_lineage`]).
+/// `lineage` is the source orb's (see [`project_lineage`]); `parent` the project snapshot
+/// its disk was created from (None: an image), which the new one supersedes here.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
     ctx: &OpContext,
@@ -320,6 +322,7 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
     key: &ProjectSnapshotKey,
     source_orb: OrbId,
     lineage: Option<String>,
+    parent: Option<&ProjectSnapshotKey>,
     tools: &disktools::DiskTools<'_>,
     write_raw: impl FnOnce(PathBuf) -> F,
 ) -> Result<(), RuntimeError> {
@@ -347,6 +350,7 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
             "key": key,
             "source_orb": source_orb,
             "lineage": lineage,
+            "parent": parent,
             "created_unix_ms": crate::model::unix_ms_now(),
             "bytes": std::fs::metadata(&raw).map(|m| m.len()).unwrap_or(0),
         });

@@ -198,6 +198,16 @@ pub(crate) fn recipe_bases(json: &[u8]) -> Option<Vec<String>> {
     Some(bases)
 }
 
+/// The project snapshot a QEMU orb's disk was created from, by its `vm.json` (inner
+/// None: an image, or a source that does not parse); None if `json` is not a QEMU recipe.
+pub(crate) fn recipe_project(json: &[u8]) -> Option<Option<String>> {
+    let recipe: VmRecipe = serde_json::from_slice(json).ok()?;
+    Some(match serde_json::from_str(&recipe.base.source) {
+        Ok(BaseSource::ProjectSnapshot { key }) => Some(key.0),
+        _ => None,
+    })
+}
+
 /// `checkpoints/<gen>/manifest.json`. Its presence in a `.tmp` directory marks the
 /// memory file complete (QMP `completed`, stream EOF, fsync).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1626,12 +1636,18 @@ impl Runtime for QemuRuntime {
         }
         let tools = super::vm::disktools::DiskTools::new(self.jail.as_ref().zip(ids));
         let (tools_ref, base, disk_bytes) = (&tools, recipe.base.path.clone(), recipe.disk_bytes);
+        // The source the recipe declares: its base, which the new snapshot supersedes.
+        let parent = match serde_json::from_str(&recipe.base.source) {
+            Ok(BaseSource::ProjectSnapshot { key }) => Some(key),
+            _ => None,
+        };
         publish_project(
             ctx,
             &self.state_dir,
             key,
             orb.id,
             recipe.lineage,
+            parent.as_ref(),
             &tools,
             |raw: PathBuf| async move {
                 std::fs::OpenOptions::new()

@@ -456,6 +456,34 @@ impl ImageStore {
         trashed
     }
 
+    /// The lineages of the images references resolve to now, as prepared for this guest
+    /// integration: a project snapshot of any other lineage is passed over whenever
+    /// one of these references is spawned (see [`crate::runtime::vm::initial_source`]).
+    /// A reference whose current image is not prepared adds nothing; reads only what is
+    /// on disk.
+    pub fn current_lineages(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let refs = self.inner.images.join("refs");
+        for e in std::fs::read_dir(&refs).into_iter().flatten().flatten() {
+            let Some(r) = std::fs::read(e.path())
+                .ok()
+                .and_then(|b| serde_json::from_slice::<RefRecord>(&b).ok())
+            else {
+                continue;
+            };
+            if e.path() != self.ref_path(&r.image_ref) {
+                continue;
+            }
+            if let Some(l) = self
+                .published(&r.image_ref, &r.manifest_digest)
+                .and_then(|i| i.lineage)
+            {
+                out.insert(l);
+            }
+        }
+        out
+    }
+
     fn cache_key(&self, manifest_digest: &str) -> String {
         sha256_hex(
             format!(
@@ -770,5 +798,59 @@ mod tests {
         want.sort();
         assert_eq!(left, want);
         assert!(!blobs.join("old").exists() && blobs.join("new").exists());
+    }
+
+    /// Current lineages are those of the images references resolve to now, once
+    /// prepared: not of an image no reference names, of a reference whose image is not
+    /// prepared, or of a record filed under another reference's name.
+    #[tokio::test]
+    async fn current_lineages_are_those_of_current_prepared_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("orbd-guest");
+        std::fs::write(&helper, b"\x7fELF test").unwrap();
+        let mut config = crate::config::agent::AgentConfig::default().images.unwrap();
+        config.guest_helper = helper;
+        config.prewarm = Vec::new();
+        let state = tmp.path().join("state");
+        let store = ImageStore::open(&config, &state).unwrap();
+        assert!(store.current_lineages().is_empty(), "nothing resolved yet");
+        let publish = |digest: &str, lineage: Option<&str>| {
+            let key = store.cache_key(digest);
+            let dir = state.join("images").join(&key);
+            std::fs::create_dir_all(&dir).unwrap();
+            let meta = ImageMeta {
+                key,
+                image_ref: "r".into(),
+                manifest_digest: digest.into(),
+                recipe_version: RECIPE_VERSION,
+                guest_integration_digest: store.guest_integration_digest().into(),
+                rootfs_bytes: 1,
+                created_unix: now_unix(),
+                lineage: lineage.map(str::to_owned),
+            };
+            write_json_atomic(&dir.join(META_FILE), &meta).unwrap();
+        };
+        let resolve = |image_ref: &str, digest: &str, file: Option<&str>| {
+            let record = RefRecord {
+                image_ref: image_ref.into(),
+                manifest_digest: digest.into(),
+                resolved_unix: now_unix(),
+            };
+            let path = match file {
+                Some(f) => state.join("images/refs").join(f),
+                None => store.ref_path(image_ref),
+            };
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_json_atomic(&path, &record).unwrap();
+        };
+        publish("sha256:current", Some("new"));
+        publish("sha256:previous", Some("old"));
+        publish("sha256:bare", None);
+        publish("sha256:misfiled", Some("misfiled"));
+        resolve("amp-orb:latest", "sha256:current", None);
+        resolve("amp-orb:pending", "sha256:not-prepared", None);
+        resolve("bare:latest", "sha256:bare", None);
+        resolve("other:latest", "sha256:misfiled", Some("not-its-name.json"));
+        assert_eq!(store.current_lineages(), HashSet::from(["new".to_owned()]));
     }
 }

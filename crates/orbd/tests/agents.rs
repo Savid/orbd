@@ -333,3 +333,49 @@ fn restricted_egress_goes_only_to_agents_that_enforce_it() {
     assert!(!c.only_orb("strict").running);
     assert_ok(&c.dispatch("delete", "amp-3", &[]), "delete");
 }
+
+/// A new orb that names a project snapshot goes to a host holding it; the coordinator
+/// counts each such placement by whether it hit, missed because the hosts holding the
+/// snapshot could not take the orb, or missed because none holds it, and logs a miss.
+#[test]
+fn project_snapshot_placements_are_counted() {
+    let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
+    c.start_all();
+    c.wait_connected(2);
+    let snap = [("ORB_SNAPSHOT_ID", "project-1")];
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1");
+    assert_ok(&c.dispatch("pause", "amp-1", &snap), "publish project-1");
+    let (holder, other) = match c.fake_orbs("agent-a").is_empty() {
+        true => ("agent-b", "agent-a"),
+        false => ("agent-a", "agent-b"),
+    };
+
+    assert_ok(&c.dispatch("spawn", "amp-2", &snap), "amp-2");
+    assert!(
+        c.fake_orb(holder, "amp-2").running,
+        "amp-2 goes where project-1 is"
+    );
+    assert_ok(
+        &c.dispatch("spawn", "amp-3", &[("ORB_SNAPSHOT_ID", "project-2")]),
+        "amp-3",
+    );
+    c.terminate_agent(holder, Duration::from_secs(30));
+    c.wait_connected(1);
+    assert_ok(&c.dispatch("spawn", "amp-4", &snap), "amp-4");
+    assert!(
+        c.fake_orb(other, "amp-4").running,
+        "amp-4 goes to {other}: {holder} is gone"
+    );
+
+    let metrics = c.metrics().unwrap_or_default();
+    for (result, n) in [("hit", 1), ("absent", 1), ("elsewhere", 1)] {
+        let line = format!("orbd_project_snapshot_placements_total{{result=\"{result}\"}} {n}");
+        assert!(metrics.contains(&line), "no {line:?} in:\n{metrics}");
+    }
+    let logs = c.logs();
+    assert_eq!(
+        logs.matches("project snapshot miss").count(),
+        2,
+        "one log line per miss"
+    );
+}

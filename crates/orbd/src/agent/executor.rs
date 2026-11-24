@@ -929,6 +929,8 @@ impl Run {
                     )
                 {
                     tracing::warn!(orb_id = %orb_id, %why, image_ref, "project snapshot missing; creating the disk from the image");
+                    metrics::counter!("orbd_project_snapshot_fallbacks_total", "reason" => "missing")
+                        .increment(1);
                     self.log(&format!(
                         "{why}; creating the disk from {image_ref} instead"
                     ));

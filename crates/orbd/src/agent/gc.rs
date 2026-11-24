@@ -7,7 +7,10 @@
 //! it (a QEMU orb's `vm.json` names it: its disk reads through to its base; a
 //! Firecracker orb's disk is a standalone copy, so it pins nothing) and nothing has
 //! used it for [`IDLE`]. A spawn that creates a disk from it counts as a use, and so
-//! does publishing it. The current image of a prewarmed reference is kept. Collection
+//! does publishing it. The current image of a prewarmed reference is kept. A project
+//! snapshot goes sooner when it can no longer stand in for any image here (its lineage
+//! is none of the current images', see [`DEAD_IDLE`]), or once another snapshot was
+//! published here from an orb created from it (see [`SUPERSEDED_IDLE`]). Collection
 //! runs at startup, hourly and after every orb delete, under
 //! [`crate::runtime::vm::BASES`], so no disk is created from a base while it runs.
 
@@ -20,6 +23,16 @@ use std::time::Duration;
 
 /// How long an unused base is kept: Amp names a project snapshot for at most 72 hours.
 pub const IDLE: Duration = Duration::from_secs(72 * 3600);
+/// How long an unused project snapshot is kept once another one on this host was
+/// published from an orb created from it: Amp names the newer one from then on. A parent
+/// can have several (Amp keeps one per orb size, and on some repositories one per
+/// member); one named again after it went costs that orb a start from its image.
+pub const SUPERSEDED_IDLE: Duration = Duration::from_secs(12 * 3600);
+/// How long an unused project snapshot is kept once its lineage is none of the lineages
+/// the images here resolve to now: [`vm::initial_source`] passes it over for each of
+/// them. The hour keeps one from going before the pause that published it has recorded
+/// it (a publication counts as a use).
+pub const DEAD_IDLE: Duration = Duration::from_secs(3600);
 const EVERY: Duration = Duration::from_secs(3600);
 
 /// Collects now, then hourly and whenever an orb was deleted, until shutdown.
@@ -46,7 +59,11 @@ async fn collect(sh: &Arc<Shared>) {
         let (state, images) = (state.clone(), sh.images.clone());
         tokio::task::spawn_blocking(move || {
             let in_use = orb_bases(&state)?;
-            let projects = collect_projects(&state, &in_use, IDLE);
+            let lineages = images
+                .as_ref()
+                .map(|s| s.current_lineages())
+                .unwrap_or_default();
+            let projects = collect_projects(&state, &in_use, &lineages);
             let images = match &images {
                 Some(store) => {
                     let keys = in_use
@@ -74,8 +91,8 @@ async fn collect(sh: &Arc<Shared>) {
         }
     };
     // Forgotten before a snapshot of the same key can be published again.
-    for (key, _) in &projects {
-        let key = key.clone();
+    for p in &projects {
+        let key = p.key.clone();
         if let Err(e) = sh
             .db
             .call(move |c| db::forget_project_snapshot(c, &key))
@@ -88,8 +105,8 @@ async fn collect(sh: &Arc<Shared>) {
 
     let mut trashed: Vec<_> = projects
         .iter()
-        .chain(&images)
-        .map(|(_, t)| t.clone())
+        .map(|p| p.trashed.clone())
+        .chain(images.iter().map(|(_, t)| t.clone()))
         .collect();
     if let Some(store) = sh.images.clone() {
         trashed.extend(
@@ -109,13 +126,29 @@ async fn collect(sh: &Arc<Shared>) {
     if let Err(e) = removed {
         tracing::warn!("garbage collection failed: {e}");
     }
+    let projects_for = |why: Why| {
+        projects
+            .iter()
+            .filter(|p| p.why == why)
+            .map(|p| p.key.clone())
+            .collect::<Vec<_>>()
+    };
+    for why in [Why::Idle, Why::Superseded, Why::DeadLineage] {
+        metrics::counter!("orbd_project_snapshots_deleted_total", "reason" => why.label())
+            .increment(projects.iter().filter(|p| p.why == why).count() as u64);
+    }
     if !projects.is_empty() || !images.is_empty() {
-        let keys = |v: &[(String, PathBuf)]| v.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
         tracing::info!(
-            projects = ?keys(&projects),
-            images = ?keys(&images),
-            "deleted project snapshots and images no orb is built on, unused for {}h",
-            IDLE.as_secs() / 3600
+            projects = ?projects_for(Why::Idle),
+            superseded_projects = ?projects_for(Why::Superseded),
+            dead_lineage_projects = ?projects_for(Why::DeadLineage),
+            images = ?images.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            "deleted project snapshots and images no orb is built on: unused for {}h, \
+             superseded and unused for {}h, or of a lineage no current image has and \
+             unused for {}h",
+            IDLE.as_secs() / 3600,
+            SUPERSEDED_IDLE.as_secs() / 3600,
+            DEAD_IDLE.as_secs() / 3600,
         );
     }
 }
@@ -148,33 +181,137 @@ fn orb_bases(state: &Path) -> Result<HashSet<String>, String> {
     Ok(bases)
 }
 
-/// Moves into the trash every project snapshot not in `in_use` and unused for `idle`;
-/// returns each one's key and path in the trash.
+/// Why a project snapshot was deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// Unused for [`IDLE`].
+    Idle,
+    /// Superseded and unused for [`SUPERSEDED_IDLE`].
+    Superseded,
+    /// Of a lineage no current image has, and unused for [`DEAD_IDLE`].
+    DeadLineage,
+}
+
+impl Why {
+    fn label(self) -> &'static str {
+        match self {
+            Why::Idle => "idle",
+            Why::Superseded => "superseded",
+            Why::DeadLineage => "dead_lineage",
+        }
+    }
+}
+
+/// A project snapshot moved into the trash.
+#[derive(Debug)]
+struct Trashed {
+    key: String,
+    trashed: PathBuf,
+    why: Why,
+}
+
+/// What a project snapshot's `meta.json` says it descends from: its image lineage and
+/// its parent (the snapshot its source orb's disk was created from; None: an image, or
+/// not known). Snapshots published before parents were recorded take the parent from
+/// their source orb's recipe while that orb is here.
+fn descent(state: &Path, dir: &Path) -> (Option<String>, Option<String>) {
+    let Some(meta) = std::fs::read(dir.join("meta.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+    else {
+        return (None, None);
+    };
+    let lineage = meta
+        .get("lineage")
+        .and_then(|l| l.as_str())
+        .map(str::to_owned);
+    let parent = match meta.get("parent") {
+        Some(p) => p.as_str().map(str::to_owned),
+        None => meta
+            .get("source_orb")
+            .and_then(|o| o.as_str())
+            .filter(|o| crate::model::OrbId::parse(o).is_ok())
+            .and_then(|o| std::fs::read(state.join("orbs").join(o).join("vm.json")).ok())
+            .and_then(|json| {
+                crate::runtime::qemu::recipe_project(&json)
+                    .or_else(|| crate::runtime::firecracker::recipe_project(&json))
+            })
+            .flatten(),
+    };
+    (lineage, parent)
+}
+
+/// Moves into the trash every project snapshot not in `in_use` that is unused for
+/// [`IDLE`], superseded and unused for [`SUPERSEDED_IDLE`], or (with `lineages`, the
+/// current images' lineages, known) of none of `lineages` and unused for [`DEAD_IDLE`].
 fn collect_projects(
     state: &Path,
     in_use: &HashSet<String>,
-    idle: Duration,
-) -> Vec<(String, PathBuf)> {
-    let mut deleted = Vec::new();
+    lineages: &HashSet<String>,
+) -> Vec<Trashed> {
+    struct Found {
+        key: String,
+        path: PathBuf,
+        dead: bool,
+        parent: Option<String>,
+    }
     let dir = state.join("projects");
-    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-        let key = e.file_name().to_string_lossy().into_owned();
-        let path = e.path();
-        if in_use.contains(&format!("projects/{key}")) {
+    let found: Vec<Found> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| {
+            let path = e.path();
+            let (lineage, parent) = descent(state, &path);
+            Found {
+                key: e.file_name().to_string_lossy().into_owned(),
+                // As `initial_source` decides: a snapshot without a lineage is passed over
+                // too, once the image's is known.
+                dead: !lineages.is_empty() && lineage.is_none_or(|l| !lineages.contains(&l)),
+                parent,
+                path,
+            }
+        })
+        .collect();
+    // Only a snapshot that can still be used supersedes its parent.
+    let superseded: HashSet<&str> = found
+        .iter()
+        .filter(|f| !f.dead)
+        .filter_map(|f| f.parent.as_deref().filter(|p| *p != f.key))
+        .collect();
+    let mut deleted = Vec::new();
+    for f in &found {
+        if in_use.contains(&format!("projects/{}", f.key)) {
             continue;
         }
-        match vm::last_used(&path) {
-            Ok(t) if t.elapsed().is_ok_and(|e| e >= idle) => {}
-            Ok(_) => continue,
+        let unused = match vm::last_used(&f.path) {
+            Ok(t) => t.elapsed().unwrap_or_default(),
             Err(e) => {
+                let key = &f.key;
                 tracing::warn!(key, error = %e, "garbage collection: no use time; keeping it");
                 continue;
             }
-        }
-        match vm::fsutil::move_to_trash(&path, &state.join("trash")) {
-            Ok(Some(t)) => deleted.push((key, t)),
+        };
+        let why = if unused >= IDLE {
+            Why::Idle
+        } else if f.dead && unused >= DEAD_IDLE {
+            Why::DeadLineage
+        } else if superseded.contains(f.key.as_str()) && unused >= SUPERSEDED_IDLE {
+            Why::Superseded
+        } else {
+            continue;
+        };
+        match vm::fsutil::move_to_trash(&f.path, &state.join("trash")) {
+            Ok(Some(t)) => deleted.push(Trashed {
+                key: f.key.clone(),
+                trashed: t,
+                why,
+            }),
             Ok(None) => {}
-            Err(e) => tracing::warn!(key, error = %e, "deleting an unused project snapshot"),
+            Err(e) => {
+                let key = &f.key;
+                tracing::warn!(key, error = %e, "deleting an unused project snapshot");
+            }
         }
     }
     deleted
@@ -186,8 +323,42 @@ mod tests {
     use std::time::SystemTime;
 
     fn age(path: &Path, days: u64) {
-        let t = SystemTime::now() - Duration::from_secs(days * 86_400);
+        ago(path, Duration::from_secs(days * 86_400));
+    }
+
+    fn ago(path: &Path, by: Duration) {
+        let t = SystemTime::now() - by;
         std::fs::File::open(path).unwrap().set_modified(t).unwrap();
+    }
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    /// A published project snapshot `key` with `meta` as its `meta.json`, last used
+    /// `unused` ago.
+    fn snapshot(state: &Path, key: &str, meta: serde_json::Value, unused: Duration) {
+        let dir = state.join("projects").join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
+        ago(&dir, unused);
+    }
+
+    /// An orb directory `n` with `recipe` as its `vm.json`; returns the orb id.
+    fn orb(state: &Path, n: u8, recipe: String) -> String {
+        let id = format!("01a17b00-0000-7000-8000-0000000000{n:02}");
+        let dir = state.join("orbs").join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vm.json"), recipe).unwrap();
+        id
+    }
+
+    fn keys(trashed: &[Trashed], why: Why) -> Vec<&str> {
+        let mut k: Vec<&str> = trashed
+            .iter()
+            .filter(|t| t.why == why)
+            .map(|t| t.key.as_str())
+            .collect();
+        k.sort();
+        k
     }
 
     /// A QEMU orb's `vm.json` as the runtime writes it, built on `base` (`images/<key>`
@@ -258,9 +429,9 @@ mod tests {
 
         let in_use = orb_bases(state).unwrap();
         assert!(in_use.is_empty(), "{in_use:?}");
-        let trashed = collect_projects(state, &in_use, IDLE);
+        let trashed = collect_projects(state, &in_use, &HashSet::new());
         assert_eq!(trashed.len(), 1);
-        assert_eq!(trashed[0].0, "copied");
+        assert_eq!(trashed[0].key, "copied");
     }
 
     /// Only a project snapshot that no orb is built on and nothing used for the idle
@@ -289,9 +460,9 @@ mod tests {
             in_use,
             HashSet::from(["projects/built-on".to_owned(), "images/k1".to_owned()])
         );
-        let trashed = collect_projects(state, &in_use, IDLE);
+        let trashed = collect_projects(state, &in_use, &HashSet::new());
         assert_eq!(trashed.len(), 1);
-        assert_eq!(trashed[0].0, "idle");
+        assert_eq!(trashed[0].key, "idle");
         let mut left: Vec<String> = std::fs::read_dir(state.join("projects"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -307,5 +478,139 @@ mod tests {
         );
         std::fs::write(broken.join("vm.json"), b"{").unwrap();
         assert!(orb_bases(state).is_err(), "an unreadable vm.json");
+    }
+
+    /// With the current images' lineages known, a snapshot of none of them (or of no
+    /// recorded lineage) goes once unused for an hour, unless a QEMU orb is built on it;
+    /// with none known, only idle ones go.
+    #[test]
+    fn dead_lineage_snapshots_go_after_an_hour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        orb(state, 1, qemu_recipe(state, "projects/old-built-on"));
+        let old = serde_json::json!({"lineage": "old", "parent": null});
+        snapshot(state, "old-built-on", old.clone(), 2 * HOUR);
+        snapshot(state, "old-unused", old.clone(), 2 * HOUR);
+        snapshot(state, "old-just-published", old, Duration::from_secs(600));
+        snapshot(state, "unrecorded", serde_json::json!({}), 2 * HOUR);
+        snapshot(
+            state,
+            "current",
+            serde_json::json!({"lineage": "new"}),
+            2 * HOUR,
+        );
+        let in_use = orb_bases(state).unwrap();
+
+        assert!(
+            collect_projects(state, &in_use, &HashSet::new()).is_empty(),
+            "no current lineage known: nothing is dead"
+        );
+        let trashed = collect_projects(state, &in_use, &HashSet::from(["new".to_owned()]));
+        assert_eq!(
+            keys(&trashed, Why::DeadLineage),
+            ["old-unused", "unrecorded"]
+        );
+        assert_eq!(trashed.len(), 2);
+        let other = HashSet::from(["new".to_owned(), "old".to_owned()]);
+        assert!(
+            collect_projects(state, &in_use, &other).is_empty(),
+            "a lineage one current image has is alive"
+        );
+    }
+
+    /// A snapshot another one here was published from (its parent, recorded or taken
+    /// from the source orb's recipe) goes once unused for 12 hours; one a dead or no
+    /// snapshot descends from waits for the idle time.
+    #[test]
+    fn superseded_snapshots_go_after_twelve_hours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let meta = |parent: Option<&str>| serde_json::json!({"lineage": "new", "parent": parent});
+        snapshot(state, "parent", meta(None), 13 * HOUR);
+        snapshot(state, "child", meta(Some("parent")), 13 * HOUR);
+        snapshot(state, "recent-parent", meta(None), 6 * HOUR);
+        snapshot(state, "recent-child", meta(Some("recent-parent")), HOUR);
+        snapshot(state, "orphan", meta(Some("long-gone")), 13 * HOUR);
+        snapshot(state, "own-parent", meta(Some("own-parent")), 13 * HOUR);
+        // Its only child is of a dead lineage (and goes itself).
+        snapshot(state, "dead-childs-parent", meta(None), 13 * HOUR);
+        snapshot(
+            state,
+            "dead-child",
+            serde_json::json!({"lineage": "old", "parent": "dead-childs-parent"}),
+            13 * HOUR,
+        );
+        // Published before parents were recorded: the source orb's recipe says.
+        let source = orb(state, 2, firecracker_recipe("projects/legacy-parent"));
+        snapshot(state, "legacy-parent", meta(None), 13 * HOUR);
+        snapshot(
+            state,
+            "legacy-child",
+            serde_json::json!({"lineage": "new", "source_orb": source}),
+            HOUR,
+        );
+        // A recorded parent wins over the recipe: null is an image.
+        let other = orb(state, 3, firecracker_recipe("projects/not-a-parent"));
+        snapshot(state, "not-a-parent", meta(None), 13 * HOUR);
+        snapshot(
+            state,
+            "recorded-image",
+            serde_json::json!({"lineage": "new", "parent": null, "source_orb": other}),
+            HOUR,
+        );
+        let in_use = orb_bases(state).unwrap();
+        let lineages = HashSet::from(["new".to_owned()]);
+
+        let trashed = collect_projects(state, &in_use, &lineages);
+        assert_eq!(keys(&trashed, Why::Superseded), ["legacy-parent", "parent"]);
+        assert_eq!(keys(&trashed, Why::DeadLineage), ["dead-child"]);
+        assert_eq!(trashed.len(), 3);
+        let mut left: Vec<String> = std::fs::read_dir(state.join("projects"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "child",
+                "dead-childs-parent",
+                "legacy-child",
+                "not-a-parent",
+                "orphan",
+                "own-parent",
+                "recent-child",
+                "recent-parent",
+                "recorded-image"
+            ]
+        );
+    }
+
+    /// A QEMU orb built on a superseded snapshot keeps it; its recipe names the parent
+    /// of a snapshot published from it.
+    #[test]
+    fn qemu_orbs_keep_superseded_bases_and_name_parents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        let source = orb(state, 1, qemu_recipe(state, "projects/q-parent"));
+        snapshot(
+            state,
+            "q-parent",
+            serde_json::json!({"lineage": "new"}),
+            13 * HOUR,
+        );
+        snapshot(
+            state,
+            "q-child",
+            serde_json::json!({"lineage": "new", "source_orb": source}),
+            HOUR,
+        );
+        assert_eq!(
+            descent(state, &state.join("projects/q-child")),
+            (Some("new".to_owned()), Some("q-parent".to_owned()))
+        );
+        let in_use = orb_bases(state).unwrap();
+        let trashed = collect_projects(state, &in_use, &HashSet::from(["new".to_owned()]));
+        assert!(trashed.is_empty(), "{trashed:?}");
     }
 }

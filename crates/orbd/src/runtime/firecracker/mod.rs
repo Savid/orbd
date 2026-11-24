@@ -136,6 +136,15 @@ pub(crate) fn recipe_bases(json: &[u8]) -> Option<Vec<String>> {
     Some(Vec::new())
 }
 
+/// The project snapshot an orb's disk was created from, by its `vm.json` (inner None:
+/// an image); None if `json` is not a recipe of this runtime.
+pub(crate) fn recipe_project(json: &[u8]) -> Option<Option<String>> {
+    match serde_json::from_slice::<VmRecipe>(json).ok()?.source {
+        DiskSource::ProjectSnapshot { key } => Some(Some(key.0)),
+        DiskSource::Image { .. } => Some(None),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum DiskSource {
@@ -1429,7 +1438,11 @@ impl Runtime for FirecrackerRuntime {
         }
         let disk = self.orb_paths(orb.id).disk;
         log(ctx, &format!("copying disk into project snapshot {key}"));
-        let lineage = self.read_recipe(orb.id)?.lineage;
+        let recipe = self.read_recipe(orb.id)?;
+        let parent = match &recipe.source {
+            DiskSource::ProjectSnapshot { key } => Some(key),
+            DiskSource::Image { .. } => None,
+        };
         // The copy reads no content as root; the guest's filesystem is checked and shrunk
         // in the orb's jail.
         let ids = self.jail_ids(orb.id)?;
@@ -1439,7 +1452,8 @@ impl Runtime for FirecrackerRuntime {
             &self.state_dir,
             key,
             orb.id,
-            lineage,
+            recipe.lineage,
+            parent,
             &tools,
             |raw: PathBuf| async move { copy_disk(ctx, &disk, &raw).await },
         )

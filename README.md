@@ -337,10 +337,22 @@ reach existing projects changes it, which costs each project one start without i
 snapshot. A snapshot that records no lineage is passed over too, once the image's
 lineage is known. An agent deletes a project snapshot or prepared image once no orb on
 it is built on it and nothing has used it for 72 hours (the current image of a
-prewarmed reference is kept), and image layers no build has used for as long.
+prewarmed reference is kept), and image layers no build has used for as long. A
+project snapshot goes sooner when it can no longer be used: after an hour unused once
+its lineage is none of those the agent's images resolve to now (as known from images
+already prepared), and after 12 hours unused once another snapshot on the agent was
+published from an orb created from it, since Amp names the newer one from then on.
 Only QEMU orbs are built on their base, since their disks read through to it; a
 Firecracker orb's disk is a standalone copy and keeps nothing. It checks at startup,
-hourly and after each orb delete.
+hourly and after each orb delete (metric `orbd_project_snapshots_deleted_total{reason}`).
+
+The coordinator places a new orb that names a project snapshot on an agent holding
+it when one fits. `orbd_project_snapshot_placements_total{result}` counts these
+placements: `hit`, `elsewhere` (the agents holding it could not take the orb: full,
+down or overflow) and `absent` (none holds it); each miss is logged. An agent counts
+orbs it starts from the image although placed for a snapshot in
+`orbd_project_snapshot_fallbacks_total{reason}`: `missing` (deleted since) or
+`lineage`.
 
 `prefer` sets where new orbs go, in order: `[local, boat]` (the default) runs them on
 the agents and sends them to Boat when no agent can take them (all full, down or
