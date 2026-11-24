@@ -1484,6 +1484,7 @@ impl Runtime for QemuRuntime {
         &self,
         orb: &OrbDefinition,
         checkpoint_generation: u64,
+        _hold: bool,
         ctx: &OpContext,
     ) -> Result<SleepCheckpointRef, RuntimeError> {
         let g = checkpoint_generation;

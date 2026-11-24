@@ -157,6 +157,10 @@ pub struct AgentSection {
     /// on their next wake (`ORBD_CHECKPOINT_MAX_AGE_HOURS`; None: kept for as long as
     /// the orb sleeps).
     pub checkpoint_max_age: Option<std::time::Duration>,
+    /// A sleep's memory stays in RAM this long before its checkpoint is written, so a
+    /// wake within it resumes in place and writes nothing (`ORBD_SLEEP_HOLD_MINUTES`;
+    /// None: written at once).
+    pub sleep_hold: Option<std::time::Duration>,
     /// Whether VMMs on Linux run jailed (`ORBD_VMM_JAIL`).
     pub vmm_jail: JailMode,
     /// Jailed VMMs run as `vmm_jail_uid_base + <index>` (`ORBD_VMM_JAIL_UID_BASE`).
@@ -565,6 +569,7 @@ impl AgentSection {
             coordinator_url: None,
             overflow: false,
             checkpoint_max_age: None,
+            sleep_hold: Self::sleep_hold_minutes(None),
             vmm_jail: JailMode::On,
             vmm_jail_uid_base: DEFAULT_JAIL_UID_BASE,
             vm_only: true,
@@ -581,7 +586,18 @@ impl AgentSection {
             .filter(|&h| h > 0)
             .map(|h| std::time::Duration::from_secs(h.saturating_mul(3600)))
     }
+
+    /// `ORBD_SLEEP_HOLD_MINUTES`: unset is [`DEFAULT_SLEEP_HOLD_MINUTES`], 0 off.
+    pub fn sleep_hold_minutes(minutes: Option<u64>) -> Option<std::time::Duration> {
+        Some(minutes.unwrap_or(DEFAULT_SLEEP_HOLD_MINUTES))
+            .filter(|&m| m > 0)
+            .map(|m| std::time::Duration::from_secs(m.saturating_mul(60)))
+    }
 }
+
+/// How long a sleep stays in RAM before its checkpoint is written, by default. Most
+/// wakes come within minutes of the sleep; one within this writes nothing.
+pub const DEFAULT_SLEEP_HOLD_MINUTES: u64 = 20;
 
 /// Per-field overrides of the detected capacity.
 #[derive(Clone, Copy, Debug, Default)]
@@ -817,6 +833,17 @@ mod tests {
 
     /// Checkpoints are kept for as long as an orb sleeps unless a max age is set; 0
     /// (e.g. compose's `${VAR:-0}`) means unset.
+    #[test]
+    fn sleep_holds_default_on_and_zero_turns_them_off() {
+        let s = AgentSection::new("/s".into());
+        assert_eq!(s.sleep_hold, Some(Duration::from_secs(20 * 60)));
+        assert_eq!(AgentSection::sleep_hold_minutes(Some(0)), None);
+        assert_eq!(
+            AgentSection::sleep_hold_minutes(Some(5)),
+            Some(Duration::from_secs(300))
+        );
+    }
+
     #[test]
     fn checkpoint_max_age_is_off_unless_set() {
         assert_eq!(AgentSection::default().checkpoint_max_age, None);

@@ -183,6 +183,8 @@ fn worker(rx: mpsc::Receiver<Job>, shared: &Shared, handler: &dyn Handler) {
                 let started = std::time::Instant::now();
                 // SAFETY: sync(2) has no preconditions.
                 unsafe { libc::sync() };
+                // Watchdogs off before the trim, so the trim's budget accounts for it.
+                let watchdogs = crate::watchdogs::suspend();
                 // Then freed blocks go back to the host, in what is left of the host's
                 // wait (15 s) after the sync and a second one, so a slow sync is never
                 // reported as unprepared.
@@ -193,7 +195,7 @@ fn worker(rx: mpsc::Receiver<Job>, shared: &Shared, handler: &dyn Handler) {
                     // SAFETY: as above.
                     unsafe { libc::sync() };
                 }
-                log!("prepared for sleep (filesystems synced; {trimmed})");
+                log!("prepared for sleep (filesystems synced; {trimmed}; {watchdogs})");
                 Ok(shared.last_generation.load(Ordering::SeqCst))
             }
             host_message::Body::Resync(r) => handler
@@ -207,6 +209,12 @@ fn worker(rx: mpsc::Receiver<Job>, shared: &Shared, handler: &dyn Handler) {
             }
             host_message::Body::Hello(_) => unreachable!("answered by the session loop"),
         };
+        if matches!(
+            job.body,
+            host_message::Body::Wake(_) | host_message::Body::Resync(_)
+        ) {
+            crate::watchdogs::resume_soon();
+        }
         let shutdown = matches!(job.body, host_message::Body::Shutdown(_));
         scrub(&mut job.body);
         match result {

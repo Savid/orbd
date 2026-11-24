@@ -12,6 +12,9 @@
 //! * [`gc`]: deletes project snapshots and prepared images no orb is built on.
 //! * [`checkpoint_age`]: opt-in, drops the memory checkpoints of orbs asleep longer than
 //!   `ORBD_CHECKPOINT_MAX_AGE_HOURS` (they cold-boot on their next wake).
+//! * [`hold`]: sleeps held in RAM (`ORBD_SLEEP_HOLD_MINUTES`): their checkpoints are
+//!   written when the hold runs out, when an orb being admitted needs the memory, and on
+//!   a graceful stop.
 //! * The egress flow log (`ORBD_FLOW_LOG`, [`crate::runtime::vm::flowlog`]) runs on a
 //!   thread of its own, naming orbs from the network index and this agent's records.
 //! * On a Linux VM agent, the DNS proxy of orbs with restricted egress
@@ -35,6 +38,7 @@ mod db;
 mod detect;
 mod executor;
 mod gc;
+mod hold;
 mod identity;
 mod logs;
 mod maintenance;
@@ -77,6 +81,8 @@ pub(crate) struct Shared {
     /// Orbs with a liveness check queued or running, so a slow `inspect` cannot pile
     /// checks up behind it.
     pub liveness_queued: Mutex<std::collections::HashSet<OrbId>>,
+    /// Orbs with a write of their held sleep queued or running (see [`hold`]).
+    pub flush_queued: Mutex<std::collections::HashSet<OrbId>>,
     /// Last measurement of the bytes allocated under the state directory.
     pub disk_allocated: AtomicU64,
     /// The same measurement per orb directory.
@@ -87,7 +93,14 @@ pub(crate) struct Shared {
     pub memory_reserve: u64,
     /// Memory of orbs admitted lately, whose guests have not yet touched it: the host's
     /// available memory does not show it yet.
-    pub recent_admits: Mutex<Vec<(std::time::Instant, u64)>>,
+    pub recent_admits: Mutex<Vec<(std::time::Instant, u64, OrbId)>>,
+    /// Writes of held sleeps that failed, by orb: the hold's expiry is not retried
+    /// before then (see [`hold`]).
+    pub flush_backoff: Mutex<HashMap<OrbId, std::time::Instant>>,
+    /// Memory of holds pauses have reserved but not yet made (see `hold::reserve`).
+    pub hold_pending: Mutex<u64>,
+    /// Measured checkpoint write speed, bytes/s (0 until measured; see `hold::max_held`).
+    pub save_rate: AtomicU64,
     pub tokens: Mutex<HashMap<OperationId, CancellationToken>>,
     pub actors: Mutex<HashMap<OrbId, mpsc::UnboundedSender<executor::Work>>>,
     pub session: Mutex<Option<SessionHandle>>,
@@ -152,6 +165,43 @@ impl Shared {
             return None;
         }
         detect::mem_available()
+    }
+
+    /// Memory held by sleeps in RAM: available to new orbs once their checkpoints are
+    /// written (which admission does when it needs it).
+    pub(crate) fn memory_held(&self) -> u64 {
+        self.held_resident_except(OrbId(uuid::Uuid::nil()))
+    }
+
+    /// [`memory_held`](Self::memory_held) less `orb`'s own.
+    pub(crate) fn held_resident_except(&self, orb: OrbId) -> u64 {
+        self.runtimes
+            .values()
+            .flat_map(|r| r.held())
+            .filter(|h| h.orb != orb)
+            .map(|h| h.resident_bytes)
+            .sum()
+    }
+
+    /// What held sleeps' checkpoints take on disk once written.
+    pub(crate) fn held_memory_bytes(&self) -> u64 {
+        self.runtimes
+            .values()
+            .flat_map(|r| r.held())
+            .map(|h| h.memory_bytes)
+            .sum()
+    }
+
+    /// Disk committed but not written yet: held sleeps' checkpoints, and those of holds
+    /// pauses have reserved.
+    pub(crate) fn disk_committed(&self) -> u64 {
+        let pending = *self.hold_pending.lock().unwrap_or_else(|e| e.into_inner());
+        self.held_memory_bytes().saturating_add(pending)
+    }
+
+    /// Free disk less what is committed ([`disk_committed`](Self::disk_committed)).
+    pub(crate) fn disk_room(&self) -> u64 {
+        self.disk_stats().0.saturating_sub(self.disk_committed())
     }
 
     /// Free and total bytes of the filesystem holding the state directory.
@@ -424,6 +474,10 @@ pub async fn run(
         draining: CancellationToken::new(),
         reserved: Mutex::default(),
         liveness_queued: Mutex::default(),
+        flush_queued: Mutex::default(),
+        flush_backoff: Mutex::default(),
+        hold_pending: Mutex::default(),
+        save_rate: AtomicU64::new(0),
         disk_allocated: AtomicU64::new(0),
         orb_disk: Mutex::default(),
         disk_reserve,
@@ -449,6 +503,7 @@ pub async fn run(
     tokio::spawn(executor::watch(shared.clone()));
     tokio::spawn(gc::run_loop(shared.clone()));
     tokio::spawn(checkpoint_age::run_loop(shared.clone()));
+    tokio::spawn(hold::run_loop(shared.clone()));
     measure_disk(&shared).await;
     tokio::spawn({
         let sh = shared.clone();

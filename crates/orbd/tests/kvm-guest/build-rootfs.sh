@@ -36,7 +36,7 @@ work=$(mktemp -d)
 chmod 0755 "$work"   # read by the unprivileged namespace root
 trap 'rm -rf "$work"' EXIT
 
-units="orbd-guest.service amp-headless-bootstrap.service orbd-test-counter.service orbd-test-marker.service orbd-test-dns.service orbd-test-security.service"
+units="orbd-guest.service amp-headless-bootstrap.service orbd-test-counter.service orbd-test-marker.service orbd-test-dns.service orbd-test-security.service orbd-test-watchdog.service"
 nested_hooks=()
 if [ "$nested" = 1 ]; then
     # Nested (L2) guest: the same kernel (built without initrd support) booting a tiny

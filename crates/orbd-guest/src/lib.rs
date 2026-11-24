@@ -17,6 +17,7 @@ pub mod server;
 pub mod transport;
 pub mod trim;
 pub mod wake;
+pub mod watchdogs;
 
 /// The guest protocol, shared with the host side.
 pub use orbd_proto::guest::v1 as proto;

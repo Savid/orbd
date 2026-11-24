@@ -341,6 +341,27 @@ then (the guest replays its journal at its next mount). An orb whose type has a 
 disk than the snapshot gets its copy shrunk in its own jail when its disk is made, or
 keeps the larger size if its files do not fit.
 
+Most sleeps end within minutes, and a checkpoint is the orb's whole memory, so on a busy
+agent writing them is most of what it writes to its disk. A Firecracker agent therefore
+holds a sleep in RAM first: the guest syncs its disk and the VM is paused in
+place, still holding its memory, for `ORBD_SLEEP_HOLD_MINUTES` (`--sleep-hold-minutes`;
+default 20, 0 writes every checkpoint at once). A wake within that resumes the same VM in
+an instant (its network and egress policy reapplied first) and writes nothing. The
+checkpoint is written, exactly as an unheld sleep writes it and dated at the pause, when
+the hold runs out, when an orb being admitted needs the memory or capacity (oldest holds
+first), when the host's free memory would no longer fit the largest orb it runs, and
+first thing when the agent stops gracefully. A pause holds only if the guest synced its
+disk, the host would still fit another orb of its size, all held memory stays within
+16 GiB (what a graceful stop can write) and the held checkpoints fit on disk above the
+reserve. Held memory counts against the agent's capacity, and held checkpoints count as
+committed disk, not free, for admission and placement; held memory counts as available
+in what the agent reports only while those checkpoints fit. A checkpoint that cannot be
+written (disk full, or failing as the agent stops) drops the hold instead. A held VM lost
+without a graceful stop (a container killed, a crash, the OOM killer, which prefers held
+VMs) loses only its RAM: the orb is recorded stopped and cold-boots from its disk, which
+the guest synced and the agent made durable before the pause. A pause that publishes a
+project snapshot holds too: its disk is copied from the paused VM.
+
 To delete the orbs of archived threads sooner, run a job that checks each orb's thread
 in Amp: `orbd orb list --json` lists every orb's Amp id (`amp-<thread id>`), state,
 agent and what it holds on disk (`--asleep-days 7` narrows it to orbs asleep a week or

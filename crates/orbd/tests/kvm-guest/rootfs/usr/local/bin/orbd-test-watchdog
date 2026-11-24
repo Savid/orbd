@@ -1,0 +1,18 @@
+#!/bin/sh
+# Service watchdogs across sleeps: every 10 s, how many units with a watchdog
+# (WatchdogUSec > 0) restarted or changed their main process since boot, and how many
+# journal lines report a watchdog timeout. A sleep held in RAM must change neither.
+while :; do
+    restarts=0 pids=""
+    for u in $(systemctl list-units --type=service --state=running --no-legend --plain | awk '{print $1}'); do
+        w=$(systemctl show -p WatchdogUSec --value "$u")
+        case "$w" in ""|0|infinity) continue ;; esac
+        n=$(systemctl show -p NRestarts --value "$u")
+        p=$(systemctl show -p ExecMainPID --value "$u")
+        restarts=$((restarts + ${n:-0}))
+        pids="$pids$u=$p,"
+    done
+    j=$(journalctl -b -q --no-pager 2>/dev/null | grep -c "Watchdog timeout")
+    echo "watchdog-check restarts=$restarts journal=$j pids=$pids"
+    sleep 10
+done

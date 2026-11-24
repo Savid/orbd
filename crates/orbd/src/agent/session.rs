@@ -120,16 +120,28 @@ async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
 }
 
 pub(super) fn heartbeat(sh: &Shared) -> pb::AgentEvent {
-    let (free, total) = sh.disk_stats();
+    let (_, total) = sh.disk_stats();
+    // Committed writes (held sleeps' checkpoints, held sleeps' checkpoints) are not free to place on.
+    let free = sh.disk_room();
+    // Held sleeps' memory is available only while their checkpoints fit on disk.
+    let held = match free >= sh.disk_reserve {
+        true => sh.memory_held(),
+        false => 0,
+    };
     ev(pb::agent_event::Event::Heartbeat(pb::Heartbeat {
         capacity: Some(sh.capacity.into()),
         reserved: Some(sh.reserved_total().into()),
         disk_free_bytes: free,
         draining: sh.draining.is_cancelled(),
         disk_total_bytes: total,
-        disk_allocated_bytes: sh.disk_allocated.load(std::sync::atomic::Ordering::Relaxed),
+        // Held checkpoints are as good as allocated (see `disk_committed`).
+        disk_allocated_bytes: sh
+            .disk_allocated
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(sh.disk_committed()),
         disk_reserve_bytes: sh.disk_reserve,
-        memory_available_bytes: sh.memory_available().unwrap_or(0),
+        // Sleeps held in RAM give their memory up as soon as an orb needs it.
+        memory_available_bytes: sh.memory_available().map_or(0, |a| a.saturating_add(held)),
         memory_reserve_bytes: sh.memory_reserve,
         orb_disk: sh.orb_disk.lock().unwrap().clone(),
         // Sent once: a session that ends before the coordinator saw it starts with a

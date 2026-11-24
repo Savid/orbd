@@ -113,6 +113,36 @@ pub struct CheckpointInfo {
     pub synced: bool,
 }
 
+/// A sleep held in RAM: the orb's VMM, paused, still holds its memory, and its memory
+/// checkpoint is not written yet (see [`Runtime::checkpoint_and_stop`]'s `hold`). The
+/// orb counts as asleep on `checkpoint`: a wake resumes the VM in place, and the
+/// checkpoint is written ([`Runtime::flush_held`]) only when the agent needs the memory
+/// back, the hold has lasted long enough, or the agent stops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldSleep {
+    pub orb: OrbId,
+    pub checkpoint: SleepCheckpointRef,
+    /// When the VM was paused (wall clock).
+    pub since_unix_ms: u64,
+    /// Host memory the paused VMM holds now (its anonymous resident memory: what
+    /// writing its checkpoint frees).
+    pub resident_bytes: u64,
+    /// The orb's memory size: what its checkpoint takes on disk once written.
+    pub memory_bytes: u64,
+}
+
+/// What [`Runtime::flush_held`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// The checkpoint was written and the VMM stopped: the orb sleeps on disk.
+    Written,
+    /// The orb is not held (woken, deleted, or written already).
+    NotHeld,
+    /// The held VMM was gone (killed, or the host lost it): the orb is stopped without a
+    /// checkpoint, its disk as the guest synced it before the pause.
+    Lost,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogStream {
     Stdout,
@@ -184,15 +214,42 @@ pub trait Runtime: Send + Sync {
 
     /// Saves memory to a new checkpoint generation, stops and reaps the VMM, then
     /// atomically publishes the checkpoint. Never returns Ok while the source can run.
+    ///
+    /// With `hold`, a runtime that can (Firecracker) instead pauses the VM in place once
+    /// the guest synced its disk, durably records the hold and returns: the orb sleeps
+    /// on `checkpoint_generation` held in RAM ([`HeldSleep`]) until it is woken (resumed
+    /// in place by `start` from that checkpoint) or [`flush_held`](Self::flush_held)
+    /// writes the checkpoint. Others ignore `hold`.
     async fn checkpoint_and_stop(
         &self,
         orb: &OrbDefinition,
         checkpoint_generation: u64,
+        hold: bool,
         ctx: &OpContext,
     ) -> Result<SleepCheckpointRef, RuntimeError>;
 
     /// Stops the orb without saving memory (processes lost). Idempotent.
     async fn cold_stop(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), RuntimeError>;
+
+    /// Orbs asleep in RAM (see [`HeldSleep`]). Cheap: no orb lock, no VMM call.
+    fn held(&self) -> Vec<HeldSleep> {
+        Vec::new()
+    }
+
+    /// Whether `checkpoint_and_stop`'s `hold` does anything here.
+    fn holds_sleeps(&self) -> bool {
+        false
+    }
+
+    /// Writes a held sleep's checkpoint exactly as an unheld sleep would, then stops the
+    /// VMM, freeing its memory. A failed write leaves the orb held.
+    async fn flush_held(
+        &self,
+        _orb: &OrbDefinition,
+        _ctx: &OpContext,
+    ) -> Result<FlushOutcome, RuntimeError> {
+        Ok(FlushOutcome::NotHeld)
+    }
 
     /// Removes a checkpoint, marking it consumed first so it is never restored: one that
     /// `start` already consumed, or (agent maintenance, orb stopped) one dropped so that

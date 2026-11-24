@@ -244,6 +244,12 @@ struct AgentArgs {
     /// its next wake (disk kept, processes lost) [default: 0, checkpoints are kept].
     #[arg(long, env = "ORBD_CHECKPOINT_MAX_AGE_HOURS")]
     checkpoint_max_age_hours: Option<u64>,
+    /// Keep a sleeping Firecracker orb's memory in RAM this long before writing its
+    /// checkpoint: a wake within it resumes in place and writes nothing. Held memory is
+    /// written as soon as another orb needs it, and when the agent stops; 0 writes every
+    /// checkpoint at once [default: 20].
+    #[arg(long, env = "ORBD_SLEEP_HOLD_MINUTES")]
+    sleep_hold_minutes: Option<u64>,
     /// Prometheus listener, e.g. `127.0.0.1:9465`.
     #[arg(long, env = "ORBD_METRICS_LISTEN")]
     metrics_listen: Option<std::net::SocketAddr>,
@@ -543,6 +549,8 @@ fn main() -> anyhow::Result<()> {
             s.checkpoint_max_age = orbd::config::agent::AgentSection::checkpoint_max_age_hours(
                 a.checkpoint_max_age_hours,
             );
+            s.sleep_hold =
+                orbd::config::agent::AgentSection::sleep_hold_minutes(a.sleep_hold_minutes);
             // Only `true` turned it on (0.3.0 took `true` or `false`).
             match a.allow_private_egress.as_deref() {
                 Some("true") => anyhow::bail!(

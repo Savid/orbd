@@ -1,0 +1,9 @@
+[Unit]
+Description=orbd test: service watchdogs across sleeps
+
+[Service]
+ExecStart=/usr/local/bin/orbd-test-watchdog
+StandardOutput=file:/dev/console
+
+[Install]
+WantedBy=multi-user.target

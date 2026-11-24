@@ -143,7 +143,8 @@ wait_for 30 "the dispatch socket" docker exec "$coord" test -S /var/lib/orbd/dis
 coord_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$coord")
 token=$(docker exec "$coord" orbd join-token agent-1)
 # Exactly the documented agent flags (README): no --privileged. The amd64 QEMU offering
-# gives its orb /dev/kvm, which agents allow only with ORBD_NESTED_KVM=true.
+# gives its orb /dev/kvm, which agents allow only with ORBD_NESTED_KVM=true. Sleeps are
+# written at once (no hold in RAM) so a paused orb has no VMM; the KVM gates cover holds.
 docker run -d --name "$agent" --network "$id" --stop-timeout 300 \
     --cap-add SYS_ADMIN --cap-add NET_ADMIN --device /dev/kvm --device /dev/net/tun \
     --security-opt apparmor=unconfined --security-opt systempaths=unconfined \
@@ -151,7 +152,7 @@ docker run -d --name "$agent" --network "$id" --stop-timeout 300 \
     -v "$rootfs:/fixture/rootfs.ext4:ro" -e "ORBD_JOIN=$token" -e ORBD_DISK_RESERVE_GIB=2 \
     -e ORBD_AGENT_CONFIG=/etc/orbd/agent.yaml -e ORBD_GUEST_NETWORK=10.200.0.0/24 \
     -e "ORBD_EGRESS_ALLOW=tcp:$coord_ip:7443," -e ORBD_NESTED_KVM=true \
-    "$image" agent >/dev/null
+    -e ORBD_SLEEP_HOLD_MINUTES=0 "$image" agent >/dev/null
 wait_for 60 "the agent to connect" connected
 agent_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$agent")
 echo "== agent-1 connected ($agent_ip)"

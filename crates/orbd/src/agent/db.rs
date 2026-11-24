@@ -650,8 +650,7 @@ pub fn get_orb_claimed(conn: &Connection, orb: OrbId) -> rusqlite::Result<Option
 }
 
 /// The most recent definition of `orb` the agent has accepted work for (the flow log's
-/// Amp ids).
-#[cfg(target_os = "linux")]
+/// Amp ids; maintenance of one orb).
 pub fn get_orb_definition(
     conn: &Connection,
     orb: OrbId,

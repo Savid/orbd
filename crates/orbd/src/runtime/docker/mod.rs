@@ -322,6 +322,7 @@ impl Runtime for DockerRuntime {
         &self,
         _orb: &OrbDefinition,
         _checkpoint_generation: u64,
+        _hold: bool,
         _ctx: &OpContext,
     ) -> Result<SleepCheckpointRef, RuntimeError> {
         Err(RuntimeError::Unsupported(

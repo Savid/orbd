@@ -285,6 +285,7 @@ impl Runtime for FakeRuntime {
         &self,
         orb: &OrbDefinition,
         checkpoint_generation: u64,
+        _hold: bool,
         ctx: &OpContext,
     ) -> Result<SleepCheckpointRef, RuntimeError> {
         check_ctx(ctx)?;
