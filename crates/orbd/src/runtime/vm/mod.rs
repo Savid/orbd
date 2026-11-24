@@ -46,6 +46,34 @@ pub fn mark_used(dir: &Path) {
     }
 }
 
+/// When a base disk directory was last marked used since its publication, if ever.
+pub fn marked_used(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir.join(LAST_USED))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// The guest size of an orb. Amp keeps one project snapshot per orb size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrbSize {
+    pub vcpus: u32,
+    pub memory_bytes: u64,
+}
+
+/// Where an orb's disk came from, by its recipe (`vm.json`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiskOrigin {
+    /// The project snapshot it was created from (None: an image).
+    pub project: Option<String>,
+    pub size: OrbSize,
+}
+
+/// Counts an orb whose disk was created from its image although it was placed for a
+/// project snapshot (`reason`: `missing`, `lineage`), once its disk exists.
+pub fn count_snapshot_fallback(reason: &'static str) {
+    metrics::counter!("orbd_project_snapshot_fallbacks_total", "reason" => reason).increment(1);
+}
+
 /// When a base disk directory was last used: published, or used since.
 pub fn last_used(dir: &Path) -> std::io::Result<std::time::SystemTime> {
     let published = std::fs::metadata(dir)?.modified()?;
@@ -313,7 +341,9 @@ pub async fn initial_source(
 /// `write_raw` fills a standalone raw disk in staging (an empty file lent to `tools`),
 /// which is shrunk to its used size (by `tools`), taken back, made read-only (0444),
 /// fsynced and renamed into place. The format is the same for every VM runtime.
-/// `lineage` is the source orb's (see [`project_lineage`]).
+/// `lineage` is the source orb's (see [`project_lineage`]); `parent` the project snapshot
+/// its disk was created from (None: an image) and `size` its size, which garbage
+/// collection uses to tell when the new snapshot supersedes its parent.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
     ctx: &OpContext,
@@ -321,6 +351,8 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
     key: &ProjectSnapshotKey,
     source_orb: OrbId,
     lineage: Option<String>,
+    parent: Option<&ProjectSnapshotKey>,
+    size: OrbSize,
     tools: &disktools::DiskTools<'_>,
     write_raw: impl FnOnce(PathBuf) -> F,
 ) -> Result<(), RuntimeError> {
@@ -348,6 +380,8 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
             "key": key,
             "source_orb": source_orb,
             "lineage": lineage,
+            "parent": parent,
+            "size": size,
             "created_unix_ms": crate::model::unix_ms_now(),
             "bytes": std::fs::metadata(&raw).map(|m| m.len()).unwrap_or(0),
         });

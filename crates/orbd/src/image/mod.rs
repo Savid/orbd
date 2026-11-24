@@ -110,6 +110,21 @@ struct RefRecord {
     image_ref: String,
     manifest_digest: String,
     resolved_unix: u64,
+    /// The lineage of the image it resolved to, once prepared (records written before
+    /// lineages were recorded have none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lineage: Option<RefLineage>,
+}
+
+/// A reference's [`lineage`], as of the last time it resolved to a prepared image.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RefLineage {
+    /// The image's lineage (None: it has none, see [`PreparedImage::lineage`]).
+    lineage: Option<String>,
+    /// The [`integration::GUEST_LINEAGE`] it was computed with.
+    guest: u32,
+    /// Since when the reference has resolved to images of this lineage.
+    since_unix: u64,
 }
 
 enum Job {
@@ -456,6 +471,46 @@ impl ImageStore {
         trashed
     }
 
+    /// The lineages a project snapshot must descend from to stand in for an image here:
+    /// those of the images references resolve to, for every reference resolved or used
+    /// within `window`, whether or not its image is prepared for this build. None
+    /// (nothing can be told dead) if no reference qualifies, or if one's lineage is not
+    /// known for this orbd's [`integration::GUEST_LINEAGE`], is none (any snapshot then
+    /// stands in for its image), or changed within `settle` (it may yet go back).
+    /// Reads only what is on disk.
+    pub fn current_lineages(&self, window: Duration, settle: Duration) -> Option<HashSet<String>> {
+        let now = now_unix();
+        let mut out = HashSet::new();
+        let refs = self.inner.images.join("refs");
+        for e in std::fs::read_dir(&refs).into_iter().flatten().flatten() {
+            let Some(r) = std::fs::read(e.path())
+                .ok()
+                .and_then(|b| serde_json::from_slice::<RefRecord>(&b).ok())
+            else {
+                continue;
+            };
+            if e.path() != self.ref_path(&r.image_ref) {
+                continue;
+            }
+            let image = self.inner.images.join(self.cache_key(&r.manifest_digest));
+            let used = crate::runtime::vm::last_used(&image)
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            if now.saturating_sub(r.resolved_unix.max(used)) > window.as_secs() {
+                continue;
+            }
+            let l = r.lineage?;
+            if l.guest != integration::GUEST_LINEAGE
+                || now.saturating_sub(l.since_unix) < settle.as_secs()
+            {
+                return None;
+            }
+            out.insert(l.lineage?);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     fn cache_key(&self, manifest_digest: &str) -> String {
         sha256_hex(
             format!(
@@ -504,13 +559,8 @@ impl ImageStore {
         set("resolving");
         let resolved = registry::resolve(&self.inner.client, image_ref).await?;
         let digest = resolved.manifest_digest.clone();
-        let record = RefRecord {
-            image_ref: image_ref.to_owned(),
-            manifest_digest: digest.clone(),
-            resolved_unix: now_unix(),
-        };
         if let Some(image) = self.published(image_ref, &digest) {
-            write_json_atomic(&self.ref_path(image_ref), &record).map_err(|e| e.to_string())?;
+            self.write_ref(image_ref, &image)?;
             return Ok(image);
         }
         let key = self.cache_key(&digest);
@@ -526,9 +576,38 @@ impl ImageStore {
         if self.published(image_ref, &digest).is_none() {
             self.build(&resolved, &key, &set).await?;
         }
-        write_json_atomic(&self.ref_path(image_ref), &record).map_err(|e| e.to_string())?;
-        self.published(image_ref, &digest)
-            .ok_or_else(|| format!("image {key} vanished after publication"))
+        let image = self
+            .published(image_ref, &digest)
+            .ok_or_else(|| format!("image {key} vanished after publication"))?;
+        self.write_ref(image_ref, &image)?;
+        Ok(image)
+    }
+
+    /// Records that `image_ref` resolves to the prepared `image` now.
+    fn write_ref(&self, image_ref: &str, image: &PreparedImage) -> Result<(), String> {
+        let record = self.ref_record(image_ref, image, now_unix());
+        write_json_atomic(&self.ref_path(image_ref), &record).map_err(|e| e.to_string())
+    }
+
+    /// The record of `image_ref` resolving to `image` at `now`: its lineage is current
+    /// since the previous record's time if that one names the same lineage.
+    fn ref_record(&self, image_ref: &str, image: &PreparedImage, now: u64) -> RefRecord {
+        let guest = integration::GUEST_LINEAGE;
+        let since_unix = self
+            .read_ref(image_ref)
+            .and_then(|r| r.lineage)
+            .filter(|l| l.guest == guest && l.lineage == image.lineage)
+            .map_or(now, |l| l.since_unix);
+        RefRecord {
+            image_ref: image_ref.to_owned(),
+            manifest_digest: image.manifest_digest.clone(),
+            resolved_unix: now,
+            lineage: Some(RefLineage {
+                lineage: image.lineage.clone(),
+                guest,
+                since_unix,
+            }),
+        }
     }
 
     /// Runs `umoci --version` in the image sandbox (Linux, sandbox on, no builder), so an
@@ -726,6 +805,7 @@ mod tests {
                 image_ref: prewarmed_ref.into(),
                 manifest_digest: "sha256:current".into(),
                 resolved_unix: now_unix(),
+                lineage: None,
             },
         )
         .unwrap();
@@ -770,5 +850,157 @@ mod tests {
         want.sort();
         assert_eq!(left, want);
         assert!(!blobs.join("old").exists() && blobs.join("new").exists());
+    }
+
+    const HOUR: u64 = 3600;
+    const WINDOW: Duration = Duration::from_secs(72 * HOUR);
+    const SETTLE: Duration = Duration::from_secs(12 * HOUR);
+
+    /// A store with no prewarmed images (nothing resolves in tests).
+    fn quiet_store(tmp: &Path) -> (ImageStore, PathBuf) {
+        let helper = tmp.join("orbd-guest");
+        std::fs::write(&helper, b"\x7fELF test").unwrap();
+        let mut config = crate::config::agent::AgentConfig::default().images.unwrap();
+        config.guest_helper = helper;
+        config.prewarm = Vec::new();
+        let state = tmp.join("state");
+        (ImageStore::open(&config, &state).unwrap(), state)
+    }
+
+    /// Files a reference record as the store would (or under another file name).
+    fn record(store: &ImageStore, r: &RefRecord, file: Option<&str>) {
+        let path = match file {
+            Some(f) => store.inner.images.join("refs").join(f),
+            None => store.ref_path(&r.image_ref),
+        };
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_json_atomic(&path, r).unwrap();
+    }
+
+    fn resolved(
+        image_ref: &str,
+        lineage: Option<&str>,
+        guest: u32,
+        age: u64,
+        since: u64,
+    ) -> RefRecord {
+        let now = now_unix();
+        RefRecord {
+            image_ref: image_ref.into(),
+            manifest_digest: format!("sha256:{image_ref}"),
+            resolved_unix: now - age,
+            lineage: Some(RefLineage {
+                lineage: lineage.map(str::to_owned),
+                guest,
+                since_unix: now - since,
+            }),
+        }
+    }
+
+    /// Current lineages come from the references' records, prepared for this build or
+    /// not (an orbd upgrade changes every image's cache key, not its lineage), for
+    /// references resolved or used within the window. Any doubt (a record without a
+    /// lineage, one of another guest lineage, an image without one, a lineage that
+    /// changed lately) makes the whole answer unknown.
+    #[tokio::test]
+    async fn current_lineages_are_known_only_without_doubt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _) = quiet_store(tmp.path());
+        let guest = integration::GUEST_LINEAGE;
+        let lineages = || store.current_lineages(WINDOW, SETTLE);
+        assert_eq!(lineages(), None, "nothing resolved yet");
+
+        // Neither image is prepared for this build: their records still say.
+        record(
+            &store,
+            &resolved("a:latest", Some("la"), guest, HOUR, 50 * HOUR),
+            None,
+        );
+        record(
+            &store,
+            &resolved("b:latest", Some("lb"), guest, 70 * HOUR, 80 * HOUR),
+            None,
+        );
+        // Resolved, and its image unused, longer ago than the window: left out.
+        record(
+            &store,
+            &resolved("old:latest", None, guest, 80 * HOUR, 90 * HOUR),
+            None,
+        );
+        // Filed under another reference's name: left out.
+        record(
+            &store,
+            &resolved("c:latest", None, guest, HOUR, 50 * HOUR),
+            Some("x.json"),
+        );
+        let want = HashSet::from(["la".to_owned(), "lb".to_owned()]);
+        assert_eq!(lineages(), Some(want.clone()));
+
+        let doubts = [
+            (
+                "an image without a lineage",
+                resolved("d:latest", None, guest, HOUR, 50 * HOUR),
+            ),
+            (
+                "another guest lineage",
+                resolved("d:latest", Some("ld"), guest + 1, HOUR, 50 * HOUR),
+            ),
+            (
+                "a lineage that changed lately",
+                resolved("d:latest", Some("ld"), guest, HOUR, HOUR),
+            ),
+            (
+                "a record without a lineage",
+                RefRecord {
+                    lineage: None,
+                    ..resolved("d:latest", None, guest, HOUR, 0)
+                },
+            ),
+        ];
+        for (what, r) in doubts {
+            record(&store, &r, None);
+            assert_eq!(lineages(), None, "{what}");
+        }
+        // Its image used lately keeps an old record in.
+        let used = store
+            .inner
+            .images
+            .join(store.cache_key("sha256:old:latest"));
+        std::fs::create_dir_all(&used).unwrap();
+        crate::runtime::vm::mark_used(&used);
+        std::fs::remove_file(store.ref_path("d:latest")).unwrap();
+        assert_eq!(lineages(), None, "old:latest has no lineage");
+    }
+
+    /// A reference's lineage stays current since it first resolved to it, across
+    /// digests and builds of the same guest lineage; another lineage starts it again.
+    #[tokio::test]
+    async fn ref_records_keep_since_while_the_lineage_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, _) = quiet_store(tmp.path());
+        let image = |digest: &str, lineage: &str| PreparedImage {
+            key: "k".into(),
+            image_ref: "a:latest".into(),
+            manifest_digest: digest.into(),
+            rootfs: "/nonexistent".into(),
+            rootfs_bytes: 0,
+            lineage: Some(lineage.into()),
+        };
+        let since = |r: &RefRecord| r.lineage.as_ref().unwrap().since_unix;
+        let first = store.ref_record("a:latest", &image("sha256:1", "l1"), 1000);
+        assert_eq!(since(&first), 1000);
+        record(&store, &first, None);
+        let rebuilt = store.ref_record("a:latest", &image("sha256:2", "l1"), 2000);
+        assert_eq!((since(&rebuilt), rebuilt.resolved_unix), (1000, 2000));
+        record(&store, &rebuilt, None);
+        let moved = store.ref_record("a:latest", &image("sha256:3", "l2"), 3000);
+        assert_eq!(since(&moved), 3000);
+        let mut other_guest = rebuilt;
+        other_guest.lineage.as_mut().unwrap().guest += 1;
+        record(&store, &other_guest, None);
+        assert_eq!(
+            since(&store.ref_record("a:latest", &image("sha256:2", "l1"), 4000)),
+            4000
+        );
     }
 }

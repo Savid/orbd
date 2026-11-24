@@ -198,6 +198,22 @@ pub(crate) fn recipe_bases(json: &[u8]) -> Option<Vec<String>> {
     Some(bases)
 }
 
+/// Where a QEMU orb's disk came from, by its `vm.json` (the source its recipe declares;
+/// one that does not parse counts as an image); None if `json` is not a QEMU recipe.
+pub(crate) fn recipe_origin(json: &[u8]) -> Option<super::vm::DiskOrigin> {
+    let recipe: VmRecipe = serde_json::from_slice(json).ok()?;
+    Some(super::vm::DiskOrigin {
+        project: match serde_json::from_str(&recipe.base.source) {
+            Ok(BaseSource::ProjectSnapshot { key }) => Some(key.0),
+            _ => None,
+        },
+        size: super::vm::OrbSize {
+            vcpus: recipe.vcpus,
+            memory_bytes: recipe.memory_bytes,
+        },
+    })
+}
+
 /// `checkpoints/<gen>/manifest.json`. Its presence in a `.tmp` directory marks the
 /// memory file complete (QMP `completed`, stream EOF, fsync).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -905,7 +921,9 @@ impl QemuRuntime {
     ) -> Result<(), RuntimeError> {
         // Until the published recipe names the base, garbage collection must not take it.
         let _bases = bounded(ctx, super::vm::BASES.read()).await?;
+        let requested_snapshot = matches!(src, InitialDiskSource::ProjectSnapshot { .. });
         let src = super::vm::initial_source(&*self.images, &self.state_dir, src, ctx).await;
+        let passed_over = requested_snapshot && matches!(src, InitialDiskSource::Image { .. });
         let (base_path, source, lineage) = match src {
             InitialDiskSource::Image { image_ref } => {
                 let img = self
@@ -1026,6 +1044,9 @@ impl QemuRuntime {
                 self.undo_create(orb.id, Some(&staging));
             }
             return Err(e);
+        }
+        if passed_over {
+            super::vm::count_snapshot_fallback("lineage");
         }
         Ok(())
     }
@@ -1631,12 +1652,23 @@ impl Runtime for QemuRuntime {
         }
         let tools = super::vm::disktools::DiskTools::new(self.jail.as_ref().zip(ids));
         let (tools_ref, base, disk_bytes) = (&tools, recipe.base.path.clone(), recipe.disk_bytes);
+        let size = super::vm::OrbSize {
+            vcpus: recipe.vcpus,
+            memory_bytes: recipe.memory_bytes,
+        };
+        // The source the recipe declares: its base, which the new snapshot supersedes.
+        let parent = match serde_json::from_str(&recipe.base.source) {
+            Ok(BaseSource::ProjectSnapshot { key }) => Some(key),
+            _ => None,
+        };
         publish_project(
             ctx,
             &self.state_dir,
             key,
             orb.id,
             recipe.lineage,
+            parent.as_ref(),
+            size,
             &tools,
             |raw: PathBuf| async move {
                 std::fs::OpenOptions::new()

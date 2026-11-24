@@ -387,6 +387,9 @@ impl Inner {
                         .set(d.total_bytes as f64);
                     metrics::gauge!("orbd_agent_disk_allocated_bytes", "agent" => a)
                         .set(d.allocated_bytes as f64);
+                    for key in &hb.deleted_project_snapshot_keys {
+                        slot.snapshots.remove(key);
+                    }
                     slot.heartbeat = Some((hb, Instant::now()));
                 }
             }

@@ -462,6 +462,9 @@ message Heartbeat {
   // Bytes allocated per orb directory (its disk, checkpoints and logs), measured with
   // disk_allocated_bytes (blocks a cloned disk shares with its image count in full).
   repeated OrbDiskUsage orb_disk = 11;
+  // Project snapshots the agent deleted since its previous heartbeat: it no longer
+  // holds them (Hello lists the ones it holds when a session starts).
+  repeated string deleted_project_snapshot_keys = 12;
 }
 
 message OrbDiskUsage {
