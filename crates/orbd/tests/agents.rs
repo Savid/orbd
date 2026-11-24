@@ -334,9 +334,24 @@ fn restricted_egress_goes_only_to_agents_that_enforce_it() {
     assert_ok(&c.dispatch("delete", "amp-3", &[]), "delete");
 }
 
+/// The coordinator's log line for a new orb that names a project snapshot but starts
+/// from its image.
+const SNAPSHOT_MISS: &str = "project snapshot miss: the new orb starts from its image";
+
+/// The coordinator's count of new orbs naming a project snapshot, by `result`.
+fn placements(c: &Cluster, result: &str) -> u64 {
+    let want = format!("orbd_project_snapshot_placements_total{{result=\"{result}\"}} ");
+    c.metrics()
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix(&want)?.parse().ok())
+        .unwrap_or(0)
+}
+
 /// A new orb that names a project snapshot goes to a host holding it; the coordinator
 /// counts each such placement by whether it hit, missed because the hosts holding the
-/// snapshot could not take the orb, or missed because none holds it, and logs a miss.
+/// snapshot could not take the orb (one stopped, one full), or missed because none
+/// holds it, and logs each miss. An agent's deletions reach the coordinator.
 #[test]
 fn project_snapshot_placements_are_counted() {
     let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
@@ -355,27 +370,82 @@ fn project_snapshot_placements_are_counted() {
         c.fake_orb(holder, "amp-2").running,
         "amp-2 goes where project-1 is"
     );
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake amp-1");
+    assert_ok(&c.dispatch("spawn", "amp-3", &snap), "amp-3");
+    assert!(
+        c.fake_orb(other, "amp-3").running,
+        "{holder} is full (amp-1, amp-2): amp-3 goes to {other}"
+    );
     assert_ok(
-        &c.dispatch("spawn", "amp-3", &[("ORB_SNAPSHOT_ID", "project-2")]),
-        "amp-3",
+        &c.dispatch("spawn", "amp-4", &[("ORB_SNAPSHOT_ID", "project-2")]),
+        "amp-4",
     );
     c.terminate_agent(holder, Duration::from_secs(30));
     c.wait_connected(1);
-    assert_ok(&c.dispatch("spawn", "amp-4", &snap), "amp-4");
+    assert_ok(&c.dispatch("delete", "amp-3", &[]), "delete amp-3");
+    assert_ok(&c.dispatch("spawn", "amp-5", &snap), "amp-5");
     assert!(
-        c.fake_orb(other, "amp-4").running,
-        "amp-4 goes to {other}: {holder} is gone"
+        c.fake_orb(other, "amp-5").running,
+        "amp-5 goes to {other}: {holder} is gone"
     );
 
-    let metrics = c.metrics().unwrap_or_default();
-    for (result, n) in [("hit", 1), ("absent", 1), ("elsewhere", 1)] {
-        let line = format!("orbd_project_snapshot_placements_total{{result=\"{result}\"}} {n}");
-        assert!(metrics.contains(&line), "no {line:?} in:\n{metrics}");
-    }
-    let logs = c.logs();
+    let got: Vec<u64> = ["hit", "elsewhere", "absent", "unsupported"]
+        .iter()
+        .map(|r| placements(&c, r))
+        .collect();
+    assert_eq!(got, [1, 2, 1, 0], "hit, elsewhere, absent, unsupported");
     assert_eq!(
-        logs.matches("project snapshot miss").count(),
-        2,
+        c.logs().matches(SNAPSHOT_MISS).count(),
+        3,
         "one log line per miss"
     );
+}
+
+/// The hosts that hold a project snapshot count whatever keeps them from taking the
+/// orb: an overflow agent that holds it is passed over while another agent fits, and an
+/// agent of another architecture (a spill target's) holds it for none of the first
+/// offering's orbs.
+#[test]
+fn snapshot_misses_count_overflow_and_other_architectures() {
+    let mut c = Cluster::new(&["amd"], 1);
+    let path = c.root().join("coordinator.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let head = yaml.split("offerings:").next().unwrap();
+    let fake = "runtime: fake\n    resources: { vcpus: 2, memory_mib: 2048, disk_gib: 4 }";
+    std::fs::write(
+        &path,
+        format!(
+            "{head}offerings:\n  - id: {OFFERING}\n    {fake}\n    spill_to: [{OFFERING}@arm64]\n\
+             \x20 - id: {OFFERING}@arm64\n    {fake}\n    arch: arm64\n"
+        ),
+    )
+    .unwrap();
+    c.set_agent_yaml(
+        "mac",
+        "runtime:\n  fake:\n    memory_preserving_sleep: true\n    arch: arm64\n    \
+         disk: { free_gib: 1000, total_gib: 2000 }\n",
+    );
+    c.start_all();
+    c.start_agent_with_env(
+        "mac",
+        &[
+            ("ORBD_OVERFLOW", "true"),
+            ("ORBD_CAPACITY_VCPUS", "4"),
+            ("ORBD_CAPACITY_MEMORY_MIB", "4096"),
+        ],
+    );
+    c.wait_connected(2);
+    let snap = [("ORB_SNAPSHOT_ID", "project-1")];
+
+    // amd is full: amp-2 spills to the (overflow, arm64) Mac, which publishes project-1.
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1");
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "amp-2");
+    assert!(c.fake_orb("mac", "amp-2").running, "amp-2 spilled to mac");
+    assert_ok(&c.dispatch("pause", "amp-2", &snap), "publish project-1");
+    // Room on amd again: a new orb naming project-1 goes there, not to the Mac.
+    assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete amp-1");
+    assert_ok(&c.dispatch("spawn", "amp-3", &snap), "amp-3");
+    assert!(c.fake_orb("amd", "amp-3").running, "amp-3 goes to amd");
+    assert_eq!(placements(&c, "elsewhere"), 1);
+    assert_eq!(placements(&c, "absent"), 0);
 }

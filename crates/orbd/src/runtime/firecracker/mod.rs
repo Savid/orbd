@@ -136,13 +136,20 @@ pub(crate) fn recipe_bases(json: &[u8]) -> Option<Vec<String>> {
     Some(Vec::new())
 }
 
-/// The project snapshot an orb's disk was created from, by its `vm.json` (inner None:
-/// an image); None if `json` is not a recipe of this runtime.
-pub(crate) fn recipe_project(json: &[u8]) -> Option<Option<String>> {
-    match serde_json::from_slice::<VmRecipe>(json).ok()?.source {
-        DiskSource::ProjectSnapshot { key } => Some(Some(key.0)),
-        DiskSource::Image { .. } => Some(None),
-    }
+/// Where an orb's disk came from, by its `vm.json`; None if `json` is not a recipe of
+/// this runtime.
+pub(crate) fn recipe_origin(json: &[u8]) -> Option<super::vm::DiskOrigin> {
+    let r = serde_json::from_slice::<VmRecipe>(json).ok()?;
+    Some(super::vm::DiskOrigin {
+        project: match r.source {
+            DiskSource::ProjectSnapshot { key } => Some(key.0),
+            DiskSource::Image { .. } => None,
+        },
+        size: super::vm::OrbSize {
+            vcpus: r.vcpus,
+            memory_bytes: r.memory_bytes,
+        },
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -798,7 +805,9 @@ impl FirecrackerRuntime {
     ) -> Result<(), RuntimeError> {
         // Until the published recipe names the base, garbage collection must not take it.
         let _bases = bounded(ctx, super::vm::BASES.read()).await?;
+        let requested_snapshot = matches!(src, InitialDiskSource::ProjectSnapshot { .. });
         let src = super::vm::initial_source(&*self.images, &self.state_dir, src, ctx).await;
+        let passed_over = requested_snapshot && matches!(src, InitialDiskSource::Image { .. });
         let (base, source, lineage) = match src {
             InitialDiskSource::Image { image_ref } => {
                 let img = self
@@ -907,6 +916,9 @@ impl FirecrackerRuntime {
                 self.undo_create(orb.id, &staging);
             }
             return Err(e);
+        }
+        if passed_over {
+            super::vm::count_snapshot_fallback("lineage");
         }
         Ok(())
     }
@@ -1454,6 +1466,10 @@ impl Runtime for FirecrackerRuntime {
             orb.id,
             recipe.lineage,
             parent,
+            super::vm::OrbSize {
+                vcpus: recipe.vcpus,
+                memory_bytes: recipe.memory_bytes,
+            },
             &tools,
             |raw: PathBuf| async move { copy_disk(ctx, &disk, &raw).await },
         )

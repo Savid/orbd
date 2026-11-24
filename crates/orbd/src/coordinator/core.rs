@@ -652,7 +652,11 @@ impl Core {
         {
             return Ok(step);
         }
-        let plan = match self.plan(head, offering.as_ref(), orb.as_ref()).await? {
+        let mut snapshot_report = None;
+        let plan = match self
+            .plan(head, offering.as_ref(), orb.as_ref(), &mut snapshot_report)
+            .await?
+        {
             Ok(p) => p,
             Err(r) if wakes && r.code == FailureCode::BackendUnavailable => {
                 return match self.hold(head, orb.as_ref(), Some(r.clone())).await? {
@@ -670,6 +674,9 @@ impl Core {
         let (generation, orb_id) = (p.generation, p.orb_id);
         self.db.call(move |c| store::create_command(c, &p)).await?;
         crate::crash_point!("coordinator::command_committed");
+        if let Some(r) = snapshot_report {
+            r.report(&head.amp_orb_id);
+        }
         self.announce_accepted(head.invocation_id, op, generation, false, 0);
         tracing::info!(operation = %op, orb = %orb_id, generation, action = head.action.name(), "command created");
         self.submit_command(op).await;
@@ -765,11 +772,14 @@ impl Core {
     }
 
     /// Admission: choose/verify the location and build the atomic creation plan.
+    /// `snapshot_report`: for a new orb that names a project snapshot, where it went as
+    /// far as the snapshot goes, to report once the command is committed.
     async fn plan(
         &mut self,
         head: &Req,
         offering: Option<&Offering>,
         orb: Option<&OrbRecord>,
+        snapshot_report: &mut Option<SnapshotReport>,
     ) -> Result<std::result::Result<CreatePlan, Refusal>> {
         let op = OperationId::generate();
         let digest_fp = head.fingerprint.clone();
@@ -943,9 +953,15 @@ impl Core {
                     Ok(p) => p,
                     Err(r) => return Ok(Err(r)),
                 };
-                let snapshot_placement = snap_key
-                    .as_ref()
-                    .map(|k| (k, SnapshotPlacement::of(chosen.has_project_snapshot, held)));
+                let snapshot_placement = snap_key.as_ref().map(|k| SnapshotReport {
+                    placement: SnapshotPlacement::of(
+                        chosen.has_project_snapshot,
+                        chosen.capabilities.project_snapshots != SnapshotCapability::Unsupported,
+                        held,
+                    ),
+                    snapshot: k.as_str().get(..12).unwrap_or(k.as_str()).to_owned(),
+                    host: chosen.capacity_pool.clone(),
+                });
                 let initial_disk = match &snap_key {
                     Some(k) if chosen.has_project_snapshot => InitialDiskSource::ProjectSnapshot {
                         snapshot: ProjectSnapshotRef { key: k.clone() },
@@ -995,9 +1011,7 @@ impl Core {
                         )));
                     }
                 }
-                if let Some((key, placement)) = snapshot_placement {
-                    placement.report(&head.amp_orb_id, key, &chosen.capacity_pool);
-                }
+                *snapshot_report = snapshot_placement;
                 Ok(Ok(plan))
             }
         }
@@ -1005,7 +1019,8 @@ impl Core {
 
     /// Places a new orb of `offering` on one of its backend's hosts: the chosen
     /// candidate, what the orb reserves there, and the spec template it runs with.
-    /// `held` becomes true if any of the backend's hosts holds `snap_key`.
+    /// `held` becomes true if any of the backend's hosts holds `snap_key`, available or
+    /// not, able to run the offering or not.
     async fn place_new(
         &self,
         offering: &Offering,
@@ -2200,49 +2215,67 @@ fn command_digest(plan: &CreatePlan, spec_digest: &SpecDigest) -> String {
 }
 
 /// Where a new orb that names a project snapshot (`ORB_SNAPSHOT_ID`) was placed, as far
-/// as the snapshot goes. A host that held it may still start the orb from its image (it
-/// deleted the snapshot since, or passes it over for another lineage): the agent counts
-/// those in `orbd_project_snapshot_fallbacks_total`.
+/// as the snapshot goes. A host the coordinator believes holds it may still start the
+/// orb from its image (it deleted the snapshot, and the coordinator has not heard yet,
+/// or passes it over for another lineage): the agent counts those in
+/// `orbd_project_snapshot_fallbacks_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SnapshotPlacement {
     /// On a host that holds it.
     Hit,
+    /// On a host of a backend without project snapshots (e.g. Boat).
+    Unsupported,
     /// Elsewhere: the hosts holding it could not take the orb (full, unavailable,
-    /// overflow, or of another offering than the one that placed it).
+    /// overflow, or unable to run its offering).
     Elsewhere,
-    /// No host holds it.
+    /// No host of the backends tried holds it.
     Absent,
 }
 
 impl SnapshotPlacement {
-    fn of(chosen_holds: bool, held: bool) -> Self {
-        match (chosen_holds, held) {
-            (true, _) => Self::Hit,
-            (false, true) => Self::Elsewhere,
-            (false, false) => Self::Absent,
+    fn of(chosen_holds: bool, chosen_supports: bool, held: bool) -> Self {
+        match (chosen_holds, chosen_supports, held) {
+            (true, _, _) => Self::Hit,
+            (false, false, _) => Self::Unsupported,
+            (false, true, true) => Self::Elsewhere,
+            (false, true, false) => Self::Absent,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Hit => "hit",
+            Self::Unsupported => "unsupported",
             Self::Elsewhere => "elsewhere",
             Self::Absent => "absent",
         }
     }
+}
 
-    /// Counts the placement, and logs a miss: the orb starts from its image.
-    fn report(self, amp_orb_id: &impl std::fmt::Display, key: &ProjectSnapshotKey, host: &str) {
-        let result = self.label();
+/// A new orb's [`SnapshotPlacement`], reported once its command is committed.
+#[derive(Debug)]
+struct SnapshotReport {
+    placement: SnapshotPlacement,
+    /// The start of the snapshot's (storage) key.
+    snapshot: String,
+    host: String,
+}
+
+impl SnapshotReport {
+    /// Counts the placement, and logs a miss a host could have avoided.
+    fn report(&self, amp_orb_id: &impl std::fmt::Display) {
+        let result = self.placement.label();
         metrics::counter!("orbd_project_snapshot_placements_total", "result" => result)
             .increment(1);
-        if self != Self::Hit {
-            let snapshot = key.as_str().get(..12).unwrap_or(key.as_str());
+        if matches!(
+            self.placement,
+            SnapshotPlacement::Elsewhere | SnapshotPlacement::Absent
+        ) {
             tracing::info!(
                 %amp_orb_id,
-                snapshot,
+                snapshot = %self.snapshot,
                 result,
-                host,
+                host = %self.host,
                 "project snapshot miss: the new orb starts from its image"
             );
         }
@@ -2254,16 +2287,20 @@ mod tests {
     use super::*;
     use crate::model::{AgentId, BackendId, DiskReport, MemoryReport, RuntimeKind};
 
-    /// A placement on a host holding the snapshot is a hit; elsewhere it is a miss,
-    /// told apart by whether any host held it.
+    /// A placement on a host holding the snapshot is a hit; on a backend without
+    /// snapshots it is unsupported; elsewhere it is a miss, told apart by whether any
+    /// host held it.
     #[test]
     fn snapshot_placements_say_why_they_missed() {
         use SnapshotPlacement as P;
-        assert_eq!(P::of(true, true), P::Hit);
-        assert_eq!(P::of(false, true), P::Elsewhere);
-        assert_eq!(P::of(false, false), P::Absent);
-        let labels: Vec<_> = [P::Hit, P::Elsewhere, P::Absent].map(P::label).into();
-        assert_eq!(labels, ["hit", "elsewhere", "absent"]);
+        assert_eq!(P::of(true, true, true), P::Hit);
+        assert_eq!(P::of(false, false, true), P::Unsupported);
+        assert_eq!(P::of(false, false, false), P::Unsupported);
+        assert_eq!(P::of(false, true, true), P::Elsewhere);
+        assert_eq!(P::of(false, true, false), P::Absent);
+        let all = [P::Hit, P::Unsupported, P::Elsewhere, P::Absent];
+        let labels: Vec<_> = all.map(P::label).into();
+        assert_eq!(labels, ["hit", "unsupported", "elsewhere", "absent"]);
     }
 
     /// A new orb no host can take says why: hosts that could run it but are not

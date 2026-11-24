@@ -93,6 +93,8 @@ pub(crate) struct Shared {
     pub images: Option<crate::image::ImageStore>,
     /// Signalled after an orb was deleted: its base may now be unused.
     pub orb_deleted: tokio::sync::Notify,
+    /// Project snapshots deleted since the last heartbeat, which tells the coordinator.
+    pub deleted_snapshots: Mutex<Vec<String>>,
 }
 
 impl Shared {
@@ -105,6 +107,24 @@ impl Shared {
         {
             s.kill.cancel();
         }
+    }
+
+    /// Notes project snapshots deleted (their records forgotten), for the next heartbeat.
+    pub(crate) fn snapshots_deleted(&self, keys: impl IntoIterator<Item = String>) {
+        let mut d = self
+            .deleted_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        d.extend(keys);
+    }
+
+    /// Notes a project snapshot published (recorded) again: no heartbeat may report it
+    /// deleted from an earlier collection.
+    pub(crate) fn snapshot_published(&self, key: &str) {
+        self.deleted_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k| k != key);
     }
 
     pub(crate) fn reserved_total(&self) -> Resources {
@@ -409,6 +429,7 @@ pub async fn run(
         tasks: TaskTracker::new(),
         images: image_store,
         orb_deleted: tokio::sync::Notify::new(),
+        deleted_snapshots: Mutex::default(),
     });
     tracing::info!(agent = %shared.identity.agent_id, boot_id = %shared.boot_id, "agent starting");
     #[cfg(target_os = "linux")]

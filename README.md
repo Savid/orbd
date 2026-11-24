@@ -338,21 +338,35 @@ snapshot. A snapshot that records no lineage is passed over too, once the image'
 lineage is known. An agent deletes a project snapshot or prepared image once no orb on
 it is built on it and nothing has used it for 72 hours (the current image of a
 prewarmed reference is kept), and image layers no build has used for as long. A
-project snapshot goes sooner when it can no longer be used: after an hour unused once
-its lineage is none of those the agent's images resolve to now (as known from images
-already prepared), and after 12 hours unused once another snapshot on the agent was
-published from an orb created from it, since Amp names the newer one from then on.
+project snapshot goes sooner in two cases:
+- **Dead**, after an hour unused: its lineage is none of those the agent's images
+  resolve to, as recorded when each reference last resolved to a prepared image. Only
+  when every reference resolved or used in the last 72 hours has a known lineage (an
+  image without one keeps every snapshot) that has not changed in the last 12 hours: an
+  image or orbd upgrade rolled back within that keeps the snapshots.
+- **Superseded**, after 12 hours unused: Amp moved on to a newer snapshot published
+  from an orb created from it. The newer one was published later, from an orb of the
+  same size (Amp keeps one per size), was recorded, and has been named since, and
+  nothing used the old one after that. On repositories where Amp keeps a snapshot per
+  member, nothing here can tell whose is whose: a member's next orb may then start from
+  its image.
+
 Only QEMU orbs are built on their base, since their disks read through to it; a
 Firecracker orb's disk is a standalone copy and keeps nothing. It checks at startup,
-hourly and after each orb delete (metric `orbd_project_snapshots_deleted_total{reason}`).
+hourly and after each orb delete, counting deletions in
+`orbd_project_snapshots_deleted_total{reason}` (`idle`, `superseded`, `dead_lineage`),
+and tells the coordinator in its next heartbeat.
 
 The coordinator places a new orb that names a project snapshot on an agent holding
 it when one fits. `orbd_project_snapshot_placements_total{result}` counts these
 placements: `hit`, `elsewhere` (the agents holding it could not take the orb: full,
-down or overflow) and `absent` (none holds it); each miss is logged. An agent counts
-orbs it starts from the image although placed for a snapshot in
-`orbd_project_snapshot_fallbacks_total{reason}`: `missing` (deleted since) or
-`lineage`.
+down, overflow or of another architecture), `absent` (no agent of the backends tried
+holds it) and `unsupported` (placed where project snapshots are not kept, e.g. on
+Boat); each `elsewhere` and `absent` is logged. An agent counts orbs it creates from the
+image although placed for a snapshot, once each, in
+`orbd_project_snapshot_fallbacks_total{reason}`: `missing` (deleted before the
+coordinator heard; a dead snapshot deleted early shows up here rather than under
+`lineage`) or `lineage`.
 
 `prefer` sets where new orbs go, in order: `[local, boat]` (the default) runs them on
 the agents and sends them to Boat when no agent can take them (all full, down or

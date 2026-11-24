@@ -919,6 +919,7 @@ impl Run {
                     .await;
                 // The coordinator placed this orb here for a project snapshot the host
                 // no longer has: start from the spawn's image instead of failing forever.
+                let mut fell_back = false;
                 if let (
                     Err(RuntimeError::NotFound(why)),
                     InitialDiskSource::ProjectSnapshot { image_ref, .. },
@@ -929,8 +930,7 @@ impl Run {
                     )
                 {
                     tracing::warn!(orb_id = %orb_id, %why, image_ref, "project snapshot missing; creating the disk from the image");
-                    metrics::counter!("orbd_project_snapshot_fallbacks_total", "reason" => "missing")
-                        .increment(1);
+                    fell_back = true;
                     self.log(&format!(
                         "{why}; creating the disk from {image_ref} instead"
                     ));
@@ -940,16 +940,23 @@ impl Run {
                     result = self.rt.start(self.orb(), src, &self.ctx).await;
                 }
                 if let Err(e) = result {
-                    if matches!(
+                    let absent = matches!(
                         self.rt.inspect(orb_id).await,
                         Ok(RuntimeObservation::Absent)
-                    ) {
+                    );
+                    if absent {
                         self.sh
                             .db
                             .call(move |c| db::clear_created(c, orb_id))
                             .await?;
+                    } else if fell_back {
+                        // Its disk exists: a later start does not come this way again.
+                        crate::runtime::vm::count_snapshot_fallback("missing");
                     }
                     return Err(e.into());
+                }
+                if fell_back {
+                    crate::runtime::vm::count_snapshot_fallback("missing");
                 }
                 crate::crash_point!("agent::spawn::after_start");
                 StartKind::NewDisk
@@ -1106,6 +1113,7 @@ impl Run {
                         .db
                         .call(move |c| db::record_project_snapshot(c, &k, unix_ms_now()))
                         .await?;
+                    self.sh.snapshot_published(snapshot.key.as_str());
                     crate::crash_point!("agent::pause::after_snapshot");
                     fin.snapshot = SnapshotDisposition::Published { snapshot };
                 }

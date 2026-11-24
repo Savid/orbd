@@ -132,6 +132,14 @@ pub(super) fn heartbeat(sh: &Shared) -> pb::AgentEvent {
         memory_available_bytes: sh.memory_available().unwrap_or(0),
         memory_reserve_bytes: sh.memory_reserve,
         orb_disk: sh.orb_disk.lock().unwrap().clone(),
+        // Sent once: a session that ends before the coordinator saw it starts with a
+        // Hello listing what the agent holds.
+        deleted_project_snapshot_keys: std::mem::take(
+            &mut *sh
+                .deleted_snapshots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        ),
     }))
 }
 
