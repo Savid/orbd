@@ -185,11 +185,12 @@ jobs:
           - part: crash
             gates: agent_crash_at_publication_boundaries
           - part: sleep
-            gates: sleep_preserves spawn_boots_from_project_snapshot restricted_egress
+            gates: sleep_preserves spawn_boots_from_project_snapshot restricted_egress held_sleeps
           - part: rest
             gates: >-
               --skip agent_crash_at_publication_boundaries --skip sleep_preserves
               --skip spawn_boots_from_project_snapshot --skip restricted_egress
+              --skip held_sleeps
           - suite: container
     env:
       ROOTFS: kvm-guest/rootfs.ext4

@@ -301,14 +301,36 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     // Linux only: Firecracker, and the per-orb network namespaces that Firecracker orbs
     // and (on an agent running as root) QEMU orbs get, which need `ip` and `nft`.
     if cfg!(target_os = "linux") {
+        // 1.17 or later: drives with discard.
         r.line(
-            first_line(&firecracker, &["--version"]),
+            first_line(&firecracker, &["--version"]).and_then(|l| {
+                let v = l.trim_start_matches("Firecracker v");
+                let mut p = v.split(['.', '-']).map(|n| n.parse::<u64>().unwrap_or(0));
+                match (p.next().unwrap_or(0), p.next().unwrap_or(0)) >= (1, 17) {
+                    true => Ok(l),
+                    false => Err(format!("{l}: orbd needs 1.17 or later for disk discard")),
+                }
+            }),
             "firecracker",
             false,
         );
         let root = nix::unistd::geteuid().is_root();
         r.line(first_line(Path::new("ip"), &["-V"]), "ip", root);
         r.line(first_line(Path::new("nft"), &["--version"]), "nft", root);
+        // Archives of stopped Firecracker orbs' disks: required once any exists (it
+        // restores them), else without it they are not archived.
+        let state = std::env::var_os("ORBD_STATE_DIR")
+            .map_or("/var/lib/orbd".into(), std::path::PathBuf::from);
+        let archived = std::fs::read_dir(state.join("orbs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.path().join("disk.raw.zst").is_file());
+        r.line(
+            first_line(Path::new("zstd"), &["--version"]),
+            "zstd",
+            archived,
+        );
         r.line(host_firewall(), "host firewall", false);
     }
     r.line(accel(), ACCEL_NAME, true);

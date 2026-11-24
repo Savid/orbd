@@ -15,7 +15,9 @@
 //! reports an Amp command result.
 //!
 //! The same per-orb serialization runs [`super::checkpoint_age`]'s drops of memory
-//! checkpoints older than `ORBD_CHECKPOINT_MAX_AGE_HOURS`.
+//! checkpoints older than `ORBD_CHECKPOINT_MAX_AGE_HOURS`, [`super::hold`]'s writes of
+//! sleeps held in RAM and [`super::archive`]'s archives of stopped orbs' disks. A drain
+//! also writes every held sleep, after checkpointing the running orbs.
 
 use super::db::{self, RestoreIntent};
 use super::{Shared, executor};
@@ -51,6 +53,13 @@ pub(crate) enum Task {
         checkpoint: SleepCheckpointRef,
         max_age: Duration,
     },
+    /// Write a sleep held in RAM to its checkpoint (see [`super::hold`]); `reason` is a
+    /// metrics label.
+    FlushHeld {
+        reason: &'static str,
+    },
+    /// Archive a stopped orb's disk (see [`super::archive`]).
+    Archive,
 }
 
 #[derive(Debug)]
@@ -62,6 +71,10 @@ pub(crate) enum Outcome {
     /// The host no longer had the checkpoint the orb was recorded asleep on; what it
     /// has was recorded.
     Recorded,
+    /// A held sleep's checkpoint was written.
+    Flushed,
+    /// The orb's disk was archived.
+    Archived,
     /// Nothing to do (not running, or already running; for a drop, not due).
     Unchanged,
     /// Could not save or restore; what is left was recorded.
@@ -74,6 +87,8 @@ pub(super) async fn drain(sh: &Arc<Shared>) {
     let deadline = started + SHUTDOWN_BUDGET;
     sh.draining.cancel();
     sh.send_control(super::session::heartbeat(sh));
+    // First: a held sleep is lost with the agent's processes unless written.
+    super::hold::flush_all(sh, deadline).await;
     let defs = match sh.db.call(|c| db::list_orb_definitions(c)).await {
         Ok(d) => d,
         Err(e) => {
@@ -195,6 +210,9 @@ pub(super) async fn run(sh: &Arc<Shared>, orb: &OrbDefinition, task: Task) -> Ou
             checkpoint,
             max_age,
         } => return super::checkpoint_age::run(sh, &*rt, orb.id, checkpoint, max_age).await,
+        // Asleep and stopped orbs hold no reservation either.
+        Task::FlushHeld { reason } => return super::hold::run(sh, &*rt, orb, reason).await,
+        Task::Archive => return super::archive::run(sh, &*rt, orb).await,
     };
     let running = matches!(rt.inspect(orb.id).await, Ok(RuntimeObservation::Running));
     let mut reserved = sh.reserved.lock().unwrap_or_else(|e| e.into_inner());
@@ -246,8 +264,9 @@ async fn checkpoint(
     let failure = if Instant::now() >= work {
         "no shutdown budget left".to_owned()
     } else {
+        // Never held: the agent is stopping, and its orbs' memory with it.
         match rt
-            .checkpoint_and_stop(orb, intent.checkpoint.generation, &ctx)
+            .checkpoint_and_stop(orb, intent.checkpoint.generation, false, &ctx)
             .await
         {
             Ok(cp) => {
@@ -366,7 +385,7 @@ async fn observed_state(rt: &dyn Runtime, orb: OrbId) -> StableOrbState {
 }
 
 /// A runtime context outside any command: fresh id, logs to the agent's own log.
-fn context(orb: OrbId, generation: u64, work: Instant, cleanup: Instant) -> OpContext {
+pub(super) fn context(orb: OrbId, generation: u64, work: Instant, cleanup: Instant) -> OpContext {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(LogStream, bytes::Bytes)>(64);
     tokio::spawn(async move {
         while let Some((_, line)) = rx.recv().await {

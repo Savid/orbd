@@ -113,6 +113,52 @@ pub struct CheckpointInfo {
     pub synced: bool,
 }
 
+/// A sleep held in RAM: the orb's VMM, paused, still holds its memory, and its memory
+/// checkpoint is not written yet (see [`Runtime::checkpoint_and_stop`]'s `hold`). The
+/// orb counts as asleep on `checkpoint`: a wake resumes the VM in place, and the
+/// checkpoint is written ([`Runtime::flush_held`]) only when the agent needs the memory
+/// back, the hold has lasted long enough, or the agent stops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldSleep {
+    pub orb: OrbId,
+    pub checkpoint: SleepCheckpointRef,
+    /// When the VM was paused (wall clock).
+    pub since_unix_ms: u64,
+    /// Host memory the paused VMM holds now (its anonymous resident memory: what
+    /// writing its checkpoint frees).
+    pub resident_bytes: u64,
+    /// The orb's memory size: what its checkpoint takes on disk once written.
+    pub memory_bytes: u64,
+}
+
+/// What [`Runtime::flush_held`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// The checkpoint was written and the VMM stopped: the orb sleeps on disk.
+    Written,
+    /// The orb is not held (woken, deleted, or written already).
+    NotHeld,
+    /// The held VMM was gone (killed, or the host lost it): the orb is stopped without a
+    /// checkpoint, its disk as the guest synced it before the pause.
+    Lost,
+}
+
+/// A stopped orb's disk compressed in place (see [`Runtime::archive_disk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArchiveInfo {
+    pub archived_unix_ms: u64,
+    /// The compressed file's size.
+    pub compressed_bytes: u64,
+    /// What the disk held when it was archived (allocated blocks): what a restore
+    /// writes again.
+    pub allocated_bytes: u64,
+    /// The disk's size (apparent).
+    pub disk_bytes: u64,
+    /// A restore of it is running.
+    #[serde(skip)]
+    pub restoring: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogStream {
     Stdout,
@@ -143,6 +189,9 @@ pub enum RuntimeError {
     CheckpointFailed(String),
     #[error("insufficient disk: {0}")]
     InsufficientDisk(String),
+    /// The orb's archived disk is being restored; the spawn is worth retrying.
+    #[error("disk not ready: {0}")]
+    DiskNotReady(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("cancelled")]
@@ -184,12 +233,66 @@ pub trait Runtime: Send + Sync {
 
     /// Saves memory to a new checkpoint generation, stops and reaps the VMM, then
     /// atomically publishes the checkpoint. Never returns Ok while the source can run.
+    ///
+    /// With `hold`, a runtime that can (Firecracker) instead pauses the VM in place once
+    /// the guest synced its disk, durably records the hold and returns: the orb sleeps
+    /// on `checkpoint_generation` held in RAM ([`HeldSleep`]) until it is woken (resumed
+    /// in place by `start` from that checkpoint) or [`flush_held`](Self::flush_held)
+    /// writes the checkpoint. Others ignore `hold`.
     async fn checkpoint_and_stop(
         &self,
         orb: &OrbDefinition,
         checkpoint_generation: u64,
+        hold: bool,
         ctx: &OpContext,
     ) -> Result<SleepCheckpointRef, RuntimeError>;
+
+    /// Orbs asleep in RAM (see [`HeldSleep`]). Cheap: no orb lock, no VMM call.
+    fn held(&self) -> Vec<HeldSleep> {
+        Vec::new()
+    }
+
+    /// Whether `checkpoint_and_stop`'s `hold` does anything here.
+    fn holds_sleeps(&self) -> bool {
+        false
+    }
+
+    /// Disk bytes this runtime has committed but not yet written: restores of archived
+    /// disks in progress (what they still write). Cheap.
+    fn disk_in_flight(&self) -> u64 {
+        0
+    }
+
+    /// Writes a held sleep's checkpoint exactly as an unheld sleep would, then stops the
+    /// VMM, freeing its memory. A failed write leaves the orb held.
+    async fn flush_held(
+        &self,
+        _orb: &OrbDefinition,
+        _ctx: &OpContext,
+    ) -> Result<FlushOutcome, RuntimeError> {
+        Ok(FlushOutcome::NotHeld)
+    }
+
+    /// Whether this runtime can archive stopped orbs' disks ([`archive_disk`](Self::archive_disk)).
+    fn archives(&self) -> bool {
+        false
+    }
+
+    /// Compresses a stopped orb's disk (no VMM, no memory checkpoint) in place; `start`
+    /// restores it before a cold boot. None if the orb is not such an orb, or is
+    /// archived already. Honours `ctx.cancel` promptly, leaving the disk as it was.
+    async fn archive_disk(
+        &self,
+        _orb: &OrbDefinition,
+        _ctx: &OpContext,
+    ) -> Result<Option<ArchiveInfo>, RuntimeError> {
+        Err(RuntimeError::Unsupported("archiving disks".into()))
+    }
+
+    /// The orb's archive, if its disk is archived. Cheap: no orb lock.
+    fn archived(&self, _orb: OrbId) -> Option<ArchiveInfo> {
+        None
+    }
 
     /// Stops the orb without saving memory (processes lost). Idempotent.
     async fn cold_stop(&self, orb: &OrbDefinition, ctx: &OpContext) -> Result<(), RuntimeError>;

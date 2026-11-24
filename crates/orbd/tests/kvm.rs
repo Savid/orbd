@@ -1211,6 +1211,384 @@ fn spawn_boots_from_project_snapshot() {
     eprintln!("amp-4 (snapshot gone from the host): marker created {other}");
 }
 
+/// Sets an agent environment variable for the agent's next start.
+#[cfg(target_os = "linux")]
+fn set_agent_env(c: &mut Cluster, key: &str, value: &str) {
+    c.agent_env.retain(|(k, _)| k != key);
+    c.agent_env.push((key.into(), value.into()));
+}
+
+/// Bytes a file holds on the host (allocated blocks).
+#[cfg(target_os = "linux")]
+fn allocated(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map_or(0, |m| m.blocks() * 512)
+}
+
+/// The dispatch job's output, both streams.
+#[cfg(target_os = "linux")]
+fn output(job: &Job) -> String {
+    format!("{}{}", job.stdout, job.stderr)
+}
+
+/// The orb's dir among `before`'s complement (a new orb).
+#[cfg(target_os = "linux")]
+fn new_orb_dir(c: &Cluster, before: &[PathBuf]) -> PathBuf {
+    orb_dirs(c)
+        .into_iter()
+        .find(|d| !before.contains(d))
+        .expect("a new orb")
+}
+
+/// Firecracker holds sleeps in RAM: a pause leaves the VM paused with its memory and
+/// writes no checkpoint, and a wake resumes it in place with its processes; a pause that
+/// publishes a project snapshot copies the paused VM's disk. The held checkpoint is
+/// written when the hold runs out, when an orb being admitted needs the memory, and on
+/// a graceful stop; a restarted agent adopts a held VM.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+#[cfg(target_os = "linux")]
+fn held_sleeps_wake_in_place_and_are_written_when_needed() {
+    if runtime() != "firecracker" {
+        eprintln!("NOTICE: sleeps are held in RAM on Firecracker only; skipped");
+        return;
+    }
+    let mut c = cluster(3);
+    set_agent_env(&mut c, "ORBD_SLEEP_HOLD_MINUTES", "20");
+    let _vms = Vms(c.root().to_owned());
+    c.start_all();
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn");
+    let one = orb_dir(&c);
+    let (_, id) = wait_marker(&one);
+    wait_progress(&one, (0, 0));
+    let pid = vmm_pid(&one).expect("a VMM");
+
+    // A pause holds the sleep in RAM; a wake resumes the same VM.
+    for round in 1..=2 {
+        let before = counts(&one);
+        assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause (held)");
+        assert_eq!(vmm_pid(&one), Some(pid), "a held sleep keeps its VMM");
+        assert!(one.join("held.json").is_file(), "the hold is recorded");
+        assert!(checkpoint_files(&one).is_empty(), "and nothing is written");
+        let t = Instant::now();
+        let job = c.dispatch("spawn", "amp-1", &[]);
+        assert_ok(&job, "wake from RAM");
+        assert!(output(&job).contains("woke from RAM"), "{}", output(&job));
+        eprintln!("round {round}: wake from RAM {:?}", t.elapsed());
+        assert!(!one.join("held.json").exists());
+        assert_eq!(vmm_pid(&one), Some(pid));
+        wait_progress(&one, before);
+        assert_continuous(&one);
+    }
+
+    // A pause that publishes a project snapshot, held: the snapshot boots a new orb with
+    // the same disk, and the held orb still wakes in place.
+    assert_ok(
+        &c.dispatch("pause", "amp-1", &[("ORB_SNAPSHOT_ID", "snap-held")]),
+        "pause with a snapshot (held)",
+    );
+    assert_eq!(vmm_pid(&one), Some(pid));
+    let before = orb_dirs(&c);
+    assert_ok(
+        &c.dispatch("spawn", "amp-2", &[("ORB_SNAPSHOT_ID", "snap-held")]),
+        "spawn from the snapshot of a held orb",
+    );
+    let two = new_orb_dir(&c, &before);
+    assert_eq!(
+        wait_marker(&two),
+        (false, id.clone()),
+        "the held orb's disk"
+    );
+    let before = counts(&one);
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake amp-1");
+    assert_eq!(vmm_pid(&one), Some(pid));
+    wait_progress(&one, before);
+    assert_continuous(&one);
+
+    // Capacity: with room for two orbs, one running and one held, admitting a third
+    // writes the held sleep first (held memory counts against capacity).
+    set_agent_env(&mut c, "ORBD_CAPACITY_MEMORY_MIB", "2048");
+    c.kill_agent("agent-a");
+    start_again(&mut c, "");
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause (held)");
+    assert_eq!(vmm_pid(&one), Some(pid));
+    let before = orb_dirs(&c);
+    assert_ok(
+        &c.dispatch("spawn", "amp-3", &[]),
+        "spawn amp-3 at capacity",
+    );
+    assert!(
+        vmm_pid(&one).is_none(),
+        "the held sleep was written and its VMM stopped"
+    );
+    assert_eq!(checkpoint_files(&one).len(), 1, "one checkpoint written");
+    assert!(!one.join("held.json").exists());
+    let three = new_orb_dir(&c, &before);
+    wait_marker(&three);
+    assert_ok(&c.dispatch("delete", "amp-3", &[]), "delete amp-3");
+    assert_ok(&c.dispatch("delete", "amp-2", &[]), "delete amp-2");
+    let before = counts(&one);
+    let job = c.dispatch("spawn", "amp-1", &[]);
+    assert_ok(&job, "wake from the written checkpoint");
+    assert!(
+        output(&job).contains("restored checkpoint"),
+        "{}",
+        output(&job)
+    );
+    wait_progress(&one, before);
+    assert_continuous(&one);
+
+    // The agent dies at each boundary of a hold, a wake from RAM and a write: the orb
+    // converges, and its processes survive.
+    for (op, at, failpoints) in [
+        ("pause", "hold::after_record", ""),
+        ("spawn", "wake::after_resume", ""),
+        (
+            "pause",
+            "flush::after_manifest",
+            ";agent::hold::window_secs=return(1);agent::hold::every_secs=return(1)",
+        ),
+        (
+            "pause",
+            "flush::after_publish",
+            ";agent::hold::window_secs=return(1);agent::hold::every_secs=return(1)",
+        ),
+    ] {
+        if op == "spawn" {
+            assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause (held)");
+        }
+        let before = counts(&one);
+        c.kill_agent("agent-a");
+        start_again(&mut c, &format!("firecracker::{at}=return{failpoints}"));
+        let job = c.dispatch_bg(op, "amp-1", &[]);
+        c.wait_agent_crash("agent-a", Duration::from_secs(120));
+        c.start_agent("agent-a", "");
+        assert_ok(&job.join().unwrap(), &format!("{op} interrupted at {at}"));
+        // The restarted agent converges as it starts (it inspects every orb).
+        let state = || {
+            (
+                one.join("held.json").exists(),
+                vmm_pid(&one).is_some(),
+                checkpoint_files(&one)
+                    .iter()
+                    .filter(|(d, _, _)| !d.ends_with(".tmp"))
+                    .count(),
+            )
+        };
+        let want = match at {
+            "hold::after_record" => (true, true, 0),
+            "wake::after_resume" => (false, true, 0),
+            _ => (false, false, 1),
+        };
+        wait_until(
+            Duration::from_secs(60),
+            &format!("convergence after {at}"),
+            || state() == want,
+        );
+        eprintln!("crash at {at}: converged to (held, vmm, checkpoints) = {want:?}");
+        if op == "pause" {
+            assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake");
+        }
+        wait_progress(&one, before);
+        assert_continuous(&one);
+    }
+    let pid = vmm_pid(&one).expect("a VMM");
+
+    // A long hold: the guest's clock and its services' watchdogs (3 minutes) survive a
+    // wake from RAM.
+    let mark = console(&one).len();
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause (held)");
+    std::thread::sleep(Duration::from_secs(200));
+    let before = counts(&one);
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake after a long hold");
+    assert_eq!(vmm_pid(&one), Some(pid));
+    wait_progress(&one, before);
+    std::thread::sleep(Duration::from_secs(10));
+    let after = console(&one);
+    let after = since(&after, mark);
+    assert!(
+        !after.contains("Watchdog timeout") && !after.contains("watchdog timeout"),
+        "a service watchdog fired after a long hold:\n{}",
+        tail(after)
+    );
+    assert_continuous(&one);
+
+    // The hold runs out: the checkpoint is written.
+    c.kill_agent("agent-a");
+    start_again(
+        &mut c,
+        "agent::hold::window_secs=return(3);agent::hold::every_secs=return(1)",
+    );
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause (held)");
+    wait_until(
+        Duration::from_secs(60),
+        "the hold ran out and was written",
+        || {
+            vmm_pid(&one).is_none()
+                && checkpoint_files(&one).len() == 1
+                && !one.join("held.json").exists()
+        },
+    );
+    let before = counts(&one);
+    assert_ok(
+        &c.dispatch("spawn", "amp-1", &[]),
+        "wake after the hold ran out",
+    );
+    wait_progress(&one, before);
+    assert_continuous(&one);
+    let pid2 = vmm_pid(&one).expect("a VMM");
+    assert_ne!(pid2, pid, "restored by a new VMM");
+
+    // An agent killed outright: the restarted agent adopts the held VM.
+    c.kill_agent("agent-a");
+    start_again(&mut c, "");
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause (held)");
+    c.kill_agent("agent-a");
+    assert_eq!(vmm_pid(&one), Some(pid2), "the held VM outlives the agent");
+    start_again(&mut c, "");
+    let before = counts(&one);
+    let job = c.dispatch("spawn", "amp-1", &[]);
+    assert_ok(&job, "wake after an agent crash");
+    assert!(output(&job).contains("woke from RAM"), "{}", output(&job));
+    assert_eq!(vmm_pid(&one), Some(pid2));
+    wait_progress(&one, before);
+    assert_continuous(&one);
+
+    // A graceful stop writes held sleeps.
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause (held)");
+    let status = c.terminate_agent("agent-a", Duration::from_secs(120));
+    assert!(status.success(), "{status:?}");
+    assert!(vmm_pid(&one).is_none());
+    assert_eq!(checkpoint_files(&one).len(), 1, "written by the drain");
+    start_again(&mut c, "");
+    let before = counts(&one);
+    let job = c.dispatch("spawn", "amp-1", &[]);
+    assert_ok(&job, "wake after a graceful stop");
+    assert!(
+        output(&job).contains("restored checkpoint"),
+        "{}",
+        output(&job)
+    );
+    wait_progress(&one, before);
+    assert_continuous(&one);
+    assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete");
+    assert!(vmm_pids(c.root()).is_empty());
+}
+
+/// The disk of an orb stopped long enough is archived (compressed, the disk removed),
+/// and its next spawn restores it and cold-boots it with its data.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+#[cfg(target_os = "linux")]
+fn stopped_orbs_disks_are_archived_and_restored() {
+    if runtime() != "firecracker" {
+        eprintln!("NOTICE: disks are archived on Firecracker only; skipped");
+        return;
+    }
+    let mut c = cluster(1);
+    // Checkpoints older than an hour are dropped, so the orb ends up stopped.
+    set_agent_env(&mut c, "ORBD_CHECKPOINT_MAX_AGE_HOURS", "1");
+    let _vms = Vms(c.root().to_owned());
+    c.start_all();
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn");
+    let one = orb_dir(&c);
+    let (_, id) = wait_marker(&one);
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
+    // Age the checkpoint by two hours.
+    c.kill_agent("agent-a");
+    for e in std::fs::read_dir(one.join("checkpoints")).unwrap() {
+        let manifest = e.unwrap().path().join("manifest.json");
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let t = m["created_unix_ms"].as_u64().unwrap();
+        m["created_unix_ms"] = (t - 2 * 3_600_000).into();
+        std::fs::write(&manifest, m.to_string()).unwrap();
+    }
+    let disk = one.join("disk.raw");
+    let before = allocated(&disk);
+    start_again(
+        &mut c,
+        "agent::checkpoint_age::first_check_secs=return(1);\
+         agent::archive::first_check_secs=return(8);agent::archive::after_secs=return(0)",
+    );
+    wait_until(Duration::from_secs(120), "the disk archived", || {
+        !disk.exists() && one.join("disk.raw.zst").is_file()
+    });
+    let archive = allocated(&one.join("disk.raw.zst"));
+    eprintln!(
+        "archived: {} MiB disk into {} MiB",
+        before >> 20,
+        archive >> 20
+    );
+    assert!(archive > 0 && archive < before, "{archive} < {before}");
+    wait_until(Duration::from_secs(10), "the archive logged", || {
+        agent_log(&c).contains("archived the disk of a stopped orb")
+    });
+    wait_until(
+        Duration::from_secs(20),
+        "orb list notes the archive",
+        || c.admin(&["orb", "list"]).stdout.contains("disk archived"),
+    );
+
+    let job = c.dispatch("spawn", "amp-1", &[]);
+    assert_ok(&job, "spawn an archived orb");
+    assert!(
+        output(&job).contains("archived disk restored"),
+        "{}",
+        output(&job)
+    );
+    assert!(disk.is_file() && !one.join("disk.raw.zst").exists());
+    assert_eq!(wait_marker(&one).1, id, "the same disk");
+    assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete");
+}
+
+/// Space the guest frees comes back to the host: the guest trims its disk before a
+/// sleep, and Firecracker's discard punches it out of the disk file.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+#[cfg(target_os = "linux")]
+fn a_sleep_returns_space_the_guest_freed() {
+    if runtime() != "firecracker" {
+        eprintln!("NOTICE: checked on Firecracker only; skipped");
+        return;
+    }
+    let mut c = cluster(1);
+    let _vms = Vms(c.root().to_owned());
+    c.start_all();
+    let env = [
+        ("E2E_FILL_MIB", "300"),
+        (
+            "ORB_ENVS",
+            "AMP_URL ORB_TOKEN AMP_THREAD_ID AMP_SANDBOX_ID E2E_FILL_MIB",
+        ),
+    ];
+    assert_ok(&c.dispatch("spawn", "amp-1", &env), "spawn");
+    let one = orb_dir(&c);
+    let disk = one.join("disk.raw");
+    wait_until(Duration::from_secs(120), "the guest wrote its file", || {
+        printed(&one).contains("fill written")
+    });
+    let full = allocated(&disk);
+    wait_until(
+        Duration::from_secs(60),
+        "the guest removed its file",
+        || printed(&one).contains("fill removed"),
+    );
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
+    let trimmed = allocated(&disk);
+    eprintln!(
+        "disk: {} MiB with the file, {} MiB after the sleep's trim",
+        full >> 20,
+        trimmed >> 20
+    );
+    assert!(
+        trimmed + (200 << 20) < full,
+        "the freed 300 MiB came back: {full} -> {trimmed}"
+    );
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake");
+    assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete");
+}
+
 /// The agent before the switch in [`carry_over`].
 enum Before {
     /// The previous release's `orbd` (the binary alone: it runs with this tree's VMMs,

@@ -141,14 +141,19 @@ offerings:
             offering,
             provider: None,
             // Real runtimes use the host's disk: keep little of it in reserve. amd64 QEMU
-            // offerings give orbs /dev/kvm, which agents allow only when told to.
+            // offerings give orbs /dev/kvm, which agents allow only when told to. Sleeps
+            // are written at once unless a test holds them in RAM.
             agent_env: match runtime {
                 "fake" => vec![],
                 "qemu" if cfg!(target_arch = "x86_64") => vec![
                     ("ORBD_DISK_RESERVE_GIB".into(), "1".into()),
                     ("ORBD_NESTED_KVM".into(), "true".into()),
+                    ("ORBD_SLEEP_HOLD_MINUTES".into(), "0".into()),
                 ],
-                _ => vec![("ORBD_DISK_RESERVE_GIB".into(), "1".into())],
+                _ => vec![
+                    ("ORBD_DISK_RESERVE_GIB".into(), "1".into()),
+                    ("ORBD_SLEEP_HOLD_MINUTES".into(), "0".into()),
+                ],
             },
             agent_configs: BTreeMap::new(),
             agent_bin: None,

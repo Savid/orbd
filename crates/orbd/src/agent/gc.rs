@@ -6,8 +6,10 @@
 //! A project snapshot or prepared image is deleted once no orb on this host is built on
 //! it (a QEMU orb's `vm.json` names it: its disk reads through to its base; a
 //! Firecracker orb's disk is a standalone copy, so it pins nothing) and nothing has
-//! used it for [`IDLE`]. A spawn that creates a disk from it counts as a use, and so
-//! does publishing it. The current image of a prewarmed reference is kept. Collection
+//! used it for [`IDLE`]; a prepared image its reference moved on from (a tag now
+//! resolved to a newer digest) already after [`STALE_IMAGE_IDLE`]. A spawn that creates
+//! a disk from it counts as a use, and so does publishing it. The current image of a
+//! prewarmed reference is kept. Collection
 //! runs at startup, hourly and after every orb delete, under
 //! [`crate::runtime::vm::BASES`], so no disk is created from a base while it runs.
 
@@ -20,6 +22,9 @@ use std::time::Duration;
 
 /// How long an unused base is kept: Amp names a project snapshot for at most 72 hours.
 pub const IDLE: Duration = Duration::from_secs(72 * 3600);
+/// How long a prepared image no reference resolves to any more (its tag moved on to a
+/// newer digest) is kept once unused: spawns of the tag now get the newer one.
+pub const STALE_IMAGE_IDLE: Duration = Duration::from_secs(6 * 3600);
 const EVERY: Duration = Duration::from_secs(3600);
 
 /// Collects now, then hourly and whenever an orb was deleted, until shutdown.
@@ -54,7 +59,7 @@ async fn collect(sh: &Arc<Shared>) {
                         .filter_map(|b| b.strip_prefix("images/"))
                         .map(str::to_owned)
                         .collect();
-                    store.collect_garbage(&keys, IDLE)
+                    store.collect_garbage(&keys, IDLE, STALE_IMAGE_IDLE)
                 }
                 None => Vec::new(),
             };

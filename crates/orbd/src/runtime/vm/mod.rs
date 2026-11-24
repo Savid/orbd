@@ -12,6 +12,7 @@ pub mod guest;
 pub mod images;
 pub mod jail;
 pub mod net;
+pub mod reflink;
 
 pub use orbd_vm::fsutil::{self, create_private_dir};
 pub use orbd_vm::process;
@@ -211,14 +212,30 @@ impl OrbLocks {
     }
 }
 
-/// Copies a raw disk image: a reflink where the filesystem supports it, else a sparse
-/// copy.
+/// Copies a raw disk image: a clone sharing its blocks where the filesystem supports
+/// reflinks (see [`reflink`]), else a sparse copy. A failed clone where the startup
+/// probe found reflinks is logged; every copy is counted by method
+/// (`orbd_agent_disk_copies_total`).
 pub async fn copy_disk(ctx: &OpContext, from: &Path, to: &Path) -> Result<(), RuntimeError> {
+    let (f, t) = (from.to_owned(), to.to_owned());
+    let cloned = tokio::task::spawn_blocking(move || reflink::clone_file(&f, &t))
+        .await
+        .map_err(|e| RuntimeError::Other(e.to_string()))?;
+    match cloned {
+        Ok(()) => {
+            metrics::counter!("orbd_agent_disk_copies_total", "method" => "reflink").increment(1);
+            return Ok(());
+        }
+        Err(e) if reflink::expected() => {
+            tracing::warn!(from = %from.display(), to = %to.display(), error = %e, "reflink failed where the state directory supports them; copying in full");
+        }
+        Err(_) => {}
+    }
+    metrics::counter!("orbd_agent_disk_copies_total", "method" => "copy").increment(1);
     run_tool(
         ctx,
         Path::new("cp"),
         &[
-            "--reflink=auto".into(),
             "--sparse=always".into(),
             from.display().to_string(),
             to.display().to_string(),
@@ -310,9 +327,16 @@ pub async fn initial_source(
 
 /// Publishes the project snapshot `<state>/projects/<key>/{disk.raw, meta.json}`:
 /// `write_raw` fills a standalone raw disk in staging (an empty file lent to `tools`),
-/// which is shrunk to its used size (by `tools`), taken back, made read-only (0444),
-/// fsynced and renamed into place. The format is the same for every VM runtime.
-/// `lineage` is the source orb's (see [`project_lineage`]).
+/// which is taken back, made read-only (0444), fsynced and renamed into place. The format
+/// is the same for every VM runtime. `lineage` is the source orb's (see
+/// [`project_lineage`]).
+///
+/// The disk is published as copied, crash-consistent (the guest synced before it was
+/// stopped): no host tool checks or shrinks its filesystem here. Shrinking rewrote much
+/// of the disk on every publish (write wear, and unshared blocks a reflink had shared)
+/// and saved no space (a sparse copy holds the same blocks). The guest replays its
+/// journal at the next mount; an orb whose offering disk is smaller than the snapshot
+/// gets it shrunk when its disk is made (see [`disktools::shrink_ext4_to`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
     ctx: &OpContext,
@@ -334,9 +358,7 @@ pub async fn publish_project<F: Future<Output = Result<(), RuntimeError>>>(
         std::fs::File::create(&raw).map_err(io_err)?;
         let lent = tools.lend(&raw).map_err(io_err)?;
         write_raw(raw.clone()).await?;
-        let bytes = disktools::shrink_ext4(tools, ctx, &raw).await?;
         let f = tools.take_back(lent).map_err(io_err)?;
-        disktools::truncate(&f, &raw, bytes)?;
         // Read-only from here; world-readable (inside root-only directories) so jailed
         // QEMUs of orbs built on it read through to it.
         f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o444))

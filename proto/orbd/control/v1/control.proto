@@ -469,6 +469,9 @@ message OrbDiskUsage {
   uint64 allocated_bytes = 2;
   // The part held by memory checkpoints.
   uint64 checkpoint_bytes = 3;
+  // Its disk is archived (compressed until its next wake); allocated_bytes is the
+  // archive's.
+  bool archived = 4;
 }
 
 message CommandAccepted {
@@ -738,6 +741,8 @@ message DiskUse {
   uint64 allocated_bytes = 1;
   // The part held by memory checkpoints.
   uint64 checkpoint_bytes = 2;
+  // The disk is archived (compressed until the orb's next wake).
+  bool archived = 3;
 }
 
 message OrbFailure {

@@ -250,7 +250,11 @@ each agent's orbs, its reservations against its capacity, and its disk: free, al
 by orbd, reserved and limit (also exported as `orbd_agent_disk_*_bytes` and
 `orbd_reserved_disk_bytes`).
 
-A new orb goes to the agent with the most free memory that fits it. An agent started with
+A new orb goes to the agent with the most room that fits it: the most of whichever of its
+memory (capacity less running orbs) and its disk (free space less the reserve and running
+orbs' headroom) is scarcer, each as a share of the agent's own. Memory alone would send
+every new orb to the agent with the most free memory however full its disk, and orbs
+never move between agents. An agent started with
 `ORBD_OVERFLOW=true`, e.g. on a laptop or a workstation that is not always on, gets one only
 when no other agent fits it, since an orb stays on the agent it was created on and cannot
 wake while that host is off. `orbd agent list` marks such agents `(overflow)`.
@@ -310,6 +314,53 @@ with no checkpoint. A checkpoint is never deleted while its orb is being woken, 
 deleted, and is kept however old if the guest did not sync its disk before it was saved
 (it did not answer in time when it went to sleep), or if its save time is more than an
 hour in the future.
+
+Most sleeps end within minutes, and a checkpoint is the orb's whole memory, so on a busy
+agent writing them is most of what it writes to its disk. A Firecracker agent therefore
+holds a sleep in RAM first: the guest syncs and trims its disk and the VM is paused in
+place, still holding its memory, for `ORBD_SLEEP_HOLD_MINUTES` (`--sleep-hold-minutes`;
+default 20, 0 writes every checkpoint at once). A wake within that resumes the same VM in
+an instant (its network and egress policy reapplied first) and writes nothing. The
+checkpoint is written, exactly as an unheld sleep writes it and dated at the pause, when
+the hold runs out, when an orb being admitted needs the memory or capacity (oldest holds
+first), when the host's free memory would no longer fit the largest orb it runs, and
+first thing when the agent stops gracefully. A pause holds only if the guest synced its
+disk, the host would still fit another orb of its size, all held memory stays within
+16 GiB (what a graceful stop can write) and the held checkpoints fit on disk above the
+reserve. Held memory counts against the agent's capacity, and held checkpoints count as
+committed disk, not free, for admission and placement; held memory counts as available
+in what the agent reports only while those checkpoints fit. A checkpoint that cannot be
+written (disk full, or failing as the agent stops) drops the hold instead. A held VM lost
+without a graceful stop (a container killed, a crash, the OOM killer, which prefers held
+VMs) loses only its RAM: the orb is recorded stopped and cold-boots from its disk, which
+the guest synced and the agent made durable before the pause. A pause that publishes a
+project snapshot holds too: the snapshot is copied from the paused VM's disk, which
+nothing writes until the wake.
+
+The disk of a Firecracker orb stopped without a checkpoint (dropped for its age, or a
+failed save) and unused for `ORBD_ARCHIVE_AFTER_HOURS` (`--archive-after-hours`; default
+24, 0 never) is archived: compressed with `zstd` in place, about 3x for a typical orb, at
+idle CPU and I/O priority, and checked before the disk is removed. An archive stops,
+leaving the disk, if the filesystem would go below the agent's disk reserve or the
+archive would not shrink the disk to 80% or less (that orb is tried again a day later).
+On a filesystem with reflinks an orb is archived only once its base image or snapshot is
+gone, since until then its disk shares their blocks. `orbd orb list` notes `disk
+archived`. Its next spawn restores it before the cold boot, which takes seconds for a
+typical disk; one too big to restore within the spawn's time fails with
+`image_not_ready` while the restore goes on, and a later spawn finds it done. A restore
+starts only if what it writes fits above the reserve after the restores already
+running, and the agent keeps room for the largest archived orb's restore out of what it
+reports free. A command for the orb cancels an archive in progress. Orbs stopped that
+long rarely come back, and the archive and a restore together write about 1.3 times the
+disk, so the setting is worth raising where they often do.
+
+An agent deletes a prepared image a tag has moved on from (the tag now resolves to a
+newer digest) once nothing has used it for 6 hours: a Firecracker orb's disk is a copy,
+and new orbs of the tag get the newer image. Project snapshots are published as copied,
+at their source orb's disk size: no host tool checks or shrinks the guest's filesystem
+then (the guest replays its journal at its next mount). An orb whose type has a smaller
+disk than the snapshot gets its copy shrunk in its own jail when its disk is made, or
+keeps the larger size if its files do not fit.
 
 To delete the orbs of archived threads sooner, run a job that checks each orb's thread
 in Amp: `orbd orb list --json` lists every orb's Amp id (`amp-<thread id>`), state,
@@ -409,14 +460,42 @@ raise it too, e.g. a drop-in `/etc/systemd/system/docker.service.d/orbd.conf` wi
 (~5 GiB).
 
 The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Linux 7.3
-guest kernel; an agent run outside it needs QEMU 9.0 or newer, `ip` and `nft`, and
-Firecracker as `firecracker` on its `PATH` (`orbd doctor` checks). Orb types without
+guest kernel; an agent run outside it needs QEMU 9.0 or newer, `ip` and `nft`, `zstd`
+(for archived disks), and Firecracker as `firecracker` on its `PATH` (`orbd doctor`
+checks). Orb types without
 `kvm` run only in Firecracker, so an agent without it takes none of them, and with nested
 KVM off (the default) no orbs at all; it warns when it starts. VM orbs run in their own
 network namespace behind NAT and cannot reach the agent itself, each other or private
 networks (see above). A sleeping orb wakes only on the VMM build and CPU it slept on, so
 after an upgrade it cold-boots once; the agent deletes such memory checkpoints when it
 starts, as it deletes every checkpoint that was restored or superseded.
+
+### Host storage
+
+Orb disks, project snapshots, prepared images, memory checkpoints and archives all live
+in the agent's state directory (`/var/lib/orbd`, the `orbd-agent` volume above). Every
+orb disk starts as a copy of an image or a project snapshot, and every snapshot as a copy
+of an orb's disk. On a filesystem with reflinks those copies are clones: instant, and
+sharing the base's blocks until the orb changes them. On ext4 each is a full copy. The
+agent logs at startup which it got.
+
+- **A disk of its own for the state directory, formatted XFS** (`mkfs.xfs`, reflinks on
+  by default): clones, mature with large VM images, no tuning. Mount it at the volume's
+  path (or bind it in with `-v /srv/orbd:/var/lib/orbd`).
+- **On a btrfs root**, give the state directory a subvolume of its own and set No_COW on
+  it while it is empty (`chattr +C`), so everything created under it inherits it. btrfs
+  clones only between files that agree on No_COW (the agent warns at startup if its
+  directories disagree), otherwise silently copying in full. Copy-on-write VM disks
+  fragment, and compression needs it, so leave compression off there (no
+  `compress-force` on the filesystem); never defragment it (that unshares every clone)
+  and never snapshot it.
+- **Trim:** orbs return the space their guests free (they trim before every sleep, and
+  their disks pass discards through, with Firecracker 1.17 or later), so let discards
+  reach the drive: `fstrim.timer` on the host, and `allow-discards` (`discard` in
+  crypttab) on LUKS.
+- **Drives:** a sleep held in RAM, an archive and a clone all save writes, but an agent
+  still writes a lot. Prefer drives rated for it (TLC with DRAM) over DRAM-less QLC; on
+  those keep 15-20% free (`ORBD_DISK_RESERVE_GIB`), as they slow down sharply when full.
 
 ### Host firewalls
 

@@ -68,5 +68,15 @@ probe6() {
 for target in $E2E_PROBE6; do
     probe6 "$target" &
 done
+# E2E_FILL_MIB=<n>: writes n MiB of random data to the root disk and removes it again,
+# so the host can see the space come back after the next sleep's trim.
+if [ -n "$E2E_FILL_MIB" ]; then
+    {
+        f=/var/tmp/e2e-fill
+        head -c "$((E2E_FILL_MIB << 20))" /dev/urandom >"$f" && sync && echo "fill written"
+        sleep 15
+        rm -f "$f" && sync && echo "fill removed"
+    } &
+fi
 wait
 exec sleep infinity

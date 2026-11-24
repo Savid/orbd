@@ -10,6 +10,8 @@
 //!                   /disk.raw                standalone raw disk (reflink or sparse copy)
 //!                   /checkpoints/<gen>/      published: memory, vmstate, manifest.json[, consumed]
 //!                   /checkpoints/<gen>.tmp/  save in progress (complete once manifest.json exists)
+//!                   /held.json               a sleep held in RAM by the paused VMM (see [`hold`])
+//!                   /disk.raw.zst, archive.json  the disk, archived (see [`archive`])
 //!                   /logs/{firecracker.log (latest launch),console.log}
 //! <state>/net/<index>                        network index claimed by an orb
 //! <state>/uids/<index>                       jail uid claimed by an orb
@@ -38,18 +40,25 @@
 //!   that VMM exits.
 //! * Cold stop: Ctrl+Alt+Del (the guest reboots and `reboot=k` ends the VMM; a guest
 //!   poweroff only halts it), then SIGKILL.
+//! * A sleep the agent lets hold stops after the pause: the VMM stays, paused, holding
+//!   the memory, until a wake resumes it or the checkpoint is written (see [`hold`]).
 //!
 //! Crash points (feature `failpoints`): `firecracker::create::after_publish`,
 //! `firecracker::save::after_stop`, `firecracker::save::after_migrate` (Firecracker
 //! still writing the snapshot), `firecracker::save::after_manifest`,
 //! `firecracker::save::after_quit`, `firecracker::save::after_publish`,
 //! `firecracker::restore::after_load`, `firecracker::restore::after_consume`,
-//! `firecracker::clone::after_publish`, and the shared `vm::launch::after_exec`. Fault
+//! `firecracker::clone::after_publish`, `firecracker::hold::after_record`,
+//! `firecracker::wake::after_resume`, `firecracker::flush::after_manifest`,
+//! `firecracker::flush::after_publish`, `firecracker::archive::after_rename`,
+//! `firecracker::restore_disk::after_rename`, and the shared `vm::launch::after_exec`. Fault
 //! injection: `firecracker::save::write=return` fails a save in progress as a full disk
 //! would; `firecracker::save::throttle=return(<MiB/s>)` stretches a save to that rate.
 
 mod api;
+mod archive;
 mod guest;
+mod hold;
 
 use super::vm::checkpoints::{Checkpoints, MANIFEST, remove_trashed};
 use super::vm::fsutil::write_json_atomic;
@@ -64,8 +73,8 @@ use super::vm::{
     log_tail, machine_id, on_path, publish_project,
 };
 use super::{
-    CheckpointInfo, GuestControl, OpContext, Runtime, RuntimeCapabilities, RuntimeError,
-    RuntimeObservation, StartSource,
+    ArchiveInfo, CheckpointInfo, FlushOutcome, GuestControl, HeldSleep, OpContext, Runtime,
+    RuntimeCapabilities, RuntimeError, RuntimeObservation, StartSource,
 };
 use crate::config::agent::FirecrackerRuntimeConfig;
 use crate::image::ImageError;
@@ -207,6 +216,12 @@ enum Observed {
     Stopped {
         checkpoint: Option<u64>,
     },
+    /// Asleep in RAM (see [`hold`]): a validated, paused Firecracker holds the memory
+    /// of checkpoint `generation`, which is not written.
+    Held {
+        generation: u64,
+        proc: Process,
+    },
     Inconsistent(String),
 }
 
@@ -219,6 +234,9 @@ impl std::fmt::Display for Observed {
                 checkpoint: Some(g),
             } => write!(f, "sleeping (checkpoint {g})"),
             Self::Stopped { checkpoint: None } => f.write_str("stopped"),
+            Self::Held { generation, .. } => {
+                write!(f, "asleep in RAM (checkpoint {generation} not written)")
+            }
             Self::Inconsistent(r) => write!(f, "inconsistent: {r}"),
         }
     }
@@ -234,6 +252,12 @@ pub struct FirecrackerRuntime {
     /// Builds each VMM's jail; None with `ORBD_VMM_JAIL=off` (or a non-root agent).
     jail: Option<Jailer>,
     locks: OrbLocks,
+    /// The Firecracker binary takes `discard` on drives (1.17 and later).
+    discard: bool,
+    /// Sleeps held in RAM (see [`hold`]), as their records say.
+    held: std::sync::Mutex<std::collections::HashMap<OrbId, hold::Held>>,
+    /// Restores of archived disks running in the background (see [`archive`]).
+    restores: archive::Restores,
 }
 
 impl FirecrackerRuntime {
@@ -304,6 +328,11 @@ impl FirecrackerRuntime {
             None => None,
         };
         let cpu = CpuIdentity::host();
+        let discard = discard_supported(&firecracker.version);
+        if !discard {
+            tracing::warn!(firecracker = %firecracker.version, "this Firecracker predates drive discard (1.17): space guests free is not returned to the host");
+        }
+        archive::recover(state_dir);
         tracing::info!(firecracker = %firecracker.version, cpu = %cpu.model, jailed = jail.is_some(), "firecracker runtime ready");
         Ok(Self {
             config,
@@ -314,6 +343,9 @@ impl FirecrackerRuntime {
             cpu,
             jail,
             locks: OrbLocks::default(),
+            discard,
+            held: Default::default(),
+            restores: Default::default(),
         })
     }
 
@@ -470,13 +502,36 @@ impl FirecrackerRuntime {
             self.clear_run(orb);
             return Ok(Observed::Absent);
         }
+        let held = self.read_held(orb);
         match (proc, record) {
-            (Some(proc), Some(record)) => {
-                if let Some(live) = self.settle_live(orb, proc, &record).await? {
-                    return Ok(live);
+            (Some(proc), Some(record)) => match held {
+                Some(h) if h.nonce == record.nonce => {
+                    if let Some(o) = self.settle_held(orb, proc, &record, h).await? {
+                        return Ok(o);
+                    }
                 }
-            }
+                other => {
+                    if other.is_some() {
+                        // A record of another launch's hold: that VMM is gone.
+                        self.clear_held(orb)?;
+                    }
+                    if let Some(live) = self.settle_live(orb, proc, &record).await? {
+                        return Ok(live);
+                    }
+                }
+            },
             _ => self.clear_run(orb),
+        }
+        // No VMM holds a sleep: whatever was held in RAM is lost (a complete write of it
+        // is published below).
+        if let Some(h) = self.read_held(orb) {
+            let (published, tmp) = self.checkpoints(orb).list();
+            if published.iter().any(|(g, _)| *g == h.generation) || tmp.contains(&h.generation) {
+                tracing::info!(%orb, generation = h.generation, "finishing the write of a sleep held in RAM");
+            } else {
+                tracing::warn!(%orb, "a sleep held in RAM was lost with its VMM; the orb cold-boots from its synced disk");
+            }
+            self.clear_held(orb)?;
         }
         let checkpoint = self
             .checkpoints(orb)
@@ -567,6 +622,9 @@ impl FirecrackerRuntime {
             Observed::Running(_) => RuntimeObservation::Running,
             Observed::Stopped { checkpoint } => RuntimeObservation::Stopped {
                 checkpoint: checkpoint.map(|generation| SleepCheckpointRef { generation }),
+            },
+            Observed::Held { generation, .. } => RuntimeObservation::Stopped {
+                checkpoint: Some(SleepCheckpointRef { generation }),
             },
             Observed::Inconsistent(reason) => RuntimeObservation::Inconsistent { reason },
         })
@@ -742,6 +800,10 @@ impl FirecrackerRuntime {
                     path_on_host: &op.disk,
                     is_root_device: true,
                     is_read_only: false,
+                    // Space the guest frees (fstrim before every sleep) goes back to
+                    // the host. Only a boot configures drives: a restore keeps the
+                    // device its checkpoint was saved with, discard or not.
+                    discard: self.discard.then_some(true),
                 },
                 t,
             )
@@ -829,14 +891,6 @@ impl FirecrackerRuntime {
         };
         let res = orb.spec.template.resources;
         let base_bytes = std::fs::metadata(&base).map_err(io_err)?.len();
-        // Project snapshots published before they were shrunk can outsize the offering.
-        let disk_bytes = res.disk_bytes.max(base_bytes);
-        if disk_bytes > res.disk_bytes {
-            log(
-                ctx,
-                &format!("base is {base_bytes} bytes, larger than the offering disk"),
-            );
-        }
         // The jail uid and network index are claimed (durably, by this orb) before
         // anything is built.
         let ids = self.jail_ids(orb.id)?;
@@ -862,11 +916,11 @@ impl FirecrackerRuntime {
                 return Err(RuntimeError::Other(e.to_string()));
             }
         };
-        let recipe = VmRecipe {
+        let mut recipe = VmRecipe {
             orb: orb.id,
             vcpus: res.vcpus,
             memory_bytes: res.memory_bytes,
-            disk_bytes,
+            disk_bytes: res.disk_bytes,
             source,
             lineage,
             net,
@@ -877,15 +931,20 @@ impl FirecrackerRuntime {
             for d in ["logs", "checkpoints"] {
                 std::fs::create_dir_all(staging.join(d)).map_err(io_err)?;
             }
-            write_json_atomic(&staging.join("vm.json"), &recipe).map_err(io_err)?;
             let disk = staging.join("disk.raw");
             log(ctx, "copying the root disk");
             copy_disk(ctx, &base, &disk).await?;
+            if base_bytes > res.disk_bytes {
+                recipe.disk_bytes = self
+                    .fit_disk(&base, &disk, base_bytes, res.disk_bytes, ids, ctx)
+                    .await?;
+            }
+            write_json_atomic(&staging.join("vm.json"), &recipe).map_err(io_err)?;
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&disk)
                 .map_err(io_err)?;
-            f.set_len(disk_bytes).map_err(io_err)?;
+            f.set_len(recipe.disk_bytes).map_err(io_err)?;
             f.sync_all().map_err(io_err)?;
             fsync_dir(&staging).map_err(io_err)
         }
@@ -900,6 +959,58 @@ impl FirecrackerRuntime {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// The size of a new disk copied from a base of `base_bytes`, larger than the
+    /// offering's `want`: the guest's filesystem is shrunk to `want` in the new orb's
+    /// jail (project snapshots are published as copied, at their source orb's size), or
+    /// the disk keeps the base's size if its files do not fit.
+    async fn fit_disk(
+        &self,
+        base: &Path,
+        disk: &Path,
+        base_bytes: u64,
+        want: u64,
+        ids: Option<Ids>,
+        ctx: &OpContext,
+    ) -> Result<u64, RuntimeError> {
+        use super::vm::disktools::{DiskTools, shrink_ext4_to, truncate};
+        log(
+            ctx,
+            &format!("base is {base_bytes} bytes, larger than the offering disk; shrinking it"),
+        );
+        let tools = DiskTools::new(self.jail.as_ref().zip(ids));
+        let lent = tools.lend(disk).map_err(io_err)?;
+        let shrunk = shrink_ext4_to(&tools, ctx, disk, want).await;
+        let f = tools.take_back(lent).map_err(io_err)?;
+        match shrunk {
+            Ok(Some(bytes)) => {
+                truncate(&f, disk, bytes)?;
+                Ok(want)
+            }
+            Ok(None) => {
+                log(
+                    ctx,
+                    "its files do not fit the offering disk; keeping the base's size",
+                );
+                Ok(base_bytes)
+            }
+            Err(RuntimeError::Cancelled) => Err(RuntimeError::Cancelled),
+            Err(RuntimeError::DeadlineExceeded) => Err(RuntimeError::DeadlineExceeded),
+            // A failed resize may have left the copy half done: copy the base again and
+            // keep its size, so a snapshot no tool can shrink still boots smaller types.
+            Err(e) => {
+                tracing::warn!(error = %e, "shrinking a new disk failed; using the base's size");
+                log(
+                    ctx,
+                    &format!("shrinking failed ({e}); copying the base again at its size"),
+                );
+                drop(f);
+                std::fs::remove_file(disk).map_err(io_err)?;
+                copy_disk(ctx, base, disk).await?;
+                Ok(base_bytes)
+            }
+        }
     }
 
     /// Undoes a create that did not publish the orb's disk: its staging directory and
@@ -957,21 +1068,24 @@ impl FirecrackerRuntime {
         }
     }
 
-    /// pause → snapshot into a fresh `<gen>.tmp` → disk fsync → manifest. Leaves the
-    /// VMM paused; the caller kills it and publishes.
+    /// pause (unless `held_since`: a held sleep, paused then and dated then) → snapshot into a fresh `<gen>.tmp` → disk
+    /// fsync → manifest. Leaves the VMM paused; the caller kills it and publishes.
     async fn save(
         &self,
         orb: OrbId,
         recipe: &VmRecipe,
         generation: u64,
         guest_boot_id: Option<String>,
+        held_since: Option<u64>,
         ctx: &OpContext,
     ) -> Result<CheckpointManifest, RuntimeError> {
         let started = Instant::now();
         let record: LaunchRecord = process::read_record(&self.run_paths(orb).launch)
             .ok_or_else(|| RuntimeError::Other("launch record is missing".into()))?;
         let api = self.api(orb);
-        self.pause(orb, ctx).await?;
+        if held_since.is_none() {
+            self.pause(orb, ctx).await?;
+        }
         crate::crash_point!("firecracker::save::after_stop");
 
         let tmp = self.checkpoints(orb).fresh_tmp(generation)?;
@@ -1022,7 +1136,7 @@ impl FirecrackerRuntime {
         let manifest = CheckpointManifest {
             orb,
             generation,
-            created_unix_ms: unix_ms_now(),
+            created_unix_ms: held_since.unwrap_or_else(unix_ms_now),
             machine: record.config,
             memory_bytes: len(&memory)?,
             vmstate_bytes: len(&vmstate)?,
@@ -1068,6 +1182,51 @@ impl FirecrackerRuntime {
         if self.kill(orb, proc).await.is_ok() {
             let _ = self.checkpoints(orb).discard_tmp(generation);
         }
+    }
+
+    /// The held part of a sleep (see [`hold`]): the guest synced, so pause the vCPUs,
+    /// make the disk durable and record the hold. A failure resumes the guest.
+    async fn hold(
+        &self,
+        orb: OrbId,
+        generation: u64,
+        proc: &Process,
+        guest_boot_id: Option<String>,
+        ctx: &OpContext,
+    ) -> Result<(), RuntimeError> {
+        let record: LaunchRecord = process::read_record(&self.run_paths(orb).launch)
+            .ok_or_else(|| RuntimeError::Other("launch record is missing".into()))?;
+        let held = async {
+            self.pause(orb, ctx).await?;
+            // The guest's writes are in the host's page cache: durable before the hold
+            // counts, so losing the VMM (and its RAM) loses no synced data.
+            let disk = std::fs::File::open(self.orb_paths(orb).disk).map_err(io_err)?;
+            bounded(ctx, tokio::task::spawn_blocking(move || disk.sync_all()))
+                .await?
+                .map_err(|e| RuntimeError::Other(e.to_string()))?
+                .map_err(|e| RuntimeError::CheckpointFailed(format!("fsync of the disk: {e}")))?;
+            self.record_held(orb, generation, &record, proc.pid, guest_boot_id)
+        }
+        .await;
+        if let Err(e) = held {
+            log(ctx, &format!("hold failed ({e}); resuming the guest"));
+            if let Err(r) = self.api(orb).set_state("Resumed", API_TIMEOUT).await {
+                tracing::error!(%orb, error = %r, "could not resume the guest after a failed hold");
+            }
+            let _ = self.clear_held(orb);
+            return Err(match e {
+                RuntimeError::Cancelled | RuntimeError::DeadlineExceeded => e,
+                other => RuntimeError::CheckpointFailed(other.to_string()),
+            });
+        }
+        crate::crash_point!("firecracker::hold::after_record");
+        log(
+            ctx,
+            &format!(
+                "asleep in RAM: checkpoint {generation} is written only if the agent needs the memory or the hold runs out"
+            ),
+        );
+        Ok(())
     }
 
     // --- restore ----------------------------------------------------------------
@@ -1121,6 +1280,14 @@ impl FirecrackerRuntime {
     ) -> Result<(), RuntimeError> {
         let g = cp.generation;
         match self.reconcile(orb.id).await? {
+            Observed::Held { generation, proc } if generation == g => {
+                // As at a launch: the orb's network repaired and its egress policy (as
+                // edited since) applied before its guest runs again.
+                let recipe = self.read_recipe(orb.id)?;
+                let ids = self.jail_ids(orb.id)?;
+                adopt_net(orb, &self.orb_paths(orb.id).dir, &recipe.net, ids).await?;
+                return self.resume_held(orb.id, g, &proc, ctx).await;
+            }
             Observed::Stopped {
                 checkpoint: Some(latest),
             } if latest == g => {}
@@ -1184,6 +1351,7 @@ impl FirecrackerRuntime {
             .map_err(api_err)?;
         let ms = started.elapsed().as_millis();
         tracing::info!(orb = %orb.id, generation = g, ms, "restored from memory checkpoint");
+        metrics::counter!("orbd_agent_wakes_total", "from" => "checkpoint").increment(1);
         log(ctx, &format!("restored checkpoint {g} in {ms} ms"));
         Ok(())
     }
@@ -1270,6 +1438,8 @@ impl Runtime for FirecrackerRuntime {
             StartSource::ExistingDiskColdBoot => {
                 match self.reconcile(orb.id).await? {
                     Observed::Stopped { .. } => {}
+                    // Asked to cold-boot an orb held in RAM: its sleep is dropped.
+                    Observed::Held { proc, .. } => self.drop_held(orb.id, &proc).await?,
                     Observed::Running(_) => return Ok(()),
                     Observed::Absent => {
                         return Err(RuntimeError::NotFound(format!(
@@ -1281,9 +1451,13 @@ impl Runtime for FirecrackerRuntime {
                         return Err(RuntimeError::Other(format!("cannot boot: orb is {other}")));
                     }
                 }
+                // An archived disk is restored first (it may take longer than `ctx`).
+                self.ensure_disk(orb.id, ctx).await?;
                 // Booting writes the disk: published checkpoints become stale first.
                 self.checkpoints(orb.id).discard_all()?;
-                self.boot(orb, ctx).await
+                self.boot(orb, ctx).await?;
+                metrics::counter!("orbd_agent_wakes_total", "from" => "disk").increment(1);
+                Ok(())
             }
             StartSource::MemoryCheckpoint(cp) => self.restore(orb, cp, ctx).await,
         }
@@ -1293,6 +1467,7 @@ impl Runtime for FirecrackerRuntime {
         &self,
         orb: &OrbDefinition,
         checkpoint_generation: u64,
+        hold: bool,
         ctx: &OpContext,
     ) -> Result<SleepCheckpointRef, RuntimeError> {
         let g = checkpoint_generation;
@@ -1303,6 +1478,7 @@ impl Runtime for FirecrackerRuntime {
             Observed::Stopped {
                 checkpoint: Some(latest),
             } if latest == g => return Ok(done),
+            Observed::Held { generation, .. } if generation == g => return Ok(done),
             other => {
                 return Err(RuntimeError::CheckpointFailed(format!(
                     "orb is not running ({other})"
@@ -1317,9 +1493,15 @@ impl Runtime for FirecrackerRuntime {
                 "checkpoint needs up to {need} bytes, {free} free"
             )));
         }
-        let _permit = bounded(ctx, SAVES.acquire())
-            .await?
-            .map_err(|_| RuntimeError::Other("save semaphore closed".into()))?;
+        // A held sleep writes nothing now: no wait for other saves.
+        let _permit = match hold {
+            true => None,
+            false => Some(
+                bounded(ctx, SAVES.acquire())
+                    .await?
+                    .map_err(|_| RuntimeError::Other("save semaphore closed".into()))?,
+            ),
+        };
         log(ctx, "asking the guest to prepare for sleep");
         let connector = self.connector(orb.id);
         let prep_deadline = (Instant::now() + PREPARE_SLEEP_TIMEOUT).min(ctx.work_deadline);
@@ -1336,8 +1518,19 @@ impl Runtime for FirecrackerRuntime {
                 None
             }
         };
+        // Held only if the guest synced: a held VMM can be lost, and the orb then
+        // cold-boots from its disk.
+        if hold && guest_boot_id.is_some() {
+            return self
+                .hold(orb.id, g, &proc, guest_boot_id, ctx)
+                .await
+                .map(|()| done);
+        }
         log(ctx, &format!("saving memory checkpoint {g}"));
-        let manifest = match self.save(orb.id, &recipe, g, guest_boot_id, ctx).await {
+        let manifest = match self
+            .save(orb.id, &recipe, g, guest_boot_id, None, ctx)
+            .await
+        {
             Ok(m) => m,
             Err(e) => {
                 log(ctx, &format!("save failed ({e}); resuming the guest"));
@@ -1377,6 +1570,8 @@ impl Runtime for FirecrackerRuntime {
                 orb.id
             ))),
             Observed::Stopped { .. } => Ok(()),
+            // Stopped without its memory: the held sleep is dropped.
+            Observed::Held { proc, .. } => self.drop_held(orb.id, &proc).await,
             Observed::Inconsistent(r) => Err(RuntimeError::Other(r)),
             Observed::Running(proc) => {
                 self.stop_process(orb.id, &proc, ctx.work_deadline, ctx)
@@ -1392,6 +1587,14 @@ impl Runtime for FirecrackerRuntime {
     ) -> Result<(), RuntimeError> {
         let trashed = {
             let _g = self.locks.lock(orb).await;
+            if self
+                .read_held(orb)
+                .is_some_and(|h| h.generation == checkpoint.generation)
+                && let Observed::Held { generation, proc } = self.reconcile(orb).await?
+                && generation == checkpoint.generation
+            {
+                return self.drop_held(orb, &proc).await;
+            }
             self.checkpoints(orb).trash(checkpoint.generation)?
         };
         remove_trashed(orb, trashed).await;
@@ -1403,6 +1606,9 @@ impl Runtime for FirecrackerRuntime {
         orb: OrbId,
         checkpoint: &SleepCheckpointRef,
     ) -> Result<Option<CheckpointInfo>, RuntimeError> {
+        if let Some(info) = self.held_info(orb, checkpoint.generation) {
+            return Ok(Some(info));
+        }
         self.checkpoints(orb).info(checkpoint.generation)
     }
 
@@ -1420,7 +1626,10 @@ impl Runtime for FirecrackerRuntime {
         }
         let _g = bounded(ctx, self.locks.lock(orb.id)).await?;
         match self.reconcile(orb.id).await? {
-            Observed::Stopped { .. } => {}
+            Observed::Stopped { .. } => self.ensure_disk(orb.id, ctx).await?,
+            // Its VM is paused after the guest synced: nothing writes the disk until a
+            // wake, which waits for this lock. The copy is what a stopped orb's would be.
+            Observed::Held { .. } => {}
             other => {
                 return Err(RuntimeError::Other(format!(
                     "snapshot needs a stopped orb, found {other}"
@@ -1430,10 +1639,10 @@ impl Runtime for FirecrackerRuntime {
         let disk = self.orb_paths(orb.id).disk;
         log(ctx, &format!("copying disk into project snapshot {key}"));
         let lineage = self.read_recipe(orb.id)?.lineage;
-        // The copy reads no content as root; the guest's filesystem is checked and shrunk
-        // in the orb's jail.
-        let ids = self.jail_ids(orb.id)?;
-        let tools = super::vm::disktools::DiskTools::new(self.jail.as_ref().zip(ids));
+        // A copy (or clone) that reads no content and runs nothing in the orb's jail: a
+        // VMM holding the orb's sleep runs as the orb's uid, and lending a file to the
+        // jail's tools would kill it.
+        let tools = super::vm::disktools::DiskTools::new(None);
         publish_project(
             ctx,
             &self.state_dir,
@@ -1451,6 +1660,7 @@ impl Runtime for FirecrackerRuntime {
 
     async fn delete(&self, orb: OrbId, ctx: &OpContext) -> Result<(), RuntimeError> {
         let _g = bounded(ctx, self.locks.lock(orb)).await?;
+        self.cancel_restore(orb).await;
         let rp = self.run_paths(orb);
         if let Some(record) = process::read_record::<Machine>(&rp.launch)
             && let Some(proc) = Process::adopt(&record, &marker(&record), None)
@@ -1467,6 +1677,7 @@ impl Runtime for FirecrackerRuntime {
             log(ctx, "removing disk and checkpoints");
         }
         remove_via_trash(&dir, &self.trash()).map_err(io_err)?;
+        let _ = self.clear_held(orb);
         self.clear_run(orb);
         match &self.jail {
             Some(j) => j.release(orb),
@@ -1480,6 +1691,118 @@ impl Runtime for FirecrackerRuntime {
 
     fn guest(&self) -> &dyn GuestControl {
         self
+    }
+
+    fn held(&self) -> Vec<HeldSleep> {
+        self.held_sleeps()
+    }
+
+    async fn flush_held(
+        &self,
+        orb: &OrbDefinition,
+        ctx: &OpContext,
+    ) -> Result<FlushOutcome, RuntimeError> {
+        let _lock = bounded(ctx, self.locks.lock(orb.id)).await?;
+        let was_held = self.read_held(orb.id).is_some();
+        let (g, proc) = match self.reconcile(orb.id).await? {
+            Observed::Held { generation, proc } => (generation, proc),
+            Observed::Stopped { checkpoint: None } if was_held => return Ok(FlushOutcome::Lost),
+            // A complete write the reconciliation just published.
+            Observed::Stopped {
+                checkpoint: Some(_),
+            } if was_held => {
+                return Ok(FlushOutcome::Written);
+            }
+            _ => return Ok(FlushOutcome::NotHeld),
+        };
+        let held = self
+            .read_held(orb.id)
+            .ok_or_else(|| RuntimeError::Other("hold record vanished".into()))?;
+        let recipe = self.read_recipe(orb.id)?;
+        let need = recipe.memory_bytes + CHECKPOINT_MARGIN;
+        let free = free_bytes(&self.orb_paths(orb.id).checkpoints).map_err(io_err)?;
+        if free < need {
+            return Err(RuntimeError::InsufficientDisk(format!(
+                "checkpoint needs up to {need} bytes, {free} free"
+            )));
+        }
+        // Held until Firecracker is idle again, a failed write included.
+        let _permit = bounded(ctx, SAVES.acquire())
+            .await?
+            .map_err(|_| RuntimeError::Other("save semaphore closed".into()))?;
+        // The write's own budget starts now, sized to the memory (at 50 MiB/s at worst).
+        let budget = Duration::from_secs(60 + recipe.memory_bytes / (50 * MIB));
+        let wctx = OpContext {
+            work_deadline: Instant::now() + budget,
+            cleanup_deadline: Instant::now() + budget + Duration::from_secs(120),
+            ..ctx.clone()
+        };
+        log(
+            ctx,
+            &format!("writing memory checkpoint {g} of a sleep held in RAM"),
+        );
+        let manifest = match self
+            .save(
+                orb.id,
+                &recipe,
+                g,
+                held.guest_boot_id,
+                Some(held.since_unix_ms),
+                &wctx,
+            )
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                let wait = wctx
+                    .cleanup_deadline
+                    .saturating_duration_since(Instant::now());
+                self.abort_flush(orb.id, g, wait).await;
+                return Err(e);
+            }
+        };
+        crate::crash_point!("firecracker::flush::after_manifest");
+        self.kill(orb.id, &proc).await?;
+        self.checkpoints(orb.id).publish(g)?;
+        crate::crash_point!("firecracker::flush::after_publish");
+        self.clear_held(orb.id)?;
+        log(
+            ctx,
+            &format!(
+                "checkpoint {g} written: {} MiB of RAM in {} ms",
+                manifest.memory_bytes / MIB,
+                manifest.save_ms
+            ),
+        );
+        Ok(FlushOutcome::Written)
+    }
+
+    fn archives(&self) -> bool {
+        true
+    }
+
+    fn holds_sleeps(&self) -> bool {
+        true
+    }
+
+    fn disk_in_flight(&self) -> u64 {
+        self.restoring_bytes()
+    }
+
+    async fn archive_disk(
+        &self,
+        orb: &OrbDefinition,
+        ctx: &OpContext,
+    ) -> Result<Option<ArchiveInfo>, RuntimeError> {
+        let _lock = bounded(ctx, self.locks.lock(orb.id)).await?;
+        match self.reconcile(orb.id).await? {
+            Observed::Stopped { checkpoint: None } => self.archive_locked(orb.id, ctx).await,
+            _ => Ok(None),
+        }
+    }
+
+    fn archived(&self, orb: OrbId) -> Option<ArchiveInfo> {
+        self.archive_info(orb)
     }
 }
 
@@ -1502,6 +1825,15 @@ fn version(path: &Path) -> Result<String, String> {
         ));
     }
     Ok(line)
+}
+
+/// Whether `firecracker --version` (`Firecracker v1.17.0`) takes `discard` on drives:
+/// 1.17 and later. Older ones refuse a drive with a field they do not know.
+fn discard_supported(version: &str) -> bool {
+    let v = version.trim_start_matches("Firecracker v");
+    let mut parts = v.split(['.', '-']).map(|p| p.parse::<u64>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    (major, minor) >= (1, 17)
 }
 
 fn api_err(e: api::ApiError) -> RuntimeError {

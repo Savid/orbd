@@ -12,6 +12,11 @@
 //! * [`gc`]: deletes project snapshots and prepared images no orb is built on.
 //! * [`checkpoint_age`]: opt-in, drops the memory checkpoints of orbs asleep longer than
 //!   `ORBD_CHECKPOINT_MAX_AGE_HOURS` (they cold-boot on their next wake).
+//! * [`hold`]: sleeps held in RAM (`ORBD_SLEEP_HOLD_MINUTES`): their checkpoints are
+//!   written when the hold runs out, when an orb being admitted needs the memory, and on
+//!   a graceful stop.
+//! * [`archive`]: compresses the disks of orbs stopped and unused for
+//!   `ORBD_ARCHIVE_AFTER_HOURS`.
 //! * The egress flow log (`ORBD_FLOW_LOG`, [`crate::runtime::vm::flowlog`]) runs on a
 //!   thread of its own, naming orbs from the network index and this agent's records.
 //! * On a Linux VM agent, the DNS proxy of orbs with restricted egress
@@ -26,11 +31,13 @@
 //! commit) and `agent::terminal_committed` (result durable, Completed not yet sent).
 //! The fake runtime adds `fake::<method>::after_effect`.
 
+mod archive;
 mod checkpoint_age;
 mod db;
 mod detect;
 mod executor;
 mod gc;
+mod hold;
 mod identity;
 mod logs;
 mod maintenance;
@@ -73,6 +80,11 @@ pub(crate) struct Shared {
     /// Orbs with a liveness check queued or running, so a slow `inspect` cannot pile
     /// checks up behind it.
     pub liveness_queued: Mutex<std::collections::HashSet<OrbId>>,
+    /// Orbs with a write of their held sleep queued or running (see [`hold`]).
+    pub flush_queued: Mutex<std::collections::HashSet<OrbId>>,
+    /// Archives running, by orb: a command for the orb cancels its archive (see
+    /// [`archive`]).
+    pub archiving: Mutex<HashMap<OrbId, CancellationToken>>,
     /// Last measurement of the bytes allocated under the state directory.
     pub disk_allocated: AtomicU64,
     /// The same measurement per orb directory.
@@ -83,7 +95,15 @@ pub(crate) struct Shared {
     pub memory_reserve: u64,
     /// Memory of orbs admitted lately, whose guests have not yet touched it: the host's
     /// available memory does not show it yet.
-    pub recent_admits: Mutex<Vec<(std::time::Instant, u64)>>,
+    pub recent_admits: Mutex<Vec<(std::time::Instant, u64, OrbId)>>,
+    /// Writes of held sleeps that failed, by orb: the hold's expiry is not retried
+    /// before then (see [`hold`]).
+    pub flush_backoff: Mutex<HashMap<OrbId, std::time::Instant>>,
+    /// Archives that failed or were not worth it, by orb: not tried again before then.
+    pub archive_backoff: Mutex<HashMap<OrbId, std::time::Instant>>,
+    /// The most an archived orb's restore needs beyond its archive (last measured):
+    /// kept free, so one archived orb can always be restored.
+    pub archive_restore_max: AtomicU64,
     pub tokens: Mutex<HashMap<OperationId, CancellationToken>>,
     pub actors: Mutex<HashMap<OrbId, mpsc::UnboundedSender<executor::Work>>>,
     pub session: Mutex<Option<SessionHandle>>,
@@ -130,6 +150,45 @@ impl Shared {
         detect::mem_available()
     }
 
+    /// Memory held by sleeps in RAM: available to new orbs once their checkpoints are
+    /// written (which admission does when it needs it).
+    pub(crate) fn memory_held(&self) -> u64 {
+        self.held_resident_except(OrbId(uuid::Uuid::nil()))
+    }
+
+    /// [`memory_held`](Self::memory_held) less `orb`'s own.
+    pub(crate) fn held_resident_except(&self, orb: OrbId) -> u64 {
+        self.runtimes
+            .values()
+            .flat_map(|r| r.held())
+            .filter(|h| h.orb != orb)
+            .map(|h| h.resident_bytes)
+            .sum()
+    }
+
+    /// What held sleeps' checkpoints take on disk once written.
+    pub(crate) fn held_memory_bytes(&self) -> u64 {
+        self.runtimes
+            .values()
+            .flat_map(|r| r.held())
+            .map(|h| h.memory_bytes)
+            .sum()
+    }
+
+    /// Disk committed but not written yet: held sleeps' checkpoints, restores running,
+    /// and room for the largest archived orb's restore.
+    pub(crate) fn disk_committed(&self) -> u64 {
+        let in_flight: u64 = self.runtimes.values().map(|r| r.disk_in_flight()).sum();
+        self.held_memory_bytes()
+            .saturating_add(in_flight)
+            .saturating_add(self.archive_restore_max.load(Ordering::Relaxed))
+    }
+
+    /// Free disk less what is committed ([`disk_committed`](Self::disk_committed)).
+    pub(crate) fn disk_room(&self) -> u64 {
+        self.disk_stats().0.saturating_sub(self.disk_committed())
+    }
+
     /// Free and total bytes of the filesystem holding the state directory.
     pub(crate) fn disk_stats(&self) -> (u64, u64) {
         disk_stats(&self.config)
@@ -167,9 +226,11 @@ pub(crate) fn disk_stats(config: &AgentConfig) -> (u64, u64) {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DiskUse {
     total: u64,
-    /// Per `orbs/<orb id>` directory, sorted by orb id: (orb id, bytes, checkpoint bytes).
-    /// Blocks shared with another file (a reflinked disk) count in full.
-    orbs: Vec<(String, u64, u64)>,
+    /// Per `orbs/<orb id>` directory, sorted by orb id: (orb id, bytes, checkpoint bytes,
+    /// disk archived). Blocks shared with another file (a reflinked disk) count in full.
+    orbs: Vec<(String, u64, u64, bool)>,
+    /// The most an archived orb's restore writes beyond its archive.
+    archive_restore_max: u64,
 }
 
 /// Bytes allocated under `dir`: every file's blocks (sparse disks and checkpoints count
@@ -221,9 +282,28 @@ fn measure(dir: &std::path::Path) -> DiskUse {
             }
         }
     }
+    let archive_restore_max = per_orb
+        .keys()
+        .filter_map(|o| {
+            let info: crate::runtime::ArchiveInfo =
+                serde_json::from_slice(&std::fs::read(orbs_dir.join(o).join("archive.json")).ok()?)
+                    .ok()?;
+            (!orbs_dir.join(o).join("disk.raw").exists())
+                .then(|| info.allocated_bytes.saturating_sub(info.compressed_bytes))
+        })
+        .max()
+        .unwrap_or(0);
     DiskUse {
         total,
-        orbs: per_orb.into_iter().map(|(o, (b, c))| (o, b, c)).collect(),
+        archive_restore_max,
+        orbs: per_orb
+            .into_iter()
+            .map(|(o, (b, c))| {
+                let d = orbs_dir.join(&o);
+                let archived = !d.join("disk.raw").exists() && d.join("disk.raw.zst").is_file();
+                (o, b, c, archived)
+            })
+            .collect(),
     }
 }
 
@@ -234,14 +314,17 @@ async fn measure_disk(sh: &Arc<Shared>) {
         .await
         .unwrap_or_default();
     sh.disk_allocated.store(used.total, Ordering::Relaxed);
+    sh.archive_restore_max
+        .store(used.archive_restore_max, Ordering::Relaxed);
     *sh.orb_disk.lock().unwrap() = used
         .orbs
         .into_iter()
         .map(
-            |(orb_id, allocated_bytes, checkpoint_bytes)| pb::OrbDiskUsage {
+            |(orb_id, allocated_bytes, checkpoint_bytes, archived)| pb::OrbDiskUsage {
                 orb_id,
                 allocated_bytes,
                 checkpoint_bytes,
+                archived,
             },
         )
         .collect();
@@ -316,6 +399,9 @@ pub async fn run(
         None => crate::model::disk_reserve(disk_stats(&config).1),
     };
     tracing::info!(disk_reserve_gib = disk_reserve / GIB, "disk reserve");
+    if let Some(f) = config.runtime.firecracker.as_mut() {
+        f.disk_reserve = disk_reserve;
+    }
     let memory_reserve = match config.agent.capacity.memory_reserve_gib {
         Some(g) => g.saturating_mul(GIB),
         None => (4 * GIB).max(detect::mem_total().unwrap_or(0) / 10),
@@ -378,6 +464,9 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("firecracker runtime: {e}"))?;
         runtimes.insert(RuntimeKind::Firecracker, Arc::new(rt));
     }
+    if vm_images.is_some() {
+        crate::runtime::vm::reflink::probe(&config.agent.state_dir);
+    }
 
     if let Some(addr) = config.agent.metrics_listen
         && let Err(e) = crate::telemetry::init_metrics(addr)
@@ -397,6 +486,11 @@ pub async fn run(
         draining: CancellationToken::new(),
         reserved: Mutex::default(),
         liveness_queued: Mutex::default(),
+        flush_queued: Mutex::default(),
+        archiving: Mutex::default(),
+        flush_backoff: Mutex::default(),
+        archive_backoff: Mutex::default(),
+        archive_restore_max: AtomicU64::new(0),
         disk_allocated: AtomicU64::new(0),
         orb_disk: Mutex::default(),
         disk_reserve,
@@ -421,6 +515,8 @@ pub async fn run(
     tokio::spawn(executor::watch(shared.clone()));
     tokio::spawn(gc::run_loop(shared.clone()));
     tokio::spawn(checkpoint_age::run_loop(shared.clone()));
+    tokio::spawn(hold::run_loop(shared.clone()));
+    tokio::spawn(archive::run_loop(shared.clone()));
     measure_disk(&shared).await;
     tokio::spawn({
         let sh = shared.clone();
@@ -533,14 +629,22 @@ mod tests {
         w("orbs/a/checkpoints/3/memory", 128 << 10);
         w("orbs/b/logs/console.log", 16 << 10);
         w("images/x/rootfs", 32 << 10);
+        w("orbs/c/disk.raw.zst", 4 << 10);
         std::fs::create_dir_all(dir.path().join("orbs/empty")).unwrap();
         let used = measure(dir.path());
+        let archived: Vec<&str> = used
+            .orbs
+            .iter()
+            .filter(|o| o.3)
+            .map(|o| o.0.as_str())
+            .collect();
+        assert_eq!(archived, ["c"], "an archive without its disk is archived");
         let orbs: HashMap<&str, (u64, u64)> = used
             .orbs
             .iter()
-            .map(|(o, b, c)| (o.as_str(), (*b, *c)))
+            .map(|(o, b, c, _)| (o.as_str(), (*b, *c)))
             .collect();
-        assert_eq!(orbs.len(), 3, "{orbs:?}");
+        assert_eq!(orbs.len(), 4, "{orbs:?}");
         assert_eq!(
             orbs["empty"],
             (0, 0),

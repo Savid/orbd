@@ -140,6 +140,7 @@ pub(crate) async fn recover(sh: &Arc<Shared>) -> anyhow::Result<()> {
             true,
         )
         .await?;
+        record_lost_sleep(sh, d.id, &observed).await?;
         // An orb we cannot inspect is assumed to hold its resources.
         let running = !matches!(
             observed,
@@ -160,6 +161,49 @@ pub(crate) async fn recover(sh: &Arc<Shared>) -> anyhow::Result<()> {
         enqueue(sh, r.orb.id, r.operation_id);
     }
     super::maintenance::restore_all(sh, &busy).await
+}
+
+/// At startup: an orb recorded asleep on a checkpoint the host no longer has (a sleep
+/// held in RAM whose VMM went with the agent, without a drain) is recorded as the host
+/// has it, so it is reported and handled (e.g. archived) as such.
+async fn record_lost_sleep(
+    sh: &Shared,
+    id: OrbId,
+    observed: &Result<RuntimeObservation, RuntimeError>,
+) -> anyhow::Result<()> {
+    let Ok(RuntimeObservation::Stopped { checkpoint }) = observed else {
+        return Ok(());
+    };
+    let Some(row) = sh.db.call(move |c| db::get_orb(c, id)).await? else {
+        return Ok(());
+    };
+    let Some(OrbState::Known {
+        state: StableOrbState::Sleeping {
+            checkpoint: recorded,
+        },
+    }) = &row.last_state
+    else {
+        return Ok(());
+    };
+    if checkpoint.as_ref() == Some(recorded) {
+        return Ok(());
+    }
+    let state = OrbState::known(match checkpoint {
+        Some(cp) => StableOrbState::Sleeping {
+            checkpoint: cp.clone(),
+        },
+        None => StableOrbState::DiskOnlyStopped {
+            reason: "its memory checkpoint is gone (asleep in RAM when the agent stopped \
+                     without a drain); processes lost"
+                .into(),
+        },
+    });
+    tracing::warn!(orb = %id, now = ?state, "orb was recorded asleep on a checkpoint the host no longer has");
+    metrics::counter!("orbd_agent_held_flushes_total", "reason" => "lost").increment(1);
+    sh.db
+        .call(move |c| db::set_last_state(c, id, &state))
+        .await?;
+    Ok(())
 }
 
 /// Records that an orb last known running was observed stopped, its VMM gone without a
@@ -288,6 +332,16 @@ pub(crate) fn enqueue(sh: &Arc<Shared>, orb: OrbId, op: OperationId) {
 }
 
 pub(crate) fn enqueue_work(sh: &Arc<Shared>, orb: OrbId, work: Work) {
+    // A command goes ahead of an archive of the orb's disk (see `archive`).
+    if matches!(work, Work::Op(_))
+        && let Some(t) = sh
+            .archiving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&orb)
+    {
+        t.cancel();
+    }
     let tx = {
         let mut actors = sh.actors.lock().unwrap_or_else(|e| e.into_inner());
         actors
@@ -393,7 +447,10 @@ impl From<RuntimeError> for Flow {
         use FailureCode as F;
         let (code, msg) = match &e {
             RuntimeError::Cancelled | RuntimeError::DeadlineExceeded => return Flow::Interrupted,
-            RuntimeError::ImageNotReady(_) => (F::ImageNotReady, e.to_string()),
+            // Both mean: retry the spawn shortly.
+            RuntimeError::ImageNotReady(_) | RuntimeError::DiskNotReady(_) => {
+                (F::ImageNotReady, e.to_string())
+            }
             RuntimeError::CheckpointIncompatible(_) => (F::CheckpointIncompatible, e.to_string()),
             RuntimeError::CheckpointFailed(_) => (F::CheckpointFailed, e.to_string()),
             RuntimeError::InsufficientDisk(_) => (F::InsufficientDisk, e.to_string()),
@@ -574,6 +631,11 @@ async fn finalize(
             r.insert(orb, receipt.orb.spec.template.resources);
         } else {
             r.remove(&orb);
+            // Admitted but not running: it takes none of the host's memory.
+            sh.recent_admits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(_, _, o)| *o != orb);
         }
     }
     let o2 = outcome.clone();
@@ -740,6 +802,12 @@ impl Run {
     /// back), so an orb starts only if the host's available memory, less the reserve and
     /// less what orbs admitted in the last [`RECENT_ADMIT`] may still take, holds it.
     fn admit(&self) -> Result<(), Flow> {
+        self.admit_as(false)
+    }
+
+    /// [`admit`](Self::admit) for an orb whose memory is in RAM already (a sleep held
+    /// in RAM): the host's available memory does not need to hold it again.
+    fn admit_as(&self, resident: bool) -> Result<(), Flow> {
         let need = self.orb().spec.template.resources;
         let mut reserved = self.sh.reserved.lock().unwrap_or_else(|e| e.into_inner());
         if reserved.contains_key(&self.orb().id) {
@@ -752,12 +820,21 @@ impl Run {
             });
         let total = used.checked_add(need);
         let cap = self.sh.capacity;
-        let (free, _) = self.sh.disk_stats();
+        // Committed writes (held sleeps' checkpoints, restores) are not free.
+        let free = self.sh.disk_room();
         let reserve = self.sh.disk_reserve;
-        let mem_short = self.memory_short(need.memory_bytes);
+        let mem_short = match resident {
+            true => None,
+            false => self.memory_short(need.memory_bytes),
+        };
+        // Sleeps held in RAM (other than this orb's) count against capacity.
+        let held = self.sh.held_resident_except(self.orb().id);
         let (code, what) = match total {
             None => (FailureCode::InsufficientMemory, "resources overflow".into()),
-            Some(t) if t.memory_bytes > cap.memory_bytes || t.vcpus > cap.vcpus => {
+            Some(t)
+                if t.memory_bytes.saturating_add(held) > cap.memory_bytes
+                    || t.vcpus > cap.vcpus =>
+            {
                 (FailureCode::InsufficientMemory, "memory/cpu".into())
             }
             Some(_) if mem_short.is_some() => (
@@ -774,11 +851,14 @@ impl Run {
             ),
             Some(_) => {
                 reserved.insert(self.orb().id, need);
-                self.sh
-                    .recent_admits
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((Instant::now(), need.memory_bytes));
+                // A wake from RAM uses memory the host already shows as used.
+                if !resident {
+                    self.sh
+                        .recent_admits
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((Instant::now(), need.memory_bytes, self.orb().id));
+                }
                 return Ok(());
             }
         };
@@ -797,8 +877,8 @@ impl Run {
                 .recent_admits
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            r.retain(|(t, _)| t.elapsed() < RECENT_ADMIT);
-            r.iter().map(|(_, b)| b).sum()
+            r.retain(|(t, _, _)| t.elapsed() < RECENT_ADMIT);
+            r.iter().map(|(_, b, _)| b).sum()
         };
         let room = available
             .saturating_sub(self.sh.memory_reserve)
@@ -815,6 +895,74 @@ impl Run {
                 gib(recent)
             )
         })
+    }
+
+    /// Writes sleeps held in RAM (oldest first) while the host lacks the memory this
+    /// orb needs (see `hold::make_room`).
+    async fn make_room(&self) -> Result<(), Flow> {
+        let need = self.orb().spec.template.resources;
+        let short = || self.memory_short(need.memory_bytes).is_some() || self.capacity_short(need);
+        if !short() {
+            return Ok(());
+        }
+        let written = tokio::select! {
+            biased;
+            _ = self.ctx.cancel.cancelled() => return Err(Flow::Interrupted),
+            _ = tokio::time::sleep_until(self.ctx.work_deadline.into()) => return Err(Flow::Interrupted),
+            n = super::hold::make_room(&self.sh, self.orb().id, short) => n,
+        };
+        if written > 0 {
+            self.log(&format!(
+                "wrote {written} sleep(s) held in RAM to disk to make room"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether running orbs and sleeps held in RAM leave no capacity for `need`.
+    fn capacity_short(&self, need: crate::model::Resources) -> bool {
+        let used = self.sh.reserved_total();
+        let held = self.sh.held_resident_except(self.orb().id);
+        used.memory_bytes
+            .saturating_add(need.memory_bytes)
+            .saturating_add(held)
+            > self.sh.capacity.memory_bytes
+    }
+
+    /// A spawn that would fail for its image anyway does not write held sleeps first.
+    fn image_not_ready(&self) -> Result<(), Flow> {
+        let (Some(store), InitialDiskSource::Image { image_ref }) =
+            (&self.sh.images, &self.orb().spec.initial_disk)
+        else {
+            return Ok(());
+        };
+        match store.get(image_ref) {
+            Err(crate::image::ImageError::NotReady(m)) => Err(Flow::Failed(CommandFailure {
+                code: FailureCode::ImageNotReady,
+                message: format!("image not ready: {m}"),
+            })),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether this pause may hold the orb's sleep in RAM: holds are on, the agent is
+    /// not stopping, and the host would still fit another orb of this size without
+    /// writing one (so admissions rarely wait on a write).
+    fn may_hold(&self) -> bool {
+        if self.sh.config.agent.sleep_hold.is_none()
+            || self.sh.draining.is_cancelled()
+            || !self.rt.holds_sleeps()
+        {
+            return false;
+        }
+        let memory = self.orb().spec.template.resources.memory_bytes;
+        super::hold::may_hold(
+            memory,
+            self.sh.memory_available(),
+            self.sh.memory_reserve,
+            self.sh.held_memory_bytes(),
+            self.sh.disk_room().saturating_sub(self.sh.disk_reserve),
+        )
     }
 
     // --- spawn --------------------------------------------------------------
@@ -895,6 +1043,8 @@ impl Run {
                         ProcessDisposition::NotApplicable,
                     ));
                 }
+                self.image_not_ready()?;
+                self.make_room().await?;
                 self.admit()?;
                 self.check()?;
                 if !planned_new {
@@ -955,7 +1105,12 @@ impl Run {
             RuntimeObservation::Stopped {
                 checkpoint: Some(cp),
             } => {
-                self.admit()?;
+                // Held in RAM: its memory is there already, and it resumes in place.
+                let held = super::hold::is_held(&*self.rt, orb_id);
+                if !held {
+                    self.make_room().await?;
+                }
+                self.admit_as(held)?;
                 self.progress.start = Some(StartPlan {
                     kind: StartKind::MemoryRestore,
                     checkpoint: Some(cp.clone()),
@@ -975,6 +1130,22 @@ impl Run {
                 StartKind::MemoryRestore
             }
             RuntimeObservation::Stopped { checkpoint: None } => {
+                if let Some(a) = self.rt.archived(orb_id).filter(|a| !a.restoring) {
+                    // A restore writes the disk back: it must fit above the reserve.
+                    let (free, _) = self.sh.disk_stats();
+                    if free.saturating_sub(self.sh.disk_reserve) < a.allocated_bytes {
+                        return Err(Flow::Failed(CommandFailure {
+                            code: FailureCode::InsufficientDisk,
+                            message: format!(
+                                "agent capacity exceeded (disk: restoring the orb's archived \
+                                 disk needs {} MiB, {} MiB free above the reserve)",
+                                a.allocated_bytes / crate::model::MIB,
+                                free.saturating_sub(self.sh.disk_reserve) / crate::model::MIB
+                            ),
+                        }));
+                    }
+                }
+                self.make_room().await?;
                 self.admit()?;
                 self.progress.start = Some(StartPlan {
                     kind: StartKind::ExistingDiskColdBoot,
@@ -1159,10 +1330,14 @@ impl Run {
                         }
                     };
                     self.check()?;
-                    self.log("saving memory checkpoint");
+                    let hold = self.may_hold();
+                    self.log(match hold && self.rt.holds_sleeps() {
+                        true => "going to sleep (held in RAM)",
+                        false => "saving memory checkpoint",
+                    });
                     match self
                         .rt
-                        .checkpoint_and_stop(self.orb(), generation, &self.ctx)
+                        .checkpoint_and_stop(self.orb(), generation, hold, &self.ctx)
                         .await
                     {
                         Ok(cp) => {
