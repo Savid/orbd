@@ -250,6 +250,8 @@ pub struct FirecrackerRuntime {
     /// Builds each VMM's jail; None with `ORBD_VMM_JAIL=off` (or a non-root agent).
     jail: Option<Jailer>,
     locks: OrbLocks,
+    /// The Firecracker binary takes `discard` on drives (1.17 and later).
+    discard: bool,
 }
 
 impl FirecrackerRuntime {
@@ -325,6 +327,10 @@ impl FirecrackerRuntime {
         )
         .map_err(|e| other("network", &e))?;
         let cpu = CpuIdentity::host();
+        let discard = discard_supported(&firecracker.version);
+        if !discard {
+            tracing::warn!(firecracker = %firecracker.version, "this Firecracker predates drive discard (1.17): space guests free is not returned to the host");
+        }
         tracing::info!(firecracker = %firecracker.version, cpu = %cpu.model, jailed = jail.is_some(), "firecracker runtime ready");
         Ok(Self {
             config,
@@ -335,6 +341,7 @@ impl FirecrackerRuntime {
             cpu,
             jail,
             locks: OrbLocks::default(),
+            discard,
         })
     }
 
@@ -763,6 +770,10 @@ impl FirecrackerRuntime {
                     path_on_host: &op.disk,
                     is_root_device: true,
                     is_read_only: false,
+                    // Space the guest frees (fstrim before every sleep) goes back to
+                    // the host. Only a boot configures drives: a restore keeps the
+                    // device its checkpoint was saved with, discard or not.
+                    discard: self.discard.then_some(true),
                 },
                 t,
             )
@@ -852,14 +863,6 @@ impl FirecrackerRuntime {
         };
         let res = orb.spec.template.resources;
         let base_bytes = std::fs::metadata(&base).map_err(io_err)?.len();
-        // Project snapshots published before they were shrunk can outsize the offering.
-        let disk_bytes = res.disk_bytes.max(base_bytes);
-        if disk_bytes > res.disk_bytes {
-            log(
-                ctx,
-                &format!("base is {base_bytes} bytes, larger than the offering disk"),
-            );
-        }
         // The jail uid and network index are claimed (durably, by this orb) before
         // anything is built.
         let ids = self.jail_ids(orb.id)?;
@@ -885,11 +888,11 @@ impl FirecrackerRuntime {
                 return Err(RuntimeError::Other(e.to_string()));
             }
         };
-        let recipe = VmRecipe {
+        let mut recipe = VmRecipe {
             orb: orb.id,
             vcpus: res.vcpus,
             memory_bytes: res.memory_bytes,
-            disk_bytes,
+            disk_bytes: res.disk_bytes,
             source,
             lineage,
             net,
@@ -900,15 +903,20 @@ impl FirecrackerRuntime {
             for d in ["logs", "checkpoints"] {
                 std::fs::create_dir_all(staging.join(d)).map_err(io_err)?;
             }
-            write_json_atomic(&staging.join("vm.json"), &recipe).map_err(io_err)?;
             let disk = staging.join("disk.raw");
             log(ctx, "copying the root disk");
             copy_disk(ctx, &base, &disk).await?;
+            if base_bytes > res.disk_bytes {
+                recipe.disk_bytes = self
+                    .fit_disk(&base, &disk, base_bytes, res.disk_bytes, ids, ctx)
+                    .await?;
+            }
+            write_json_atomic(&staging.join("vm.json"), &recipe).map_err(io_err)?;
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&disk)
                 .map_err(io_err)?;
-            f.set_len(disk_bytes).map_err(io_err)?;
+            f.set_len(recipe.disk_bytes).map_err(io_err)?;
             f.sync_all().map_err(io_err)?;
             fsync_dir(&staging).map_err(io_err)
         }
@@ -926,6 +934,58 @@ impl FirecrackerRuntime {
             super::vm::count_snapshot_fallback("lineage");
         }
         Ok(())
+    }
+
+    /// The size of a new disk copied from a base of `base_bytes`, larger than the
+    /// offering's `want`: the guest's filesystem is shrunk to `want` in the new orb's
+    /// jail (project snapshots are published as copied, at their source orb's size), or
+    /// the disk keeps the base's size if its files do not fit.
+    async fn fit_disk(
+        &self,
+        base: &Path,
+        disk: &Path,
+        base_bytes: u64,
+        want: u64,
+        ids: Option<Ids>,
+        ctx: &OpContext,
+    ) -> Result<u64, RuntimeError> {
+        use super::vm::disktools::{DiskTools, shrink_ext4_to, truncate};
+        log(
+            ctx,
+            &format!("base is {base_bytes} bytes, larger than the offering disk; shrinking it"),
+        );
+        let tools = DiskTools::new(self.jail.as_ref().zip(ids));
+        let lent = tools.lend(disk).map_err(io_err)?;
+        let shrunk = shrink_ext4_to(&tools, ctx, disk, want).await;
+        let f = tools.take_back(lent).map_err(io_err)?;
+        match shrunk {
+            Ok(Some(bytes)) => {
+                truncate(&f, disk, bytes)?;
+                Ok(want)
+            }
+            Ok(None) => {
+                log(
+                    ctx,
+                    "its files do not fit the offering disk; keeping the base's size",
+                );
+                Ok(base_bytes)
+            }
+            Err(RuntimeError::Cancelled) => Err(RuntimeError::Cancelled),
+            Err(RuntimeError::DeadlineExceeded) => Err(RuntimeError::DeadlineExceeded),
+            // A failed resize may have left the copy half done: copy the base again and
+            // keep its size, so a snapshot no tool can shrink still boots smaller types.
+            Err(e) => {
+                tracing::warn!(error = %e, "shrinking a new disk failed; using the base's size");
+                log(
+                    ctx,
+                    &format!("shrinking failed ({e}); copying the base again at its size"),
+                );
+                drop(f);
+                std::fs::remove_file(disk).map_err(io_err)?;
+                copy_disk(ctx, base, disk).await?;
+                Ok(base_bytes)
+            }
+        }
     }
 
     /// Undoes a create that did not publish the orb's disk: its staging directory and
@@ -1460,8 +1520,8 @@ impl Runtime for FirecrackerRuntime {
             DiskSource::ProjectSnapshot { key } => Some(key),
             DiskSource::Image { .. } => None,
         };
-        // The copy reads no content as root; the guest's filesystem is checked and shrunk
-        // in the orb's jail.
+        // The copy reads no content as root, and nothing parses the guest's filesystem
+        // (see `publish_project`).
         let ids = self.jail_ids(orb.id)?;
         let tools = super::vm::disktools::DiskTools::new(self.jail.as_ref().zip(ids));
         publish_project(
@@ -1537,6 +1597,15 @@ fn version(path: &Path) -> Result<String, String> {
         ));
     }
     Ok(line)
+}
+
+/// Whether `firecracker --version` (`Firecracker v1.17.0`) takes `discard` on drives:
+/// 1.17 and later. Older ones refuse a drive with a field they do not know.
+fn discard_supported(version: &str) -> bool {
+    let v = version.trim_start_matches("Firecracker v");
+    let mut parts = v.split(['.', '-']).map(|p| p.parse::<u64>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    (major, minor) >= (1, 17)
 }
 
 fn api_err(e: api::ApiError) -> RuntimeError {

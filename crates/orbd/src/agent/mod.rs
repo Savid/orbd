@@ -402,6 +402,9 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("firecracker runtime: {e}"))?;
         runtimes.insert(RuntimeKind::Firecracker, Arc::new(rt));
     }
+    if vm_images.is_some() {
+        crate::runtime::vm::reflink::probe(&config.agent.state_dir);
+    }
 
     if let Some(addr) = config.agent.metrics_listen
         && let Err(e) = crate::telemetry::init_metrics(addr)

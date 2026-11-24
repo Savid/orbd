@@ -408,14 +408,18 @@ impl ImageStore {
     }
 
     /// Moves into the trash every published image whose key is not in `in_use` (the
-    /// bases of this host's orbs), that is not the current image of a prewarmed
-    /// reference and that has not been used for `idle`. Returns each image's key and
+    /// bases of this host's orbs) and that is not the current image of a prewarmed
+    /// reference, once unused for long enough: `idle` for the current image of any
+    /// reference (what a spawn of it gets now), `stale_idle` for every other one. A
+    /// Firecracker orb's disk is a standalone copy, so an image a reference moved on
+    /// from is only worth keeping while spawns still use it. Returns each image's key and
     /// its path in the trash, for the caller to delete. The caller holds
     /// [`crate::runtime::vm::BASES`] exclusively.
     pub fn collect_garbage(
         &self,
         in_use: &HashSet<String>,
         idle: Duration,
+        stale_idle: Duration,
     ) -> Vec<(String, PathBuf)> {
         let prewarmed: HashSet<String> = self
             .inner
@@ -423,6 +427,15 @@ impl ImageStore {
             .prewarm
             .iter()
             .filter_map(|r| self.read_ref(&platform_ref(r)))
+            .map(|r| self.cache_key(&r.manifest_digest))
+            .collect();
+        let current: HashSet<String> = std::fs::read_dir(self.inner.images.join("refs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                serde_json::from_slice::<RefRecord>(&std::fs::read(e.path()).ok()?).ok()
+            })
             .map(|r| self.cache_key(&r.manifest_digest))
             .collect();
         let mut trashed = Vec::new();
@@ -433,10 +446,15 @@ impl ImageStore {
         {
             let key = e.file_name().to_string_lossy().into_owned();
             let dir = e.path();
+            let keep_for = if current.contains(&key) {
+                idle
+            } else {
+                stale_idle
+            };
             if !dir.join(META_FILE).is_file()
                 || in_use.contains(&key)
                 || prewarmed.contains(&key)
-                || !idle_for(&dir, crate::runtime::vm::last_used(&dir), idle)
+                || !idle_for(&dir, crate::runtime::vm::last_used(&dir), keep_for)
             {
                 continue;
             }
@@ -832,7 +850,8 @@ mod tests {
 
         let in_use = HashSet::from(["base-of-an-orb".to_owned()]);
         let idle = Duration::from_secs(72 * 3600);
-        let trashed = store.collect_garbage(&in_use, idle);
+        let stale_idle = Duration::from_secs(6 * 3600);
+        let trashed = store.collect_garbage(&in_use, idle, stale_idle);
         assert_eq!(trashed.len(), 1);
         assert_eq!(trashed[0].0, "idle");
         assert!(
@@ -1002,5 +1021,47 @@ mod tests {
             since(&store.ref_record("a:latest", &image("sha256:2", "l1"), 4000)),
             4000
         );
+    }
+
+    /// An image no reference resolves to any more goes once unused for the short idle
+    /// time; the current image of a reference keeps the long one.
+    #[tokio::test]
+    async fn images_a_reference_moved_on_from_go_sooner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, state) = quiet_store(tmp.path());
+        let other = "example.invalid/other:tag";
+        write_json_atomic(
+            &store.ref_path(other),
+            &RefRecord {
+                image_ref: other.into(),
+                manifest_digest: "sha256:now".into(),
+                resolved_unix: now_unix(),
+                lineage: None,
+            },
+        )
+        .unwrap();
+        let current = store.cache_key("sha256:now");
+        let images = state.join("images");
+        let hours_ago = |path: &Path, h: u64| {
+            let t = SystemTime::now() - Duration::from_secs(h * 3600);
+            std::fs::File::open(path).unwrap().set_modified(t).unwrap();
+        };
+        for (key, h) in [
+            (current.as_str(), 7),
+            ("moved-on", 7),
+            ("moved-on-lately", 5),
+        ] {
+            std::fs::create_dir_all(images.join(key)).unwrap();
+            std::fs::write(images.join(key).join(META_FILE), b"{}").unwrap();
+            hours_ago(&images.join(key), h);
+        }
+        let trashed = store.collect_garbage(
+            &HashSet::new(),
+            Duration::from_secs(72 * 3600),
+            Duration::from_secs(6 * 3600),
+        );
+        let keys: Vec<&str> = trashed.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["moved-on"]);
+        assert!(images.join(&current).is_dir() && images.join("moved-on-lately").is_dir());
     }
 }

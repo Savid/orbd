@@ -959,7 +959,8 @@ impl QemuRuntime {
         };
         let res = orb.spec.template.resources;
         let base = BaseDisk::of(&base_path, &source).map_err(io_err)?;
-        // Project snapshots published before they were shrunk can outsize the offering.
+        // Project snapshots are published at their source orb's disk size, so one can
+        // outsize the offering: the overlay then keeps the base's size.
         let disk_bytes = res.disk_bytes.max(base.size);
         if disk_bytes > res.disk_bytes {
             log(
