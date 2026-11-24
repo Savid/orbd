@@ -317,6 +317,20 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
         let root = nix::unistd::geteuid().is_root();
         r.line(first_line(Path::new("ip"), &["-V"]), "ip", root);
         r.line(first_line(Path::new("nft"), &["--version"]), "nft", root);
+        // Archives of stopped Firecracker orbs' disks: required once any exists (it
+        // restores them), else without it they are not archived.
+        let state = std::env::var_os("ORBD_STATE_DIR")
+            .map_or("/var/lib/orbd".into(), std::path::PathBuf::from);
+        let archived = std::fs::read_dir(state.join("orbs"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.path().join("disk.raw.zst").is_file());
+        r.line(
+            first_line(Path::new("zstd"), &["--version"]),
+            "zstd",
+            archived,
+        );
         r.line(host_firewall(), "host firewall", false);
     }
     r.line(accel(), ACCEL_NAME, true);

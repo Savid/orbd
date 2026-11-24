@@ -362,6 +362,23 @@ VMs) loses only its RAM: the orb is recorded stopped and cold-boots from its dis
 the guest synced and the agent made durable before the pause. A pause that publishes a
 project snapshot holds too: its disk is copied from the paused VM.
 
+The disk of a Firecracker orb stopped without a checkpoint (dropped for its age, a
+failed save, or a sleep held in RAM that was lost or dropped) and unused for `ORBD_ARCHIVE_AFTER_HOURS` (`--archive-after-hours`; default
+24, 0 never) is archived: compressed with `zstd` in place, about 3x for a typical orb, at
+idle CPU and I/O priority, and checked before the disk is removed. An archive stops,
+leaving the disk, if the filesystem would go below the agent's disk reserve or the
+archive would not shrink the disk to 80% or less (that orb is tried again a day later).
+On a filesystem with reflinks an orb is archived only once its base image or snapshot is
+gone, since until then its disk shares their blocks. `orbd orb list` notes `disk
+archived`. Its next spawn restores it before the cold boot, which takes seconds for a
+typical disk; one too big to restore within the spawn's time fails with
+`image_not_ready` while the restore goes on, and a later spawn finds it done. A restore
+starts only if what it writes fits above the reserve after the restores already
+running, and the agent keeps room for the largest archived orb's restore out of what it
+reports free. A command for the orb cancels an archive in progress. Orbs stopped that
+long rarely come back, and the archive and a restore together write about 1.3 times the
+disk, so the setting is worth raising where they often do.
+
 To delete the orbs of archived threads sooner, run a job that checks each orb's thread
 in Amp: `orbd orb list --json` lists every orb's Amp id (`amp-<thread id>`), state,
 agent and what it holds on disk (`--asleep-days 7` narrows it to orbs asleep a week or
@@ -486,8 +503,9 @@ raise it too, e.g. a drop-in `/etc/systemd/system/docker.service.d/orbd.conf` wi
 (~5 GiB).
 
 The image ships QEMU 11.0 (Debian 13 backports), Firecracker 1.17 and orbd's Linux 7.3
-guest kernel; an agent run outside it needs QEMU 9.0 or newer, `ip` and `nft`, and
-Firecracker as `firecracker` on its `PATH` (`orbd doctor` checks). Orb types without
+guest kernel; an agent run outside it needs QEMU 9.0 or newer, `ip` and `nft`, `zstd`
+(for archived disks), and Firecracker as `firecracker` on its `PATH` (`orbd doctor`
+checks). Orb types without
 `kvm` run only in Firecracker, so an agent without it takes none of them, and with nested
 KVM off (the default) no orbs at all; it warns when it starts. VM orbs run in their own
 network namespace behind NAT and cannot reach the agent itself, each other or private

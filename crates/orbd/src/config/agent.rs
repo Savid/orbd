@@ -161,6 +161,9 @@ pub struct AgentSection {
     /// wake within it resumes in place and writes nothing (`ORBD_SLEEP_HOLD_MINUTES`;
     /// None: written at once).
     pub sleep_hold: Option<std::time::Duration>,
+    /// The disk of an orb stopped (without a checkpoint) and unused this long is
+    /// compressed until its next wake (`ORBD_ARCHIVE_AFTER_HOURS`; None: never).
+    pub archive_after: Option<std::time::Duration>,
     /// Whether VMMs on Linux run jailed (`ORBD_VMM_JAIL`).
     pub vmm_jail: JailMode,
     /// Jailed VMMs run as `vmm_jail_uid_base + <index>` (`ORBD_VMM_JAIL_UID_BASE`).
@@ -570,6 +573,7 @@ impl AgentSection {
             overflow: false,
             checkpoint_max_age: None,
             sleep_hold: Self::sleep_hold_minutes(None),
+            archive_after: Self::archive_after_hours(None),
             vmm_jail: JailMode::On,
             vmm_jail_uid_base: DEFAULT_JAIL_UID_BASE,
             vm_only: true,
@@ -593,11 +597,22 @@ impl AgentSection {
             .filter(|&m| m > 0)
             .map(|m| std::time::Duration::from_secs(m.saturating_mul(60)))
     }
+
+    /// `ORBD_ARCHIVE_AFTER_HOURS`: unset is [`DEFAULT_ARCHIVE_AFTER_HOURS`], 0 off.
+    pub fn archive_after_hours(hours: Option<u64>) -> Option<std::time::Duration> {
+        Some(hours.unwrap_or(DEFAULT_ARCHIVE_AFTER_HOURS))
+            .filter(|&h| h > 0)
+            .map(|h| std::time::Duration::from_secs(h.saturating_mul(3600)))
+    }
 }
 
 /// How long a sleep stays in RAM before its checkpoint is written, by default. Most
 /// wakes come within minutes of the sleep; one within this writes nothing.
 pub const DEFAULT_SLEEP_HOLD_MINUTES: u64 = 20;
+
+/// How long an orb stays stopped and unused before its disk is archived, by default.
+/// Orbs stopped this long rarely come back, and one that does pays a restore.
+pub const DEFAULT_ARCHIVE_AFTER_HOURS: u64 = 24;
 
 /// Per-field overrides of the detected capacity.
 #[derive(Clone, Copy, Debug, Default)]
@@ -727,6 +742,10 @@ pub struct FirecrackerRuntimeConfig {
     /// The jail Firecracker runs in (from `agent.vmm_jail*`); None runs it unjailed.
     #[serde(skip)]
     pub jail: Option<VmmJail>,
+    /// Free disk the agent keeps (its disk reserve): archives and restores of orbs'
+    /// disks never take the filesystem below it.
+    #[serde(skip)]
+    pub disk_reserve: u64,
 }
 
 impl Default for FirecrackerRuntimeConfig {
@@ -739,6 +758,7 @@ impl Default for FirecrackerRuntimeConfig {
             guest_network: GuestNetwork::default(),
             egress: Egress::default(),
             jail: None,
+            disk_reserve: 0,
         }
     }
 }
@@ -841,6 +861,17 @@ mod tests {
         assert_eq!(
             AgentSection::sleep_hold_minutes(Some(5)),
             Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn archives_default_on_and_zero_turns_them_off() {
+        let s = AgentSection::new("/s".into());
+        assert_eq!(s.archive_after, Some(Duration::from_secs(24 * 3600)));
+        assert_eq!(AgentSection::archive_after_hours(Some(0)), None);
+        assert_eq!(
+            AgentSection::archive_after_hours(Some(72)),
+            Some(Duration::from_secs(72 * 3600))
         );
     }
 

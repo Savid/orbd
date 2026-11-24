@@ -14,6 +14,7 @@ use crate::model::{
 use crate::model::{OperationId, OrbId, SleepCheckpointRef};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -670,6 +671,23 @@ pub fn list_orb_definitions(conn: &Connection) -> rusqlite::Result<Vec<OrbDefini
     )?;
     st.query_map([], |r| from_json(&r.get::<_, String>(0)?))?
         .collect()
+}
+
+/// When each orb was last used: its latest command's acceptance or completion (unix ms).
+pub fn last_activity(conn: &Connection) -> rusqlite::Result<HashMap<OrbId, u64>> {
+    let mut st = conn.prepare(
+        "SELECT orb_id, MAX(MAX(accepted_at_unix_ms, COALESCE(completed_at_unix_ms, 0))) \
+         FROM receipts GROUP BY orb_id",
+    )?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (orb, ms) = row?;
+        if let Ok(orb) = OrbId::parse(&orb) {
+            out.insert(orb, ms.max(0) as u64);
+        }
+    }
+    Ok(out)
 }
 
 impl OrbRow {

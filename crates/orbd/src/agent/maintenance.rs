@@ -15,8 +15,9 @@
 //! reports an Amp command result.
 //!
 //! The same per-orb serialization runs [`super::checkpoint_age`]'s drops of memory
-//! checkpoints older than `ORBD_CHECKPOINT_MAX_AGE_HOURS` and [`super::hold`]'s writes
-//! of sleeps held in RAM. A drain writes every held sleep first.
+//! checkpoints older than `ORBD_CHECKPOINT_MAX_AGE_HOURS`, [`super::hold`]'s writes
+//! of sleeps held in RAM (a drain writes every held sleep first) and
+//! [`super::archive`]'s archives of stopped orbs' disks.
 
 use super::db::{self, RestoreIntent};
 use super::{Shared, executor};
@@ -57,6 +58,8 @@ pub(crate) enum Task {
     FlushHeld {
         reason: &'static str,
     },
+    /// Archive a stopped orb's disk (see [`super::archive`]).
+    Archive,
 }
 
 #[derive(Debug)]
@@ -70,6 +73,8 @@ pub(crate) enum Outcome {
     Recorded,
     /// A held sleep's checkpoint was written.
     Flushed,
+    /// The orb's disk was archived.
+    Archived,
     /// Nothing to do (not running, or already running; for a drop, not due).
     Unchanged,
     /// Could not save or restore; what is left was recorded.
@@ -254,8 +259,9 @@ pub(super) async fn run(sh: &Arc<Shared>, orb: &OrbDefinition, task: Task) -> Ou
             checkpoint,
             max_age,
         } => return super::checkpoint_age::run(sh, &*rt, orb.id, checkpoint, max_age).await,
-        // Asleep orbs hold no reservation either.
+        // Asleep and stopped orbs hold no reservation either.
         Task::FlushHeld { reason } => return super::hold::run(sh, &*rt, orb, reason).await,
+        Task::Archive => return super::archive::run(sh, &*rt, orb).await,
     };
     let running = matches!(rt.inspect(orb.id).await, Ok(RuntimeObservation::Running));
     let mut reserved = sh.reserved.lock().unwrap_or_else(|e| e.into_inner());

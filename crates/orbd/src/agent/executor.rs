@@ -332,6 +332,16 @@ pub(crate) fn enqueue(sh: &Arc<Shared>, orb: OrbId, op: OperationId) {
 }
 
 pub(crate) fn enqueue_work(sh: &Arc<Shared>, orb: OrbId, work: Work) {
+    // A command goes ahead of an archive of the orb's disk (see `archive`).
+    if matches!(work, Work::Op(_))
+        && let Some(t) = sh
+            .archiving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&orb)
+    {
+        t.cancel();
+    }
     let tx = {
         let mut actors = sh.actors.lock().unwrap_or_else(|e| e.into_inner());
         actors
@@ -437,7 +447,10 @@ impl From<RuntimeError> for Flow {
         use FailureCode as F;
         let (code, msg) = match &e {
             RuntimeError::Cancelled | RuntimeError::DeadlineExceeded => return Flow::Interrupted,
-            RuntimeError::ImageNotReady(_) => (F::ImageNotReady, e.to_string()),
+            // Both mean: retry the spawn shortly.
+            RuntimeError::ImageNotReady(_) | RuntimeError::DiskNotReady(_) => {
+                (F::ImageNotReady, e.to_string())
+            }
             RuntimeError::CheckpointIncompatible(_) => (F::CheckpointIncompatible, e.to_string()),
             RuntimeError::CheckpointFailed(_) => (F::CheckpointFailed, e.to_string()),
             RuntimeError::InsufficientDisk(_) => (F::InsufficientDisk, e.to_string()),
@@ -807,7 +820,8 @@ impl Run {
             });
         let total = used.checked_add(need);
         let cap = self.sh.capacity;
-        // Committed writes (held sleeps' checkpoints) are not free.
+        // Committed writes (held sleeps' checkpoints, restores, room for one) are not
+        // free.
         let free = self.sh.disk_room();
         let reserve = self.sh.disk_reserve;
         let mem_short = match resident {
@@ -1140,6 +1154,26 @@ impl Run {
                 StartKind::MemoryRestore
             }
             RuntimeObservation::Stopped { checkpoint: None } => {
+                if let Some(a) = self.rt.archived(orb_id).filter(|a| !a.restoring) {
+                    // A restore writes the disk back: it must fit above the reserve and
+                    // what held sleeps' checkpoints take once written.
+                    let (free, _) = self.sh.disk_stats();
+                    let room = free
+                        .saturating_sub(self.sh.disk_reserve)
+                        .saturating_sub(self.sh.holds_committed());
+                    if room < a.allocated_bytes {
+                        return Err(Flow::Failed(CommandFailure {
+                            code: FailureCode::InsufficientDisk,
+                            message: format!(
+                                "agent capacity exceeded (disk: restoring the orb's archived \
+                                 disk needs {} MiB, {} MiB free above the reserve and held \
+                                 sleeps)",
+                                a.allocated_bytes / crate::model::MIB,
+                                room / crate::model::MIB
+                            ),
+                        }));
+                    }
+                }
                 self.make_room().await?;
                 self.admit()?;
                 self.progress.start = Some(StartPlan {

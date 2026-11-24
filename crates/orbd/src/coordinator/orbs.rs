@@ -488,6 +488,7 @@ impl OrbsService {
                 disk: disk[&orb.location].get(&orb.id).map(|d| pb::DiskUse {
                     allocated_bytes: d.allocated_bytes,
                     checkpoint_bytes: d.checkpoint_bytes,
+                    archived: d.archived,
                 }),
                 wake_blockers,
                 failures,

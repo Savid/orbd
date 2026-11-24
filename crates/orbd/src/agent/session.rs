@@ -121,7 +121,7 @@ async fn hello(sh: &Shared) -> anyhow::Result<pb::AgentEvent> {
 
 pub(super) fn heartbeat(sh: &Shared) -> pb::AgentEvent {
     let (_, total) = sh.disk_stats();
-    // Committed writes (held sleeps' checkpoints, held sleeps' checkpoints) are not free to place on.
+    // Committed writes (held sleeps' checkpoints, restores) are not free to place on.
     let free = sh.disk_room();
     // Held sleeps' memory is available only while their checkpoints fit on disk.
     let held = match free >= sh.disk_reserve {

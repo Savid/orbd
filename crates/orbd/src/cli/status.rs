@@ -689,6 +689,7 @@ mod tests {
             disk_size_bytes: 50 * G,
             disk_allocated_bytes: Some(12 * G),
             checkpoint_bytes: Some(8 * G),
+            disk_archived: false,
             created_unix_ms: 0,
             last_active_unix_ms: active,
             fault: None,

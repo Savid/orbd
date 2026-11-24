@@ -11,6 +11,7 @@
 //!                   /checkpoints/<gen>/      published: memory, vmstate, manifest.json[, consumed]
 //!                   /checkpoints/<gen>.tmp/  save in progress (complete once manifest.json exists)
 //!                   /held.json               a sleep held in RAM by the paused VMM (see [`hold`])
+//!                   /disk.raw.zst, archive.json  the disk, archived (see [`archive`])
 //!                   /logs/{firecracker.log (latest launch),console.log}
 //! <state>/net/<index>                        network index claimed by an orb
 //! <state>/uids/<index>                       jail uid claimed by an orb
@@ -49,11 +50,13 @@
 //! `firecracker::restore::after_load`, `firecracker::restore::after_consume`,
 //! `firecracker::clone::after_publish`, `firecracker::hold::after_record`,
 //! `firecracker::wake::after_resume`, `firecracker::flush::after_manifest`,
-//! `firecracker::flush::after_publish`, and the shared `vm::launch::after_exec`. Fault
+//! `firecracker::flush::after_publish`, `firecracker::archive::after_rename`,
+//! `firecracker::restore_disk::after_rename`, and the shared `vm::launch::after_exec`. Fault
 //! injection: `firecracker::save::write=return` fails a save in progress as a full disk
 //! would; `firecracker::save::throttle=return(<MiB/s>)` stretches a save to that rate.
 
 mod api;
+mod archive;
 mod guest;
 mod hold;
 
@@ -70,8 +73,8 @@ use super::vm::{
     log_tail, machine_id, on_path, publish_project,
 };
 use super::{
-    CheckpointInfo, FlushOutcome, GuestControl, HeldSleep, OpContext, Runtime, RuntimeCapabilities,
-    RuntimeError, RuntimeObservation, StartSource,
+    ArchiveInfo, CheckpointInfo, FlushOutcome, GuestControl, HeldSleep, OpContext, Runtime,
+    RuntimeCapabilities, RuntimeError, RuntimeObservation, StartSource,
 };
 use crate::config::agent::FirecrackerRuntimeConfig;
 use crate::image::ImageError;
@@ -269,6 +272,8 @@ pub struct FirecrackerRuntime {
     discard: bool,
     /// Sleeps held in RAM (see [`hold`]), as their records say.
     held: std::sync::Mutex<std::collections::HashMap<OrbId, hold::Held>>,
+    /// Restores of archived disks running in the background (see [`archive`]).
+    restores: archive::Restores,
 }
 
 impl FirecrackerRuntime {
@@ -348,6 +353,7 @@ impl FirecrackerRuntime {
         if !discard {
             tracing::warn!(firecracker = %firecracker.version, "this Firecracker predates drive discard (1.17): space guests free is not returned to the host");
         }
+        archive::recover(state_dir);
         tracing::info!(firecracker = %firecracker.version, cpu = %cpu.model, jailed = jail.is_some(), "firecracker runtime ready");
         Ok(Self {
             config,
@@ -360,6 +366,7 @@ impl FirecrackerRuntime {
             locks: OrbLocks::default(),
             discard,
             held: Default::default(),
+            restores: Default::default(),
         })
         .inspect(|rt: &Self| rt.held_gauge())
     }
@@ -1470,6 +1477,8 @@ impl Runtime for FirecrackerRuntime {
                         return Err(RuntimeError::Other(format!("cannot boot: orb is {other}")));
                     }
                 }
+                // An archived disk is restored first (it may take longer than `ctx`).
+                self.ensure_disk(orb.id, ctx).await?;
                 // Booting writes the disk: published checkpoints become stale first.
                 self.checkpoints(orb.id).discard_all()?;
                 self.boot(orb, ctx).await
@@ -1653,7 +1662,9 @@ impl Runtime for FirecrackerRuntime {
         }
         let _g = bounded(ctx, self.locks.lock(orb.id)).await?;
         match self.reconcile(orb.id).await? {
-            Observed::Stopped { .. } | Observed::Held { .. } => {}
+            Observed::Stopped { .. } => self.ensure_disk(orb.id, ctx).await?,
+            // Asleep in RAM: never archived.
+            Observed::Held { .. } => {}
             other => {
                 return Err(RuntimeError::Other(format!(
                     "snapshot needs a stopped orb, found {other}"
@@ -1693,6 +1704,7 @@ impl Runtime for FirecrackerRuntime {
 
     async fn delete(&self, orb: OrbId, ctx: &OpContext) -> Result<(), RuntimeError> {
         let _g = bounded(ctx, self.locks.lock(orb)).await?;
+        self.cancel_restore(orb).await;
         let rp = self.run_paths(orb);
         if let Some(record) = process::read_record::<Machine>(&rp.launch)
             && let Some(proc) = Process::adopt(&record, &marker(&record), None)
@@ -1811,6 +1823,30 @@ impl Runtime for FirecrackerRuntime {
 
     fn holds_sleeps(&self) -> bool {
         true
+    }
+
+    fn archives(&self) -> bool {
+        true
+    }
+
+    fn disk_in_flight(&self) -> u64 {
+        self.restoring_bytes()
+    }
+
+    async fn archive_disk(
+        &self,
+        orb: &OrbDefinition,
+        ctx: &OpContext,
+    ) -> Result<Option<ArchiveInfo>, RuntimeError> {
+        let _lock = bounded(ctx, self.locks.lock(orb.id)).await?;
+        match self.reconcile(orb.id).await? {
+            Observed::Stopped { checkpoint: None } => self.archive_locked(orb.id, ctx).await,
+            _ => Ok(None),
+        }
+    }
+
+    fn archived(&self, orb: OrbId) -> Option<ArchiveInfo> {
+        self.archive_info(orb)
     }
 }
 

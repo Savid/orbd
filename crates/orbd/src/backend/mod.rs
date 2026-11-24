@@ -207,6 +207,8 @@ pub struct OrbDiskUse {
     pub allocated_bytes: u64,
     /// The part held by memory checkpoints.
     pub checkpoint_bytes: u64,
+    /// The disk is archived (compressed until the orb's next wake).
+    pub archived: bool,
 }
 
 #[async_trait]

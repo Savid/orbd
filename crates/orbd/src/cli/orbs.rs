@@ -40,6 +40,8 @@ pub struct OrbJson {
     /// report it.
     pub disk_allocated_bytes: Option<u64>,
     pub checkpoint_bytes: Option<u64>,
+    /// The disk is archived (compressed) until the orb's next wake, which restores it.
+    pub disk_archived: bool,
     pub created_unix_ms: u64,
     /// When Amp last spawned or paused it successfully (its creation if never).
     pub last_active_unix_ms: u64,
@@ -173,6 +175,7 @@ impl OrbJson {
             disk_size_bytes: r.disk_bytes,
             disk_allocated_bytes: o.disk.as_ref().map(|d| d.allocated_bytes),
             checkpoint_bytes: o.disk.as_ref().map(|d| d.checkpoint_bytes),
+            disk_archived: o.disk.as_ref().is_some_and(|d| d.archived),
             created_unix_ms: o.created_unix_ms,
             last_active_unix_ms: o.last_active_unix_ms,
             fault: some(&o.fault),
@@ -295,6 +298,9 @@ impl OrbJson {
         }
         if self.queued_requests > 0 {
             n.push(format!("{} queued", self.queued_requests));
+        }
+        if self.disk_archived {
+            n.push("disk archived".into());
         }
         n.join("; ")
     }
@@ -506,6 +512,10 @@ pub async fn show(socket: &Path, orb: &str, history: u32, json: bool) -> Result<
     kv(
         "on disk",
         match (o.disk_allocated_bytes, o.checkpoint_bytes) {
+            (Some(a), _) if o.disk_archived => format!(
+                "{} (the disk, archived: compressed until the next wake, which restores it)",
+                gib(a)
+            ),
             (Some(a), Some(c)) => format!("{} ({} of it the memory checkpoint)", gib(a), gib(c)),
             _ => "not reported by the agent".into(),
         },

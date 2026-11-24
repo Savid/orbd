@@ -143,6 +143,22 @@ pub enum FlushOutcome {
     Lost,
 }
 
+/// A stopped orb's disk compressed in place (see [`Runtime::archive_disk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArchiveInfo {
+    pub archived_unix_ms: u64,
+    /// The compressed file's size.
+    pub compressed_bytes: u64,
+    /// What the disk held when it was archived (allocated blocks): what a restore
+    /// writes again.
+    pub allocated_bytes: u64,
+    /// The disk's size (apparent).
+    pub disk_bytes: u64,
+    /// A restore of it is running.
+    #[serde(skip)]
+    pub restoring: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogStream {
     Stdout,
@@ -173,6 +189,9 @@ pub enum RuntimeError {
     CheckpointFailed(String),
     #[error("insufficient disk: {0}")]
     InsufficientDisk(String),
+    /// The orb's archived disk is being restored; the spawn is worth retrying.
+    #[error("disk not ready: {0}")]
+    DiskNotReady(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("cancelled")]
@@ -249,6 +268,33 @@ pub trait Runtime: Send + Sync {
         _ctx: &OpContext,
     ) -> Result<FlushOutcome, RuntimeError> {
         Ok(FlushOutcome::NotHeld)
+    }
+
+    /// Disk bytes this runtime has committed but not yet written: restores of archived
+    /// disks in progress (what they still write). Cheap.
+    fn disk_in_flight(&self) -> u64 {
+        0
+    }
+
+    /// Whether this runtime can archive stopped orbs' disks ([`archive_disk`](Self::archive_disk)).
+    fn archives(&self) -> bool {
+        false
+    }
+
+    /// Compresses a stopped orb's disk (no VMM, no memory checkpoint) in place; `start`
+    /// restores it before a cold boot. None if the orb is not such an orb, or is
+    /// archived already. Honours `ctx.cancel` promptly, leaving the disk as it was.
+    async fn archive_disk(
+        &self,
+        _orb: &OrbDefinition,
+        _ctx: &OpContext,
+    ) -> Result<Option<ArchiveInfo>, RuntimeError> {
+        Err(RuntimeError::Unsupported("archiving disks".into()))
+    }
+
+    /// The orb's archive, if its disk is archived. Cheap: no orb lock.
+    fn archived(&self, _orb: OrbId) -> Option<ArchiveInfo> {
+        None
     }
 
     /// Removes a checkpoint, marking it consumed first so it is never restored: one that

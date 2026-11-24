@@ -250,6 +250,11 @@ struct AgentArgs {
     /// checkpoint at once [default: 20].
     #[arg(long, env = "ORBD_SLEEP_HOLD_MINUTES")]
     sleep_hold_minutes: Option<u64>,
+    /// Compress the disk of a Firecracker orb stopped without a memory checkpoint and
+    /// unused this long (zstd, about 3x); its next wake restores it first. 0 never
+    /// archives [default: 24].
+    #[arg(long, env = "ORBD_ARCHIVE_AFTER_HOURS")]
+    archive_after_hours: Option<u64>,
     /// Prometheus listener, e.g. `127.0.0.1:9465`.
     #[arg(long, env = "ORBD_METRICS_LISTEN")]
     metrics_listen: Option<std::net::SocketAddr>,
@@ -551,6 +556,8 @@ fn main() -> anyhow::Result<()> {
             );
             s.sleep_hold =
                 orbd::config::agent::AgentSection::sleep_hold_minutes(a.sleep_hold_minutes);
+            s.archive_after =
+                orbd::config::agent::AgentSection::archive_after_hours(a.archive_after_hours);
             // Only `true` turned it on (0.3.0 took `true` or `false`).
             match a.allow_private_egress.as_deref() {
                 Some("true") => anyhow::bail!(

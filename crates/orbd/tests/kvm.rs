@@ -1702,6 +1702,73 @@ fn held_sleeps_wake_in_place_and_are_written_when_needed() {
     assert!(vmm_pids(c.root()).is_empty());
 }
 
+/// The disk of an orb stopped long enough is archived (compressed, the disk removed),
+/// and its next spawn restores it and cold-boots it with its data.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+#[cfg(target_os = "linux")]
+fn stopped_orbs_disks_are_archived_and_restored() {
+    if runtime() != "firecracker" {
+        eprintln!("NOTICE: disks are archived on Firecracker only; skipped");
+        return;
+    }
+    let mut c = cluster(1);
+    // Checkpoints older than an hour are dropped, so the orb ends up stopped.
+    set_agent_env(&mut c, "ORBD_CHECKPOINT_MAX_AGE_HOURS", "1");
+    let _vms = Vms(c.root().to_owned());
+    c.start_all();
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "spawn");
+    let one = orb_dir(&c);
+    let (_, id) = wait_marker(&one);
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
+    // Age the checkpoint by two hours.
+    c.kill_agent("agent-a");
+    for e in std::fs::read_dir(one.join("checkpoints")).unwrap() {
+        let manifest = e.unwrap().path().join("manifest.json");
+        let mut m: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let t = m["created_unix_ms"].as_u64().unwrap();
+        m["created_unix_ms"] = (t - 2 * 3_600_000).into();
+        std::fs::write(&manifest, m.to_string()).unwrap();
+    }
+    let disk = one.join("disk.raw");
+    let before = allocated(&disk);
+    start_again(
+        &mut c,
+        "agent::checkpoint_age::first_check_secs=return(1);\
+         agent::archive::first_check_secs=return(8);agent::archive::after_secs=return(0)",
+    );
+    wait_until(Duration::from_secs(120), "the disk archived", || {
+        !disk.exists() && one.join("disk.raw.zst").is_file()
+    });
+    let archive = allocated(&one.join("disk.raw.zst"));
+    eprintln!(
+        "archived: {} MiB disk into {} MiB",
+        before >> 20,
+        archive >> 20
+    );
+    assert!(archive > 0 && archive < before, "{archive} < {before}");
+    wait_until(Duration::from_secs(10), "the archive logged", || {
+        agent_log(&c).contains("archived the disk of a stopped orb")
+    });
+    wait_until(
+        Duration::from_secs(20),
+        "orb list notes the archive",
+        || c.admin(&["orb", "list"]).stdout.contains("disk archived"),
+    );
+
+    let job = c.dispatch("spawn", "amp-1", &[]);
+    assert_ok(&job, "spawn an archived orb");
+    assert!(
+        output(&job).contains("archived disk restored"),
+        "{}",
+        output(&job)
+    );
+    assert!(disk.is_file() && !one.join("disk.raw.zst").exists());
+    assert_eq!(wait_marker(&one).1, id, "the same disk");
+    assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete");
+}
+
 /// The agent before the switch in [`carry_over`].
 enum Before {
     /// The previous release's `orbd` (the binary alone: it runs with this tree's VMMs,

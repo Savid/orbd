@@ -761,6 +761,7 @@ impl ComputeBackend for FleetBackend {
                         super::OrbDiskUse {
                             allocated_bytes: u.allocated_bytes,
                             checkpoint_bytes: u.checkpoint_bytes,
+                            archived: u.archived,
                         },
                     ))
                 })
