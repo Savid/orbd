@@ -180,9 +180,20 @@ fn worker(rx: mpsc::Receiver<Job>, shared: &Shared, handler: &dyn Handler) {
                 }
             }
             host_message::Body::PrepareSleep(_) => {
+                let started = std::time::Instant::now();
                 // SAFETY: sync(2) has no preconditions.
                 unsafe { libc::sync() };
-                log!("prepared for sleep (filesystems synced)");
+                // Then freed blocks go back to the host, in what is left of the host's
+                // wait (15 s) after the sync and a second one, so a slow sync is never
+                // reported as unprepared.
+                let left = std::time::Duration::from_secs(10).saturating_sub(started.elapsed());
+                let (trimmed, finished) = crate::trim::root(left);
+                if finished {
+                    // The trim wrote metadata: synced too.
+                    // SAFETY: as above.
+                    unsafe { libc::sync() };
+                }
+                log!("prepared for sleep (filesystems synced; {trimmed})");
                 Ok(shared.last_generation.load(Ordering::SeqCst))
             }
             host_message::Body::Resync(r) => handler

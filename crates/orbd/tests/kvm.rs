@@ -1312,6 +1312,60 @@ fn spawn_boots_from_project_snapshot() {
     eprintln!("amp-4 (snapshot gone from the host): marker created {other}");
 }
 
+/// Bytes a file holds on the host (allocated blocks).
+#[cfg(target_os = "linux")]
+fn allocated(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map_or(0, |m| m.blocks() * 512)
+}
+
+/// Space the guest frees comes back to the host: the guest trims its disk before a
+/// sleep, and Firecracker's discard punches it out of the disk file.
+#[test]
+#[ignore = "needs KVM; see the module docs"]
+#[cfg(target_os = "linux")]
+fn a_sleep_returns_space_the_guest_freed() {
+    if runtime() != "firecracker" {
+        eprintln!("NOTICE: checked on Firecracker only; skipped");
+        return;
+    }
+    let mut c = cluster(1);
+    let _vms = Vms(c.root().to_owned());
+    c.start_all();
+    let env = [
+        ("E2E_FILL_MIB", "300"),
+        (
+            "ORB_ENVS",
+            "AMP_URL ORB_TOKEN AMP_THREAD_ID AMP_SANDBOX_ID E2E_FILL_MIB",
+        ),
+    ];
+    assert_ok(&c.dispatch("spawn", "amp-1", &env), "spawn");
+    let one = orb_dir(&c);
+    let disk = one.join("disk.raw");
+    wait_until(Duration::from_secs(120), "the guest wrote its file", || {
+        printed(&one).contains("fill written")
+    });
+    let full = allocated(&disk);
+    wait_until(
+        Duration::from_secs(60),
+        "the guest removed its file",
+        || printed(&one).contains("fill removed"),
+    );
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause");
+    let trimmed = allocated(&disk);
+    eprintln!(
+        "disk: {} MiB with the file, {} MiB after the sleep's trim",
+        full >> 20,
+        trimmed >> 20
+    );
+    assert!(
+        trimmed + (200 << 20) < full,
+        "the freed 300 MiB came back: {full} -> {trimmed}"
+    );
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake");
+    assert_ok(&c.dispatch("delete", "amp-1", &[]), "delete");
+}
+
 /// The agent before the switch in [`carry_over`].
 enum Before {
     /// The previous release's `orbd` (the binary alone: it runs with this tree's VMMs,

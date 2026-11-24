@@ -1072,11 +1072,8 @@ impl Core {
             let used = self.pool_used(&cand, None).await?;
             let short = shortfalls(&cand, &used, demand);
             if short.is_empty() {
-                let free = cand
-                    .capacity_ceiling
-                    .memory_bytes
-                    .saturating_sub(used.held.memory_bytes);
-                fitting.push((cand, free));
+                let score = room_score(&cand, &used);
+                fitting.push((cand, score));
             } else {
                 refusals.push((cand.capacity_pool.clone(), short));
             }
@@ -1967,6 +1964,50 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
+/// How much room a fitting host has left, for choosing among fitting hosts (higher is
+/// better): the scarcer of its free memory (capacity less running orbs) and its usable
+/// disk (filesystem free space less the reserve and running orbs' headroom), each as a
+/// fraction of the host's own (in millionths). By memory alone, the host with the most
+/// free memory took every new orb however full its disk was, and orbs cannot move
+/// between hosts; this way a host whose disk is filling up takes fewer, while memory
+/// still decides between hosts whose disks have room. Shares, not bytes: hosts fill
+/// evenly, rather than the biggest taking orbs until it is as empty as the others.
+pub(super) fn room_score(cand: &PlacementCandidate, used: &store::PoolUse) -> u64 {
+    const PARTS: u128 = 1_000_000;
+    let frac = |part: u64, whole: u64| match whole {
+        0 => PARTS as u64,
+        w => (u128::from(part.min(w)) * PARTS / u128::from(w)) as u64,
+    };
+    let cap = cand.capacity_ceiling;
+    let memory = frac(
+        cap.memory_bytes.saturating_sub(used.held.memory_bytes),
+        cap.memory_bytes,
+    );
+    // The filesystem's room, and the room under the agent's disk limit (`shortfalls`
+    // checks both), each as a share of its whole.
+    let disk = match cand.disk {
+        Some(d) if d.total_bytes > 0 => {
+            let fs = frac(
+                d.free_bytes
+                    .saturating_sub(d.reserve_bytes)
+                    .saturating_sub(used.held.disk_bytes),
+                d.total_bytes,
+            );
+            let limit = match cap.disk_bytes {
+                0 => PARTS as u64,
+                c => frac(
+                    c.saturating_sub(d.allocated_bytes)
+                        .saturating_sub(used.held.disk_bytes),
+                    c,
+                ),
+            };
+            fs.min(limit)
+        }
+        _ => PARTS as u64,
+    };
+    memory.min(disk)
+}
+
 /// What a running orb of `spec` reserves on its host (see `Core::demand`).
 pub(super) fn demand(policy: &Policy, spec: &SpecTemplate) -> Resources {
     let r = spec.resources;
@@ -2301,6 +2342,62 @@ mod tests {
         let all = [P::Hit, P::Unsupported, P::Elsewhere, P::Absent];
         let labels: Vec<_> = all.map(P::label).into();
         assert_eq!(labels, ["hit", "unsupported", "elsewhere", "absent"]);
+    }
+
+    /// Among fitting hosts the one with more room wins, room being the scarcer of free
+    /// memory and usable disk, each as a fraction of the host's: a host with more free
+    /// memory but a filling disk loses to one whose disk has room.
+    #[test]
+    fn placement_prefers_the_host_with_more_room_in_its_scarcer_resource() {
+        let gib = crate::model::GIB;
+        let score = |mem_used_gib: u64, disk_free_gib: u64, disk_total_gib: u64| {
+            let cand = PlacementCandidate {
+                location: Location::Fleet {
+                    backend_id: BackendId::new("fleet"),
+                    agent_id: AgentId::new("h".to_owned()),
+                },
+                availability: Availability::Available,
+                capabilities: crate::backend::fleet::capabilities::ceiling(
+                    RuntimeKind::Firecracker,
+                ),
+                capacity_pool: "h".into(),
+                capacity_ceiling: Resources {
+                    vcpus: 32,
+                    memory_bytes: 54 * gib,
+                    disk_bytes: 888 * gib,
+                },
+                demand: Resources::default(),
+                disk: Some(DiskReport {
+                    free_bytes: disk_free_gib * gib,
+                    total_bytes: disk_total_gib * gib,
+                    allocated_bytes: 0,
+                    reserve_bytes: 44 * gib,
+                }),
+                memory: None,
+                has_project_snapshot: false,
+                overflow: false,
+            };
+            let used = store::PoolUse {
+                held: Resources {
+                    vcpus: 0,
+                    memory_bytes: mem_used_gib * gib,
+                    disk_bytes: 0,
+                },
+                running: 1,
+                orbs: 1,
+            };
+            room_score(&cand, &used)
+        };
+        let host = |mem_used_gib: u64, disk_free_gib: u64| score(mem_used_gib, disk_free_gib, 888);
+        // More free memory on the second host, but its disk is filling up.
+        let (one, two) = (host(40, 329), host(20, 214));
+        assert!(one > two, "{one} vs {two}");
+        // With disks alike, memory decides.
+        assert!(host(20, 329) > host(40, 329));
+        // A host that has not reported its disk total is judged by memory alone.
+        assert_eq!(score(20, 0, 0), score(20, 888, 888));
+        // Disk the scarcer resource: it decides even against much more free memory.
+        assert!(score(40, 600, 888) > score(10, 120, 888));
     }
 
     /// A new orb no host can take says why: hosts that could run it but are not

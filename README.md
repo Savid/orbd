@@ -268,7 +268,11 @@ each agent's orbs, its reservations against its capacity, and its disk: free, al
 by orbd, reserved and limit (also exported as `orbd_agent_disk_*_bytes` and
 `orbd_reserved_disk_bytes`).
 
-A new orb goes to the agent with the most free memory that fits it. An agent started with
+A new orb goes to the agent with the most room that fits it: the most of whichever of its
+memory (capacity less running orbs) and its disk (free space less the reserve and running
+orbs' headroom) is scarcer, each as a share of the agent's own. Memory alone would send
+every new orb to the agent with the most free memory however full its disk, and orbs
+never move between agents. An agent started with
 `ORBD_OVERFLOW=true`, e.g. on a laptop or a workstation that is not always on, gets one only
 when no other agent fits it, since an orb stays on the agent it was created on and cannot
 wake while that host is off. `orbd agent list` marks such agents `(overflow)`.
@@ -328,6 +332,14 @@ with no checkpoint. A checkpoint is never deleted while its orb is being woken, 
 deleted, and is kept however old if the guest did not sync its disk before it was saved
 (it did not answer in time when it went to sleep), or if its save time is more than an
 hour in the future.
+
+An agent deletes a prepared image a tag has moved on from (the tag now resolves to a
+newer digest) once nothing has used it for 6 hours: a Firecracker orb's disk is a copy,
+and new orbs of the tag get the newer image. Project snapshots are published as copied,
+at their source orb's disk size: no host tool checks or shrinks the guest's filesystem
+then (the guest replays its journal at its next mount). An orb whose type has a smaller
+disk than the snapshot gets its copy shrunk in its own jail when its disk is made, or
+keeps the larger size if its files do not fit.
 
 To delete the orbs of archived threads sooner, run a job that checks each orb's thread
 in Amp: `orbd orb list --json` lists every orb's Amp id (`amp-<thread id>`), state,
@@ -461,6 +473,33 @@ network namespace behind NAT and cannot reach the agent itself, each other or pr
 networks (see above). A sleeping orb wakes only on the VMM build and CPU it slept on, so
 after an upgrade it cold-boots once; the agent deletes such memory checkpoints when it
 starts, as it deletes every checkpoint that was restored or superseded.
+
+### Host storage
+
+Orb disks, project snapshots, prepared images and memory checkpoints all live in the
+agent's state directory (`/var/lib/orbd`, the `orbd-agent` volume above). Every
+orb disk starts as a copy of an image or a project snapshot, and every snapshot as a copy
+of an orb's disk. On a filesystem with reflinks those copies are clones: instant, and
+sharing the base's blocks until the orb changes them. On ext4 each is a full copy. The
+agent logs at startup which it got.
+
+- **A disk of its own for the state directory, formatted XFS** (`mkfs.xfs`, reflinks on
+  by default): clones, mature with large VM images, no tuning. Mount it at the volume's
+  path (or bind it in with `-v /srv/orbd:/var/lib/orbd`).
+- **On a btrfs root**, give the state directory a subvolume of its own and set No_COW on
+  it while it is empty (`chattr +C`), so everything created under it inherits it. btrfs
+  clones only between files that agree on No_COW (the agent warns at startup if its
+  directories disagree), otherwise silently copying in full. Copy-on-write VM disks
+  fragment, and compression needs it, so leave compression off there (no
+  `compress-force` on the filesystem); never defragment it (that unshares every clone)
+  and never snapshot it.
+- **Trim:** orbs return the space their guests free (they trim before every sleep, and
+  their disks pass discards through, with Firecracker 1.17 or later), so let discards
+  reach the drive: `fstrim.timer` on the host, and `allow-discards` (`discard` in
+  crypttab) on LUKS.
+- **Drives:** clones and trims save writes, but an agent still writes a lot (every sleep
+  writes the orb's memory). Prefer drives rated for it (TLC with DRAM) over DRAM-less QLC; on
+  those keep 15-20% free (`ORBD_DISK_RESERVE_GIB`), as they slow down sharply when full.
 
 ### Host firewalls
 

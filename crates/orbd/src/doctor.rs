@@ -301,8 +301,16 @@ pub fn run(opts: &DoctorOptions) -> anyhow::Result<bool> {
     // Linux only: Firecracker, and the per-orb network namespaces that Firecracker orbs
     // and (on an agent running as root) QEMU orbs get, which need `ip` and `nft`.
     if cfg!(target_os = "linux") {
+        // 1.17 or later: drives with discard.
         r.line(
-            first_line(&firecracker, &["--version"]),
+            first_line(&firecracker, &["--version"]).and_then(|l| {
+                let v = l.trim_start_matches("Firecracker v");
+                let mut p = v.split(['.', '-']).map(|n| n.parse::<u64>().unwrap_or(0));
+                match (p.next().unwrap_or(0), p.next().unwrap_or(0)) >= (1, 17) {
+                    true => Ok(l),
+                    false => Err(format!("{l}: orbd needs 1.17 or later for disk discard")),
+                }
+            }),
             "firecracker",
             false,
         );

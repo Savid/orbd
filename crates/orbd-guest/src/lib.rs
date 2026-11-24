@@ -15,6 +15,7 @@ pub mod init;
 pub mod net;
 pub mod server;
 pub mod transport;
+pub mod trim;
 pub mod wake;
 
 /// The guest protocol, shared with the host side.

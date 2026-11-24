@@ -65,6 +65,10 @@ pub struct Drive<'a> {
     pub path_on_host: &'a Path,
     pub is_root_device: bool,
     pub is_read_only: bool,
+    /// virtio-blk discard (Firecracker 1.17, Sync IO engine, the default): the guest's
+    /// TRIM punches holes in the disk file. Left out for older Firecrackers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discard: Option<bool>,
 }
 
 #[derive(Serialize)]

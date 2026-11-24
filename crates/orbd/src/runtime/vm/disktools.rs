@@ -1,6 +1,7 @@
-//! The tools that read an orb's disk when it becomes a project snapshot: `qemu-img
-//! convert` of a QEMU orb's qcow2 overlay (whose header the VMM can write) and e2fsck,
-//! resize2fs and dumpe2fs of the copy (whose filesystem the guest wrote). With jails
+//! The tools that read a guest-written disk: `qemu-img convert` of a QEMU orb's qcow2
+//! overlay into a project snapshot (whose header the VMM can write), and e2fsck,
+//! resize2fs and dumpe2fs when a new orb's disk made from a larger project snapshot is
+//! shrunk to its offering (whose filesystem the guest wrote). With jails
 //! (`ORBD_VMM_JAIL`) none of them runs as root: each runs in the orb's own jail, as its
 //! uid, and sees only the files it works on, at their paths: its inputs read-only, its
 //! output lent to it (owned by the orb's uid while it runs, then taken back: still the
@@ -249,15 +250,19 @@ pub async fn qcow2_to_raw(
     Ok(())
 }
 
-/// Shrinks the raw ext4 disk `raw` (lent) to the blocks its files use, so a snapshot
-/// of a big orb fits any offering (the guest grows its root filesystem to its disk at
-/// boot). Returns the filesystem's new size: the caller truncates the file to it once
-/// it took the file back.
-pub async fn shrink_ext4(
+/// Shrinks the ext4 filesystem on the raw disk `raw` (lent) to `bytes` (a whole number of
+/// KiB), so a disk made from a project snapshot larger than its orb's offering fits the
+/// offering. Run in the new orb's jail, as the filesystem is the guest's. Returns the
+/// filesystem's new size; None when its files do not fit in `bytes` (`resize2fs -P`'s
+/// minimum is larger), the filesystem then only checked. Any other failure is an error,
+/// and the caller must not use the file (a resize may have stopped half way). The caller
+/// truncates the file to the size once it took the file back.
+pub async fn shrink_ext4_to(
     tools: &DiskTools<'_>,
     ctx: &OpContext,
     raw: &Path,
-) -> Result<u64, RuntimeError> {
+    bytes: u64,
+) -> Result<Option<u64>, RuntimeError> {
     let file = [(raw, Access::Write)];
     // resize2fs wants a freshly checked filesystem. Exit 1 means e2fsck fixed something,
     // such as replaying the journal of this crash-consistent copy.
@@ -269,21 +274,7 @@ pub async fn shrink_ext4(
             &file,
         )
         .await?;
-    let (code, _) = tools
-        .run(ctx, "resize2fs", &["-M".into(), raw.into()], &file)
-        .await?;
-    if code != Some(0) {
-        return Err(RuntimeError::Other(format!("resize2fs: exit {code:?}")));
-    }
-    let (_, header) = tools
-        .run(
-            ctx,
-            "dumpe2fs",
-            &["-h".into(), raw.into()],
-            &[(raw, Access::Read)],
-        )
-        .await?;
-    let field = |name: &str| {
+    let field = |header: &str, name: &str| {
         header
             .lines()
             .find_map(|l| l.strip_prefix(name)?.trim().parse::<u64>().ok())
@@ -291,9 +282,65 @@ pub async fn shrink_ext4(
                 RuntimeError::Other(format!("dumpe2fs: no {name:?} in {}", raw.display()))
             })
     };
-    field("Block count:")?
-        .checked_mul(field("Block size:")?)
-        .ok_or_else(|| RuntimeError::Other("dumpe2fs: filesystem size overflows".into()))
+    let (_, h) = tools
+        .run(
+            ctx,
+            "dumpe2fs",
+            &["-h".into(), raw.into()],
+            &[(raw, Access::Read)],
+        )
+        .await?;
+    let block = field(&h, "Block size:")?;
+    let (code, min) = tools
+        .run(
+            ctx,
+            "resize2fs",
+            &["-P".into(), raw.into()],
+            &[(raw, Access::Read)],
+        )
+        .await?;
+    let min_blocks = min
+        .lines()
+        .find_map(|l| {
+            l.split_once("minimum size of the filesystem:")?
+                .1
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .filter(|_| code == Some(0))
+        .ok_or_else(|| RuntimeError::Other(format!("resize2fs -P: no minimum in {min:?}")))?;
+    if min_blocks.saturating_mul(block) > bytes {
+        return Ok(None);
+    }
+    let (code, _) = tools
+        .run(
+            ctx,
+            "resize2fs",
+            &[raw.into(), format!("{}K", bytes / 1024).into()],
+            &file,
+        )
+        .await?;
+    if code != Some(0) {
+        return Err(RuntimeError::Other(format!("resize2fs: exit {code:?}")));
+    }
+    let (_, h) = tools
+        .run(
+            ctx,
+            "dumpe2fs",
+            &["-h".into(), raw.into()],
+            &[(raw, Access::Read)],
+        )
+        .await?;
+    let size = field(&h, "Block count:")?
+        .checked_mul(block)
+        .ok_or_else(|| RuntimeError::Other("dumpe2fs: filesystem size overflows".into()))?;
+    if size > bytes {
+        return Err(RuntimeError::Other(format!(
+            "resize2fs left {size} bytes, asked for {bytes}"
+        )));
+    }
+    Ok(Some(size))
 }
 
 /// Truncates the taken-back `raw` to the filesystem's `bytes`, which must fit in it.
@@ -442,7 +489,21 @@ mod tests {
         qcow2_to_raw(&tools, &ctx, Path::new("qemu-img"), &disk, &base, &out)
             .await
             .unwrap();
-        let bytes = shrink_ext4(&tools, &ctx, &out).await.unwrap();
+        let f = tools.take_back(lent).unwrap();
+        drop(f);
+        // A disk made from it for a smaller offering is shrunk in the jail too; one whose
+        // files do not fit the size is left as it is.
+        let lent = tools.lend(&out).unwrap();
+        let bytes = shrink_ext4_to(&tools, &ctx, &out, 16 << 20)
+            .await
+            .unwrap()
+            .expect("a nearly empty filesystem fits 16 MiB");
+        assert!(bytes <= 16 << 20);
+        assert_eq!(
+            shrink_ext4_to(&tools, &ctx, &out, 64 << 10).await.unwrap(),
+            None,
+            "64 KiB cannot hold it"
+        );
         let f = tools.take_back(lent).unwrap();
         truncate(&f, &out, bytes).unwrap();
         drop(f);
