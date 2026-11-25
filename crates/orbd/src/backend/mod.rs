@@ -194,6 +194,11 @@ pub enum BackendEvent {
         location: Location,
         availability: Availability,
     },
+    /// The location's host was removed for good (an agent revoked): it will never run,
+    /// or answer for, anything sent to it.
+    Removed {
+        location: Location,
+    },
     /// Orb states observed outside any command (a VM that exited on its own).
     OrbsObserved {
         location: Location,
@@ -259,6 +264,13 @@ pub trait ComputeBackend: Send + Sync {
         &self,
         _location: &Location,
     ) -> Option<std::collections::HashMap<crate::model::OrbId, OrbDiskUse>> {
+        None
+    }
+
+    /// How long `location`'s host has been gone: removed (forever, [`Duration::MAX`]),
+    /// or disconnected since its last heartbeat this coordinator saw. None while it is
+    /// connected (draining included) or when it cannot tell.
+    fn host_absence(&self, _location: &Location) -> Option<std::time::Duration> {
         None
     }
 

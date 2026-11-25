@@ -387,15 +387,27 @@ pub fn wake_room(
     )?)
 }
 
-/// Whether `orb` never started, and how its last command failed if it did: known
-/// uncreated by its last command (`generation`, nothing issued since, none open), none
-/// of its commands ever started or paused it, not retired, no delete begun. Its host
-/// said nothing of it exists there. None if not such an orb.
-pub fn unstarted(
-    c: &Connection,
-    orb: OrbId,
-    generation: u64,
-) -> Result<Option<Option<FailureCode>>> {
+/// How an orb that never started was refused ([`unstarted`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Unstarted {
+    /// How its last command failed.
+    pub last_failure: Option<FailureCode>,
+    /// How many of its latest commands in a row its host refused for want of room
+    /// (memory, disk or vCPUs).
+    pub capacity_refusals: u32,
+}
+
+const CAPACITY_CODES: [FailureCode; 3] = [
+    FailureCode::InsufficientMemory,
+    FailureCode::InsufficientDisk,
+    FailureCode::QuotaExceeded,
+];
+
+/// Whether `orb` never started, and how it was refused: known uncreated by its last
+/// command (`generation`, nothing issued since, none open), none of its commands ever
+/// started or paused it, not retired, no delete begun. Its host said nothing of it
+/// exists there. None if not such an orb.
+pub fn unstarted(c: &Connection, orb: OrbId, generation: u64) -> Result<Option<Unstarted>> {
     let Some(rec) = get_orb_by_id_live(c, orb)? else {
         return Ok(None);
     };
@@ -411,13 +423,87 @@ pub fn unstarted(
     if !unstarted {
         return Ok(None);
     }
-    let failure = orb_commands(c, orb, 1)?
+    let failures: Vec<Option<FailureCode>> = orb_commands(c, orb, 16)?
         .into_iter()
-        .next()
-        .and_then(|h| h.outcome)
-        .and_then(|o| o.result.err())
-        .map(|f| f.code);
-    Ok(Some(failure))
+        .map(|h| h.outcome.and_then(|o| o.result.err()).map(|f| f.code))
+        .collect();
+    let capacity_refusals = failures
+        .iter()
+        .take_while(|f| f.is_some_and(|code| CAPACITY_CODES.contains(&code)))
+        .count() as u32;
+    Ok(Some(Unstarted {
+        last_failure: failures.first().copied().flatten(),
+        capacity_refusals,
+    }))
+}
+
+/// The hosts that refused an Amp orb before it ever started, since `since_ms`: where its
+/// incarnations retired for a new placement were ([`CreatePlan::retire`]), newest first.
+pub fn refused_hosts(
+    c: &Connection,
+    ep: &str,
+    amp_orb: &str,
+    since_ms: u64,
+) -> Result<Vec<Location>> {
+    let mut st = c.prepare(
+        "SELECT o.location_json FROM orbs o
+         WHERE o.amp_endpoint = ?1 AND o.amp_orb_id = ?2 AND o.retired_ms >= ?3
+           AND EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
+           AND NOT EXISTS (SELECT 1 FROM commands m WHERE m.orb_id = o.id
+                             AND m.status = 'terminal'
+                             AND json_extract(m.action_json, '$.kind') IN ('spawn', 'pause')
+                             AND json_type(m.outcome_json, '$.result.Ok') IS NOT NULL)
+         ORDER BY o.retired_ms DESC",
+    )?;
+    let rows = st.query_map(params![ep, amp_orb, since_ms as i64], |r| de(r, 0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Removes the rows of incarnations retired for a new placement before `before_ms`
+/// (orb, commands, tombstone, reservation) once nothing is left to do for them: their
+/// old host deleted them, answered that it cannot run them, or was sent every delete
+/// it gets ([`retired_undeleted`]). Returns how many it removed.
+pub fn prune_retired_unstarted(
+    c: &mut Connection,
+    before_ms: u64,
+    max_deletes: u32,
+) -> Result<usize> {
+    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ids: Vec<String> = {
+        let mut st = tx.prepare(
+            "SELECT o.id FROM orbs o
+             WHERE o.retired_ms IS NOT NULL AND o.retired_ms < ?1
+               AND EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
+               AND NOT EXISTS (SELECT 1 FROM commands m WHERE m.orb_id = o.id
+                                 AND m.status <> 'terminal')
+               AND NOT EXISTS (SELECT 1 FROM commands m WHERE m.orb_id = o.id
+                                 AND m.status = 'terminal'
+                                 AND json_extract(m.action_json, '$.kind') IN ('spawn', 'pause')
+                                 AND json_type(m.outcome_json, '$.result.Ok') IS NOT NULL)
+               AND (COALESCE(json_extract(o.observation_json, '$.state.state.kind'), '')
+                        = 'deleted'
+                    OR EXISTS (SELECT 1 FROM commands m WHERE m.orb_id = o.id
+                                 AND m.status = 'terminal'
+                                 AND json_extract(m.action_json, '$.kind') = 'delete'
+                                 AND json_extract(m.outcome_json, '$.result.Err.code')
+                                     = 'unsupported_capability')
+                    OR (SELECT COUNT(*) FROM commands m WHERE m.orb_id = o.id
+                          AND json_extract(m.action_json, '$.kind') = 'delete') >= ?2)",
+        )?;
+        st.query_map(params![before_ms as i64, max_deletes as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for id in &ids {
+        tx.execute("DELETE FROM commands WHERE orb_id = ?1", params![id])?;
+        tx.execute("DELETE FROM reservations WHERE orb_id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM delete_tombstones WHERE orb_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM orbs WHERE id = ?1", params![id])?;
+    }
+    tx.commit()?;
+    Ok(ids.len())
 }
 
 /// A retired orb its old host is still to delete ([`retired_undeleted`]).
@@ -1302,13 +1388,31 @@ mod tests {
         let c = crate::coordinator::db::test_connection();
         let uncreated = OrbState::known(StableOrbState::Uncreated);
         let u = orb(&c, &uncreated, 0);
+        command(&c, u, 3, &Action::Spawn, refused(), &uncreated);
+        let not_ready = Err(CommandFailure {
+            code: FailureCode::ImageNotReady,
+            message: "preparing".into(),
+        });
+        command(&c, u, 4, &Action::Spawn, not_ready, &uncreated);
         command(&c, u, 5, &Action::Spawn, refused(), &uncreated);
         assert_eq!(
             unstarted(&c, u, 5).unwrap(),
-            Some(Some(FailureCode::InsufficientMemory))
+            Some(Unstarted {
+                last_failure: Some(FailureCode::InsufficientMemory),
+                capacity_refusals: 1,
+            }),
+            "refusals for want of room count only in a row"
         );
+        command(&c, u, 6, &Action::Spawn, refused(), &uncreated);
+        c.execute(
+            "UPDATE orbs SET last_issued_generation = 6, observation_generation = 6,
+                observation_json = json_set(observation_json, '$.generation', 6) WHERE id = ?1",
+            params![u.to_string()],
+        )
+        .unwrap();
+        assert_eq!(unstarted(&c, u, 6).unwrap().unwrap().capacity_refusals, 2);
         assert_eq!(
-            unstarted(&c, u, 4).unwrap(),
+            unstarted(&c, u, 5).unwrap(),
             None,
             "a newer generation was issued"
         );
@@ -1630,5 +1734,133 @@ mod tests {
             wake_room(&c, "fleet", "empty", 10 * GIB, since, &[], &[]).unwrap(),
             Resources::default()
         );
+    }
+
+    /// The hosts that refused an Amp orb before it started are where its incarnations
+    /// retired for a new placement were, lately; not where an incarnation that ran was
+    /// (deleted and replaced), nor long ago.
+    #[test]
+    fn refused_hosts_are_where_incarnations_that_never_started_were() {
+        let c = crate::coordinator::db::test_connection();
+        c.execute_batch("DROP TRIGGER orbs_identity_immutable")
+            .unwrap();
+        let uncreated = OrbState::known(StableOrbState::Uncreated);
+        let retire_at = |id: OrbId, at: u64, agent: &str| {
+            c.execute(
+                "UPDATE orbs SET retired_ms = ?2, location_json = ?3, amp_orb_id = 'amp-x'
+                 WHERE id = ?1",
+                params![id.to_string(), at as i64, js(&fleet(agent))],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO delete_tombstones(amp_endpoint, amp_orb_id, orb_id, created_ms)
+                 VALUES ('amp', 'amp-x', ?1, 0)",
+                params![id.to_string()],
+            )
+            .unwrap();
+        };
+        let a = orb(&c, &uncreated, 0);
+        retire_at(a, 5_000, "agent-a");
+        let b = orb(&c, &uncreated, 0);
+        retire_at(b, 6_000, "agent-b");
+        let long_ago = orb(&c, &uncreated, 0);
+        retire_at(long_ago, 100, "agent-c");
+        let ran = orb(&c, &OrbState::known(StableOrbState::Deleted), 0);
+        let spawned = Ok(ActionResult::Spawned {
+            start: StartKind::NewDisk,
+            bootstrap_generation: 1,
+        });
+        command(
+            &c,
+            ran,
+            1,
+            &Action::Spawn,
+            spawned,
+            &OrbState::known(StableOrbState::Running),
+        );
+        retire_at(ran, 7_000, "agent-d");
+        assert_eq!(
+            refused_hosts(&c, "amp", "amp-x", 1_000).unwrap(),
+            vec![fleet("agent-b"), fleet("agent-a")]
+        );
+        assert!(refused_hosts(&c, "amp", "amp-y", 0).unwrap().is_empty());
+    }
+
+    /// The rows of an incarnation retired for a new placement go once nothing is left to
+    /// do for it and it is old enough: its old host deleted it, cannot run it, or was
+    /// sent every delete it gets. Not before, not one that ran, not a live orb.
+    #[test]
+    fn retired_incarnations_are_pruned_once_settled() {
+        let mut c = crate::coordinator::db::test_connection();
+        let uncreated = OrbState::known(StableOrbState::Uncreated);
+        let deleted = OrbState::known(StableOrbState::Deleted);
+        let retired = |c: &Connection, state: &OrbState, at: u64| {
+            let id = orb(c, state, 0);
+            c.execute(
+                "UPDATE orbs SET retired_ms = ?2 WHERE id = ?1",
+                params![id.to_string(), at as i64],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO delete_tombstones(amp_endpoint, amp_orb_id, orb_id, created_ms)
+                 VALUES ('amp', ?1, ?2, 0)",
+                params![format!("amp-{id}"), id.to_string()],
+            )
+            .unwrap();
+            id
+        };
+        let busy = || {
+            Err(CommandFailure {
+                code: FailureCode::BackendFailure,
+                message: "busy".into(),
+            })
+        };
+        let done = retired(&c, &deleted, 100);
+        command(&c, done, 5, &Action::Spawn, refused(), &uncreated);
+        command(
+            &c,
+            done,
+            6,
+            &Action::Delete,
+            Ok(ActionResult::Deleted),
+            &deleted,
+        );
+        let unsupported = retired(&c, &uncreated, 100);
+        let no_runtime = Err(CommandFailure {
+            code: FailureCode::UnsupportedCapability,
+            message: "no runtime".into(),
+        });
+        command(&c, unsupported, 6, &Action::Delete, no_runtime, &uncreated);
+        let gave_up = retired(&c, &uncreated, 100);
+        command(&c, gave_up, 6, &Action::Delete, busy(), &uncreated);
+        command(&c, gave_up, 7, &Action::Delete, busy(), &uncreated);
+        let pending = retired(&c, &uncreated, 100);
+        command(&c, pending, 6, &Action::Delete, busy(), &uncreated);
+        let young = retired(&c, &deleted, 5_000);
+        let ran = retired(&c, &deleted, 100);
+        let spawned = Ok(ActionResult::Spawned {
+            start: StartKind::NewDisk,
+            bootstrap_generation: 1,
+        });
+        command(
+            &c,
+            ran,
+            4,
+            &Action::Spawn,
+            spawned,
+            &OrbState::known(StableOrbState::Running),
+        );
+        let live = orb(&c, &uncreated, 0);
+
+        assert_eq!(prune_retired_unstarted(&mut c, 1_000, 2).unwrap(), 3);
+        let left = |c: &Connection, id: OrbId| get_orb(c, id).unwrap().is_some();
+        for id in [done, unsupported, gave_up] {
+            assert!(!left(&c, id));
+            assert!(orb_commands(&c, id, 10).unwrap().is_empty());
+            assert!(!is_tombstoned(&c, id).unwrap());
+        }
+        for id in [pending, young, ran, live] {
+            assert!(left(&c, id));
+        }
     }
 }

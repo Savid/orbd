@@ -652,10 +652,13 @@ impl Core {
         }
         let mut snapshot_report = None;
         // An orb that never started has nothing on its host (its agent said so), so
-        // nothing ties it there: when that host refuses it, at admission here or for its
-        // own reasons (its image not allowed, no room), its spawn places a new
-        // incarnation like a new orb, away from that host if another fits. Not when its
-        // agent asked it to wait (an image being prepared) and can take it now.
+        // nothing ties it there once that host will not take it: its spawn then places a
+        // new incarnation like a new orb, away from every host that refused it. At once
+        // when its agent refused it for a reason of its own the coordinator cannot see
+        // (its image not allowed there), or kept refusing it for want of room; otherwise
+        // only when the coordinator finds its host cannot take it now: no room, unable
+        // to run it, or gone well beyond a restart ([`HOST_GONE`]) or removed. Never when
+        // it was asked to wait (an image being prepared).
         let unstarted = match (&orb, spawn) {
             (Some(o), true) => {
                 let (id, generation) = (o.id, o.last_issued_generation);
@@ -667,13 +670,13 @@ impl Core {
         };
         let mut replaced: Option<(OrbRecord, String)> = None;
         let mut planned = None;
-        if let (Some(Some(code)), Some(o)) = (&unstarted, &orb)
-            && refused_by_its_agent(*code)
+        if let (Some(u), Some(o)) = (&unstarted, &orb)
+            && let Some(why) = refused_for_good(u)
             && let Some((p, o2)) = self
                 .replace_unstarted(head, o, &mut snapshot_report)
                 .await?
         {
-            replaced = Some((o.clone(), format!("its agent refused its spawn ({code:?})")));
+            replaced = Some((o.clone(), why));
             offering = Some(o2);
             planned = Some(Ok(p));
         }
@@ -686,11 +689,11 @@ impl Core {
                         offering.as_ref(),
                         orb.as_ref(),
                         &mut snapshot_report,
-                        None,
+                        &[],
                     )
                     .await?;
                 match (&p, &unstarted, &orb) {
-                    (Err(r), Some(_), Some(o)) if host_refusal(r.code) => {
+                    (Err(r), Some(_), Some(o)) if self.host_cannot_take(r, &o.location) => {
                         match self
                             .replace_unstarted(head, o, &mut snapshot_report)
                             .await?
@@ -745,10 +748,11 @@ impl Core {
     }
 
     /// Plans a new incarnation of `old`, an orb that never started, like a new orb
-    /// (the job's orb type, else the one it was created as), away from its host if
-    /// another fits; the plan retires `old` in the same transaction (see
-    /// [`CreatePlan::retire`]). None, leaving `old` as it is, when no host takes it or
-    /// only its own does.
+    /// (the job's orb type, else the one it was created as), away from every host that
+    /// refused this Amp orb lately ([`REFUSALS_KEPT`]) if another fits; the plan
+    /// retires `old` in the same transaction (see [`CreatePlan::retire`]). None, leaving
+    /// `old` as it is, when no host takes it, when only hosts that refused it do, or
+    /// when it was placed anew [`MAX_REPLACEMENTS`] times lately already.
     async fn replace_unstarted(
         &mut self,
         head: &Req,
@@ -763,28 +767,54 @@ impl Core {
         else {
             return Ok(None);
         };
+        let (ep, amp) = (
+            old.identity.amp_endpoint.to_string(),
+            old.identity.amp_orb_id.to_string(),
+        );
+        let since = unix_ms_now().saturating_sub(REFUSALS_KEPT.as_millis() as u64);
+        let mut avoid = self
+            .db
+            .call(move |c| store::refused_hosts(c, &ep, &amp, since))
+            .await?;
+        if avoid.len() >= MAX_REPLACEMENTS {
+            tracing::debug!(orb = %old.id, amp_orb_id = %old.identity.amp_orb_id, "placed anew too often lately; staying where it is");
+            return Ok(None);
+        }
+        avoid.push(old.location.clone());
         let mut report = None;
         let Ok(mut p) = self
-            .plan(
-                head,
-                Some(&offering),
-                None,
-                &mut report,
-                Some(&old.location),
-            )
+            .plan(head, Some(&offering), None, &mut report, &avoid)
             .await?
         else {
             return Ok(None);
         };
         if p.new_orb
             .as_ref()
-            .is_none_or(|n| same_host(&n.location, &old.location))
+            .is_none_or(|n| avoid.iter().any(|a| same_host(a, &n.location)))
         {
             return Ok(None);
         }
         p.retire = Some((old.id, old.last_issued_generation));
         *snapshot_report = report;
         Ok(Some((p, offering)))
+    }
+
+    /// Whether the coordinator's refusal `r` of an orb at `location` says that host
+    /// cannot take it now: no room or unable to run it, or gone (disconnected) well
+    /// beyond a restart ([`HOST_GONE`]) or removed. Not while it restarts or drains.
+    fn host_cannot_take(&self, r: &Refusal, location: &Location) -> bool {
+        match r.code {
+            FailureCode::InsufficientMemory
+            | FailureCode::InsufficientDisk
+            | FailureCode::QuotaExceeded
+            | FailureCode::UnsupportedCapability => true,
+            FailureCode::BackendUnavailable => self
+                .backends
+                .get(location.backend_id())
+                .and_then(|b| b.host_absence(location))
+                .is_some_and(|gone| gone >= HOST_GONE),
+            _ => false,
+        }
     }
 
     /// Tells the old host of each orb that never started and was placed anew (retired,
@@ -944,14 +974,14 @@ impl Core {
     /// Admission: choose/verify the location and build the atomic creation plan.
     /// `snapshot_report`: for a new orb that names a project snapshot, where it went as
     /// far as the snapshot goes, to report once the command is committed.
-    /// `avoid`: for a new orb, a host to place it away from if another fits.
+    /// `avoid`: for a new orb, hosts to place it away from if another fits.
     async fn plan(
         &mut self,
         head: &Req,
         offering: Option<&Offering>,
         orb: Option<&OrbRecord>,
         snapshot_report: &mut Option<SnapshotReport>,
-        avoid: Option<&Location>,
+        avoid: &[Location],
     ) -> Result<std::result::Result<CreatePlan, Refusal>> {
         let op = OperationId::generate();
         let digest_fp = head.fingerprint.clone();
@@ -1217,7 +1247,7 @@ impl Core {
         snap_key: Option<&ProjectSnapshotKey>,
         held: &mut bool,
         kept_room: &mut bool,
-        avoid: Option<&Location>,
+        avoid: &[Location],
     ) -> Result<std::result::Result<(PlacementCandidate, Resources, SpecTemplate), Refusal>> {
         let Some(backend) = self.backends.get(&offering.backend_id).cloned() else {
             return Ok(Err(refuse(
@@ -1275,7 +1305,7 @@ impl Core {
                 } else {
                     room_score(&cand, &used)
                 };
-                let avoided = avoid.is_some_and(|a| same_host(a, &cand.location));
+                let avoided = avoid.iter().any(|a| same_host(a, &cand.location));
                 fitting.push(Fit {
                     cand,
                     score,
@@ -1643,6 +1673,31 @@ impl Core {
                 self.complete(key, outcome, true).await?;
             }
             BackendEvent::ReconcileNeeded { key } => self.start_reconcile(key.operation_id),
+            BackendEvent::Removed { location } => {
+                // Its host will never run, or answer for, what it was sent: those commands
+                // end failed, the orbs as last recorded, so a spawn of one that never
+                // started is placed anew on its next try.
+                let open = self.db.call(|c| store::open_commands(c)).await?;
+                for (cmd, orb) in open {
+                    if orb.location != location {
+                        continue;
+                    }
+                    let key = CommandKey {
+                        operation_id: cmd.operation_id,
+                        orb_id: orb.id,
+                        generation: cmd.generation,
+                    };
+                    tracing::info!(operation = %cmd.operation_id, orb = %orb.id, ?location, "ending a command of a removed host");
+                    let outcome = synthetic_outcome(
+                        orb.observation.state.clone(),
+                        refuse(
+                            FailureCode::BackendUnavailable,
+                            "its host was removed; it never answered",
+                        ),
+                    );
+                    self.complete(key, outcome, false).await?;
+                }
+            }
             BackendEvent::AvailabilityChanged {
                 location,
                 availability,
@@ -1947,6 +2002,17 @@ impl Core {
         if self.ticks.is_multiple_of(600) {
             let cutoff = now.saturating_sub(3_600_000);
             self.db.call(move |c| store::gc(c, cutoff)).await?;
+            let before = now.saturating_sub(RETIRED_KEPT.as_millis() as u64);
+            let pruned = self
+                .db
+                .call(move |c| store::prune_retired_unstarted(c, before, CLEANUP_ATTEMPTS))
+                .await?;
+            if pruned > 0 {
+                tracing::info!(
+                    pruned,
+                    "removed the rows of incarnations retired for a new placement"
+                );
+            }
         }
         if self.ticks.is_multiple_of(60) {
             self.reclaim_idle(now).await?;
@@ -2280,6 +2346,21 @@ pub(super) fn wake_demand(
     need
 }
 
+/// How long a host must have been gone (disconnected) before an orb that never started
+/// there is placed anew elsewhere: well beyond an agent's restart or upgrade.
+const HOST_GONE: Duration = Duration::from_secs(30 * 60);
+/// How long the hosts that refused an Amp orb before it started are avoided for it.
+const REFUSALS_KEPT: Duration = Duration::from_secs(24 * 3600);
+/// At most this many new placements of one Amp orb that never started per
+/// [`REFUSALS_KEPT`]; after that it stays where it is.
+const MAX_REPLACEMENTS: usize = 4;
+/// How many refusals in a row for want of room by its agent move an orb that never
+/// started, while the coordinator finds room for it there.
+const CAPACITY_REFUSALS: u32 = 3;
+/// How long the rows of an incarnation retired for a new placement are kept once
+/// nothing is left to do for it.
+const RETIRED_KEPT: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// How long after a delete of a retired orb its old host is told again, while it has
 /// not deleted it; doubling with each try.
 const CLEANUP_EVERY: Duration = Duration::from_secs(600);
@@ -2362,9 +2443,10 @@ pub(super) struct Fit {
 /// Chooses among the hosts that fit a new orb (`fitting`, not empty), narrowing tier by
 /// tier, each only when some host passes it:
 ///
-/// 1. Not a host to avoid (one that refused this orb).
-/// 2. An always-on host over an overflow one (not always on), as an orb stays where it
+/// 1. An always-on host over an overflow one (not always on), as an orb stays where it
 ///    was created.
+/// 2. Not a host to avoid (one that refused this orb): only among hosts of the same
+///    kind, so a refusal never moves an orb onto an overflow host.
 /// 3. One that still leaves room to wake its own orbs: they cannot wake anywhere else,
 ///    while a new orb can go anywhere. Ahead of the project snapshot: missing it costs a
 ///    new orb a slower first boot; a host filled up for it leaves its sleeping orbs
@@ -2375,11 +2457,11 @@ pub(super) struct Fit {
 /// Returns the host, and whether tier 3 passed over a host holding the snapshot for
 /// one without it (a miss counted as `wake_room`).
 pub(super) fn choose(mut fitting: Vec<Fit>, wants_snapshot: bool) -> (PlacementCandidate, bool) {
-    if fitting.iter().any(|f| !f.avoided) {
-        fitting.retain(|f| !f.avoided);
-    }
     if fitting.iter().any(|f| !f.cand.overflow) {
         fitting.retain(|f| !f.cand.overflow);
+    }
+    if fitting.iter().any(|f| !f.avoided) {
+        fitting.retain(|f| !f.avoided);
     }
     let mut passed_over_holder = false;
     if fitting.iter().any(|f| f.leaves_wake_room) {
@@ -2570,30 +2652,22 @@ fn no_host_message(spec: &SpecTemplate, cands: &[PlacementCandidate]) -> String 
     message
 }
 
-/// How an agent refused an orb's spawn for reasons of its own host, before creating
-/// anything (its image not allowed or no runtime for it there, no room): not a request
-/// to wait and retry there (an image being prepared, a deadline, a cancel).
-fn refused_by_its_agent(code: FailureCode) -> bool {
-    matches!(
-        code,
-        FailureCode::UnsupportedCapability
-            | FailureCode::InsufficientMemory
-            | FailureCode::InsufficientDisk
-            | FailureCode::QuotaExceeded
-    )
-}
-
-/// A refusal of an existing orb's spawn that comes from its host (gone, unable to run
-/// it, or without room for it), not from the request.
-fn host_refusal(code: FailureCode) -> bool {
-    matches!(
-        code,
-        FailureCode::BackendUnavailable
-            | FailureCode::UnsupportedCapability
-            | FailureCode::InsufficientMemory
-            | FailureCode::InsufficientDisk
-            | FailureCode::QuotaExceeded
-    )
+/// Why an orb that never started should move at once for how its agent refused it, if
+/// it should: for a reason of that host's own the coordinator cannot see (its image not
+/// allowed or no runtime for it there), or for want of room [`CAPACITY_REFUSALS`] times
+/// in a row (once may pass: room admitted lately frees up within minutes). Never when
+/// asked to wait and retry there (an image being prepared, a deadline, a cancel).
+fn refused_for_good(u: &store::Unstarted) -> Option<String> {
+    match u.last_failure {
+        Some(FailureCode::UnsupportedCapability) => {
+            Some("its agent cannot run it (UnsupportedCapability)".into())
+        }
+        Some(code) if u.capacity_refusals >= CAPACITY_REFUSALS => Some(format!(
+            "its agent refused it for want of room {} times ({code:?})",
+            u.capacity_refusals
+        )),
+        _ => None,
+    }
 }
 
 fn describe(short: &[(FailureCode, String)]) -> String {
@@ -2862,36 +2936,40 @@ mod tests {
         );
     }
 
-    /// An orb that never started moves when its host refused it for the host's own
-    /// reasons, never when it was asked to wait and retry there (its image being
-    /// prepared on that host's disk, a deadline, a cancel) or the request was at fault.
+    /// An orb that never started moves at once when its agent cannot run it there, or
+    /// refused it for want of room [`CAPACITY_REFUSALS`] times in a row; not after one
+    /// such refusal (room admitted lately frees up), nor when asked to wait and retry
+    /// (its image being prepared there), nor for anything else.
     #[test]
-    fn unstarted_orbs_move_on_host_refusals_only() {
+    fn unstarted_orbs_move_at_once_only_for_lasting_refusals() {
         use FailureCode as F;
-        for code in [
-            F::UnsupportedCapability,
-            F::InsufficientMemory,
-            F::InsufficientDisk,
-            F::QuotaExceeded,
-        ] {
-            assert!(refused_by_its_agent(code), "{code:?}");
-            assert!(host_refusal(code), "{code:?}");
+        let u = |last: F, capacity_refusals: u32| store::Unstarted {
+            last_failure: Some(last),
+            capacity_refusals,
+        };
+        assert!(refused_for_good(&u(F::UnsupportedCapability, 0)).is_some());
+        for code in [F::InsufficientMemory, F::InsufficientDisk, F::QuotaExceeded] {
+            assert!(refused_for_good(&u(code, 1)).is_none(), "{code:?} once");
+            assert!(refused_for_good(&u(code, CAPACITY_REFUSALS - 1)).is_none());
+            assert!(
+                refused_for_good(&u(code, CAPACITY_REFUSALS)).is_some(),
+                "{code:?}"
+            );
         }
-        assert!(host_refusal(F::BackendUnavailable), "its host is gone");
-        assert!(!refused_by_its_agent(F::BackendUnavailable));
         for code in [
             F::ImageNotReady,
             F::DeadlineExceeded,
             F::Cancelled,
             F::BackendFailure,
+            F::BackendUnavailable,
             F::GuestBootstrapFailed,
             F::SecretUnavailable,
             F::StaleGeneration,
             F::InvalidRequest,
         ] {
-            assert!(!refused_by_its_agent(code), "{code:?}");
-            assert!(!host_refusal(code), "{code:?}");
+            assert!(refused_for_good(&u(code, 0)).is_none(), "{code:?}");
         }
+        assert!(refused_for_good(&store::Unstarted::default()).is_none());
     }
 
     /// A retired orb's old host gets a delete at once, then again only after a wait
@@ -3108,8 +3186,9 @@ mod tests {
             true,
         );
         assert_eq!((pool(&c), kept), ("holder", false));
-        // A host that refused the orb is avoided first, whatever else it has; unless no
-        // other host fits.
+        // A host that refused the orb is avoided ahead of wake room, snapshot and room,
+        // among hosts of its kind: never for an overflow host, and kept when no other
+        // fits (the caller then leaves the orb where it is).
         let avoid = |mut f: Fit| {
             f.avoided = true;
             f
@@ -3117,11 +3196,19 @@ mod tests {
         let (c, _) = choose(
             vec![
                 avoid(fit("refused", 900, true, true, false)),
-                fit("other", 100, false, false, true),
+                fit("other", 100, false, false, false),
             ],
             true,
         );
         assert_eq!(pool(&c), "other");
+        let (c, _) = choose(
+            vec![
+                avoid(fit("refused", 900, true, true, false)),
+                fit("spare", 900, true, false, true),
+            ],
+            true,
+        );
+        assert_eq!(pool(&c), "refused", "not onto an overflow host");
         let (c, _) = choose(vec![avoid(fit("refused", 900, true, true, false))], true);
         assert_eq!(pool(&c), "refused");
     }

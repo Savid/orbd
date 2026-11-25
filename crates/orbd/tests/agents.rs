@@ -643,3 +643,92 @@ fn an_orb_its_agent_refused_before_creating_it_is_placed_anew() {
     assert!(job.stderr.contains("BackendUnavailable"), "{}", job.stderr);
     assert_eq!(c.fake_orbs("agent-b").len(), 1, "amp-2 is not re-placed");
 }
+
+const PLACED_ANEW: &str = "spawn of an orb that never started: placing it anew";
+
+/// An agent that runs only tools images (`ORBD_IMAGE_ALLOW`), with room for `orbs`.
+fn picky(c: &mut Cluster, id: &str, orbs: u64) {
+    c.start_agent_with_env(
+        id,
+        &[
+            ("ORBD_IMAGE_ALLOW", "example.invalid/tools/*"),
+            ("ORBD_CAPACITY_VCPUS", &(2 * orbs).to_string()),
+            ("ORBD_CAPACITY_MEMORY_MIB", &(2048 * orbs).to_string()),
+        ],
+    );
+}
+
+/// The refusing host is passed over even where it has the most room: avoiding it alone
+/// decides where the orb goes.
+#[test]
+fn a_new_placement_avoids_the_host_that_refused_it() {
+    let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
+    c.start_coordinator("");
+    c.start_agent("agent-b", "");
+    c.wait_connected(1);
+    assert_ok(&c.dispatch("spawn", "amp-0", &[]), "amp-0 on agent-b");
+    picky(&mut c, "agent-a", 8);
+    c.wait_connected(2);
+    // agent-a has far more room: amp-1 goes there and is refused.
+    assert_ne!(c.dispatch("spawn", "amp-1", &[]).code, 0);
+    assert!(c.fake_orbs("agent-b").len() == 1, "amp-1 went to agent-a");
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1 placed anew");
+    assert!(c.fake_orb("agent-b", "amp-1").running);
+}
+
+/// When only the host that refused an orb fits it, the orb stays where it is: no new
+/// incarnation, refused again.
+#[test]
+fn an_orb_only_its_refusing_host_fits_stays_where_it_is() {
+    let mut c = Cluster::new(&["agent-a", "agent-b"], 1);
+    c.start_coordinator("");
+    c.start_agent("agent-b", "");
+    c.wait_connected(1);
+    assert_ok(&c.dispatch("spawn", "amp-0", &[]), "amp-0 fills agent-b");
+    picky(&mut c, "agent-a", 4);
+    c.wait_connected(2);
+    assert_ne!(c.dispatch("spawn", "amp-1", &[]).code, 0);
+    let first = c.orb_id("amp-1");
+    assert_ne!(c.dispatch("spawn", "amp-1", &[]).code, 0, "refused again");
+    assert_eq!(c.orb_id("amp-1"), first, "the same incarnation");
+    assert_eq!(c.logs().matches(PLACED_ANEW).count(), 0);
+}
+
+/// An orb refused by two agents is placed away from both, reaching the third that runs
+/// it, though the two have more room.
+#[test]
+fn an_orb_two_hosts_refused_reaches_a_third() {
+    let mut c = Cluster::new(&["agent-a", "agent-b", "agent-c"], 2);
+    c.start_coordinator("");
+    c.start_agent("agent-c", "");
+    c.wait_connected(1);
+    assert_ok(&c.dispatch("spawn", "amp-0", &[]), "amp-0 on agent-c");
+    picky(&mut c, "agent-a", 8);
+    picky(&mut c, "agent-b", 8);
+    c.wait_connected(3);
+    for _ in 0..2 {
+        assert_ne!(c.dispatch("spawn", "amp-1", &[]).code, 0, "refused");
+    }
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1 on agent-c");
+    assert!(c.fake_orb("agent-c", "amp-1").running);
+    assert_eq!(c.logs().matches(PLACED_ANEW).count(), 2);
+}
+
+/// A refusal never moves an orb onto an overflow agent: the always-on agent that
+/// refused it is the only one of its kind that fits, so the orb stays there.
+#[test]
+fn a_refusal_does_not_move_an_orb_onto_an_overflow_agent() {
+    let mut c = Cluster::new(&["agent-a"], 2);
+    c.start_coordinator("");
+    picky(&mut c, "agent-a", 4);
+    c.start_agent_with_env("spare", &[("ORBD_OVERFLOW", "true")]);
+    c.wait_connected(2);
+    assert_ne!(c.dispatch("spawn", "amp-1", &[]).code, 0);
+    let first = c.orb_id("amp-1");
+    assert_ne!(c.dispatch("spawn", "amp-1", &[]).code, 0, "refused again");
+    assert_eq!(c.orb_id("amp-1"), first);
+    assert!(
+        c.fake_orbs("spare").is_empty(),
+        "nothing on the overflow agent"
+    );
+}

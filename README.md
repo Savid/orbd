@@ -287,12 +287,21 @@ its snapshot boots slower; one that fills an agent leaves that agent's sleeping 
 unable to wake).
 
 An orb whose first spawn was refused before anything was created (its agent said
-nothing of it exists there) is not tied to that agent. When the agent refused it for
-reasons of its own (its image not in `ORBD_IMAGE_ALLOW`, no room), or the coordinator
-finds it cannot take it now (gone, or without room), its next spawn places it anew like
-a new orb, away from that agent if another fits, and that agent is told to delete what
-it recorded of the old one (`orbd_unstarted_orbs_replaced_total`). Not when the agent
-asked it to wait (its image being prepared there) and can take it.
+nothing of it exists there) is not tied to that agent. Its next spawn places it anew like
+a new orb (`orbd_unstarted_orbs_replaced_total`), and the old agent is told to delete what
+it recorded of it, when:
+
+- its agent refused it for a reason the coordinator cannot see (its image not in that
+  agent's `ORBD_IMAGE_ALLOW`), or for want of room three times in a row (once may pass:
+  memory admitted moments ago frees up); or
+- the coordinator finds that agent cannot take it now: no room, unable to run it, gone
+  for more than 30 minutes (longer than a restart or upgrade), or removed with
+  `orbd agent remove` (which also ends the commands it was sent and never answered).
+
+It goes to an agent of the same kind (always-on, or overflow) that has not refused it in
+the last 24 hours; when only agents that refused it fit, it stays where it is, as it does
+after four new placements in a day. Not when its agent asked it to wait (its image being
+prepared there).
 
 Running orbs reserve their vCPUs and memory; sleeping orbs reserve nothing. An orb type's
 `disk_gib` is each orb's disk size, a sparse file that grows as the orb writes, so disk is
@@ -302,7 +311,8 @@ checkpoint) after the headroom of the orbs already running and the agent's reser
 (`ORBD_DISK_RESERVE_GIB`, default max(10 GiB, 5% of the filesystem)) are set aside. A wake
 is credited the checkpoint room its agent reports the wake frees, which the orb's next
 checkpoint takes again: a sleep held in RAM frees what its agent committed for its
-checkpoint, and a QEMU checkpoint is read into memory and deleted at the wake. A
+checkpoint (unless that checkpoint is being written), and a QEMU checkpoint is read into
+memory and deleted at the wake. A
 Firecracker checkpoint on disk frees nothing at the wake (the restored VM maps it until
 its next checkpoint is written), so that wake needs room for both.
 `ORBD_CAPACITY_DISK_GIB` optionally limits what orbd allocates on the host (default: the
