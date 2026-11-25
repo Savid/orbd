@@ -450,30 +450,80 @@ fn snapshot_misses_count_overflow_and_other_architectures() {
     assert_eq!(placements(&c, "absent"), 0);
 }
 
-/// A sleeping orb's wake is admitted net of the memory checkpoint it sleeps on: that
-/// checkpoint already takes its room on the host and is discarded once the orb runs, so
-/// its next one needs no more. Here the agent's disk keeps room for one more orb's
-/// growth (1 GiB of headroom) but not for its growth and a second checkpoint (2 GiB).
+/// `log` without its colours.
+fn plain(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut chars = log.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for x in chars.by_ref() {
+                if x == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Whether the coordinator would let `amp_orb` start on its agent now.
+fn wakes_now(c: &Cluster, amp_orb: &str) -> bool {
+    let list = c.admin(&["orb", "list", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&list.stdout).unwrap_or_default();
+    v["orbs"].as_array().into_iter().flatten().any(|o| {
+        o["amp_orb_id"] == amp_orb && o["wake_blockers"].as_array().is_some_and(|b| b.is_empty())
+    })
+}
+
+/// A sleeping orb's wake is admitted net of what its agent reports the wake frees:
+/// here a checkpoint a restore reads into memory and deletes (as QEMU's), whose room
+/// the orb's next checkpoint takes again. The agent's disk keeps room for one more
+/// orb's growth (1 GiB of headroom) but not for its growth and a second checkpoint
+/// (2 GiB). Where the restored VM keeps its checkpoint until its next sleep is written
+/// (as Firecracker's), its wake frees nothing and needs both.
 #[test]
-fn a_wake_needs_room_for_its_growth_not_a_second_checkpoint() {
-    let mut c = Cluster::with_runtime(
-        &["agent-a"],
-        2,
-        "fake",
-        "runtime:\n  fake:\n    memory_preserving_sleep: true\n    \
-         disk: { free_gib: 6, total_gib: 100 }\n",
-    );
-    c.agent_env
-        .push(("ORBD_DISK_RESERVE_GIB".into(), "1".into()));
-    c.start_all();
-    // 6 GiB free less the 1 GiB reserve: 5 GiB; a running orb holds 1 + 2 GiB.
-    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1");
-    assert_ok(&c.dispatch("pause", "amp-1", &[]), "amp-1 sleeps");
-    assert!(!c.fake_orb("agent-a", "amp-1").checkpoints.is_empty());
-    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "amp-2");
-    // 2 GiB left: enough for amp-1 to grow, not for a checkpoint besides its own.
-    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake amp-1");
-    assert!(c.fake_orb("agent-a", "amp-1").running);
+fn a_wake_needs_room_for_a_second_checkpoint_only_where_the_first_stays() {
+    for keeps in [false, true] {
+        let mut c = Cluster::with_runtime(
+            &["agent-a"],
+            2,
+            "fake",
+            &format!(
+                "runtime:\n  fake:\n    memory_preserving_sleep: true\n    \
+                 restore_keeps_checkpoint: {keeps}\n    disk: {{ free_gib: 6, total_gib: 100 }}\n"
+            ),
+        );
+        c.agent_env
+            .push(("ORBD_DISK_RESERVE_GIB".into(), "1".into()));
+        c.start_all();
+        // 6 GiB free less the 1 GiB reserve: 5 GiB; a running orb holds 1 + 2 GiB.
+        assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1");
+        assert_ok(&c.dispatch("pause", "amp-1", &[]), "amp-1 sleeps");
+        assert_ok(&c.dispatch("spawn", "amp-2", &[]), "amp-2");
+        // 2 GiB left: room for amp-1 to grow, not for a second checkpoint.
+        if keeps {
+            let wake = c.dispatch("spawn", "amp-1", &[]);
+            assert_eq!(wake.code, 1, "{}", wake.stderr);
+            assert!(
+                wake.stderr.contains("InsufficientDisk")
+                    && wake
+                        .stderr
+                        .contains("needs 3.0 GiB headroom, 2.0 GiB usable"),
+                "{}",
+                wake.stderr
+            );
+        } else {
+            wait_until(
+                Duration::from_secs(10),
+                "the coordinator heard what amp-1's wake frees",
+                || wakes_now(&c, "amp-1"),
+            );
+            assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake amp-1");
+            assert!(c.fake_orb("agent-a", "amp-1").running);
+        }
+    }
 }
 
 /// A new orb leaves its host the room to wake the orbs asleep there (they cannot wake
@@ -514,15 +564,14 @@ fn new_orbs_leave_room_to_wake_the_orbs_asleep_on_their_host() {
     assert_eq!(c.logs().matches(SNAPSHOT_MISS).count(), 1);
 }
 
-/// An orb whose first spawn its agent refused before creating anything has nothing on
-/// that agent: once the agent cannot take it (here it is gone), its next spawn places
-/// a new incarnation on another agent, once. An orb that ever started stays where its
-/// disk is.
+/// An orb whose first spawn its agent refused for reasons of its own (here its image
+/// is not allowed there), before creating anything, has nothing on that agent: its next
+/// spawn places a new incarnation away from it, once, and that agent is told to delete
+/// what it recorded of the old one. An orb that ever started stays where its disk is.
 #[test]
-fn an_orb_that_never_started_is_placed_anew_when_its_agent_cannot_take_it() {
+fn an_orb_its_agent_refused_before_creating_it_is_placed_anew() {
     let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
     c.start_coordinator("");
-    // agent-a runs only the images its allowlist names: not amp-1's.
     c.start_agent_with_env(
         "agent-a",
         &[("ORBD_IMAGE_ALLOW", "example.invalid/tools/*")],
@@ -530,6 +579,7 @@ fn an_orb_that_never_started_is_placed_anew_when_its_agent_cannot_take_it() {
     c.wait_connected(1);
     let refused = c.dispatch("spawn", "amp-1", &[]);
     assert_ne!(refused.code, 0, "{}", refused.stdout);
+    let old = c.orb_id("amp-1");
     assert!(c.fake_orbs("agent-a").iter().all(|o| !o.disk));
     let tools = [("ORB_IMAGE", "example.invalid/tools/orb:1")];
     assert_ok(&c.dispatch("spawn", "amp-2", &tools), "amp-2");
@@ -538,13 +588,24 @@ fn an_orb_that_never_started_is_placed_anew_when_its_agent_cannot_take_it() {
         "amp-2 sleeps on agent-a",
     );
 
-    c.terminate_agent("agent-a", Duration::from_secs(30));
     c.start_agent("agent-b", "");
-    c.wait_connected(1);
+    c.wait_connected(2);
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1 placed anew");
     assert!(
         c.fake_orb("agent-b", "amp-1").running,
         "amp-1 runs on agent-b"
+    );
+    assert_ne!(c.orb_id("amp-1"), old, "a new incarnation");
+    wait_until(
+        Duration::from_secs(20),
+        "agent-a deleted what it recorded of the old amp-1",
+        || {
+            let log =
+                std::fs::read_to_string(c.root().join("agent-agent-a.log")).unwrap_or_default();
+            plain(&log).lines().any(|l| {
+                l.contains("operation terminal") && l.contains("action=\"delete\" ok=true")
+            })
+        },
     );
     // Its next spawn finds it where it runs now.
     assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1 again");
@@ -556,6 +617,8 @@ fn an_orb_that_never_started_is_placed_anew_when_its_agent_cannot_take_it() {
     );
 
     // amp-2 has its disk on agent-a: it waits for agent-a.
+    c.terminate_agent("agent-a", Duration::from_secs(30));
+    c.wait_connected(1);
     let job = c.dispatch("spawn", "amp-2", &tools);
     assert_eq!(job.code, 75, "{}", job.stderr);
     assert!(job.stderr.contains("BackendUnavailable"), "{}", job.stderr);

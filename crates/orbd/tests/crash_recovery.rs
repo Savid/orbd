@@ -185,3 +185,40 @@ fn forced_delete_finishes_an_orb_whose_delete_failed() {
     let s = c.only_orb("agent-a");
     assert!(!s.running && !s.disk, "deleted");
 }
+
+/// An orb whose first spawn failed for no reason of its host's (here the start itself
+/// failed, nothing created) is retried on that host while the host can take it: no new
+/// incarnation. Once its host is gone, nothing ties it there and its next spawn places
+/// it anew.
+#[test]
+fn an_orb_that_never_started_moves_only_when_its_host_cannot_take_it() {
+    let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
+    c.start_coordinator("");
+    c.start_agent("agent-a", "fake::start=2*return(boom)");
+    c.wait_connected(1);
+    for orb in ["amp-1", "amp-2"] {
+        let failed = c.dispatch("spawn", orb, &[]);
+        assert_ne!(failed.code, 0, "{orb}: {}", failed.stdout);
+    }
+    assert!(c.fake_orbs("agent-a").iter().all(|o| !o.disk));
+    c.start_agent("agent-b", "");
+    c.wait_connected(2);
+
+    // agent-a can take amp-1 now: it is retried there.
+    let first = c.orb_id("amp-1");
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1 on agent-a");
+    assert_eq!(c.orb_id("amp-1"), first);
+    assert!(c.fake_orb("agent-a", "amp-1").running);
+
+    // agent-a is gone: amp-2, never started, is placed on agent-b.
+    c.terminate_agent("agent-a", Duration::from_secs(30));
+    c.wait_connected(1);
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "amp-2 placed anew");
+    assert!(c.fake_orb("agent-b", "amp-2").running);
+    assert_eq!(
+        c.logs()
+            .matches("spawn of an orb that never started: placing it anew")
+            .count(),
+        1
+    );
+}

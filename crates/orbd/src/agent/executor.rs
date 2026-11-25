@@ -643,6 +643,7 @@ async fn finalize(
         .call(move |c| db::complete(c, op, orb, &o2, unix_ms_now()))
         .await?;
     crate::crash_point!("agent::terminal_committed");
+    super::refresh_wake_release(sh, &receipt.orb, &outcome.observed).await;
     let result_label = match &outcome.result {
         Ok(_) => "ok".to_owned(),
         Err(f) => format!("{:?}", f.code).to_lowercase(),

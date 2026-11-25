@@ -565,9 +565,22 @@ fn sleeping_orbs_do_not_block_new_orbs_on_disk() {
         list.stdout
     );
 
-    // Waking a sleeping orb needs only its growth (1 GiB): the memory checkpoint it
-    // wakes from already takes its room, and the next one takes it again. Admitted with
-    // 2 GiB left; the next wake, with none left, is refused until an orb sleeps.
+    // Waking a sleeping orb needs only its growth (1 GiB) once its agent reported that
+    // the wake frees its memory checkpoint (the fake's restore reads it into memory, as
+    // QEMU's does), whose room the next one takes again. Admitted with 2 GiB left; the
+    // next wake, with none left, is refused until an orb sleeps.
+    wait_until(
+        Duration::from_secs(10),
+        "the agent reported what waking amp-asleep-0 frees",
+        || {
+            let list = c.admin(&["orb", "list", "--json"]);
+            let v: serde_json::Value = serde_json::from_str(&list.stdout).unwrap_or_default();
+            v["orbs"].as_array().into_iter().flatten().any(|o| {
+                o["amp_orb_id"] == "amp-asleep-0"
+                    && o["wake_blockers"].as_array().is_some_and(|b| b.is_empty())
+            })
+        },
+    );
     assert_ok(&c.dispatch("spawn", "amp-asleep-0", &[]), "wake");
     let wake = c.dispatch("spawn", "amp-asleep-1", &[]);
     assert_eq!(wake.code, 1, "{}", wake.stderr);

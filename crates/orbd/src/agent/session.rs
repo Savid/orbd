@@ -144,6 +144,7 @@ pub(super) fn heartbeat(sh: &Shared) -> pb::AgentEvent {
         memory_available_bytes: sh.memory_available().map_or(0, |a| a.saturating_add(held)),
         memory_reserve_bytes: sh.memory_reserve,
         orb_disk: sh.orb_disk.lock().unwrap().clone(),
+        wake_releases: wake_releases(sh),
         // Sent once: a session that ends before the coordinator saw it starts with a
         // Hello listing what the agent holds.
         deleted_project_snapshot_keys: std::mem::take(
@@ -153,6 +154,29 @@ pub(super) fn heartbeat(sh: &Shared) -> pb::AgentEvent {
                 .unwrap_or_else(|e| e.into_inner()),
         ),
     }))
+}
+
+/// What waking each orb asleep here would free on disk now: the checkpoint room a
+/// sleep held in RAM has committed (its memory size, as `disk_committed` counts it),
+/// then the checkpoints on disk a wake frees, as last measured.
+fn wake_releases(sh: &Shared) -> Vec<pb::WakeRelease> {
+    let mut out: Vec<pb::WakeRelease> = sh
+        .runtimes
+        .values()
+        .flat_map(|r| r.held())
+        .map(|h| pb::WakeRelease {
+            orb_id: h.orb.to_string(),
+            checkpoint_generation: h.checkpoint.generation,
+            bytes: h.memory_bytes,
+        })
+        .collect();
+    let disk = sh.disk_wake_releases.lock().unwrap().clone();
+    for r in disk {
+        if !out.iter().any(|h| h.orb_id == r.orb_id) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 async fn connect_once(sh: &Arc<Shared>, attempt: &mut u32) -> anyhow::Result<()> {

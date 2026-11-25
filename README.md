@@ -278,24 +278,33 @@ when no other agent fits it, since an orb stays on the agent it was created on a
 wake while that host is off. `orbd agent list` marks such agents `(overflow)`.
 
 Orbs asleep or stopped on an agent can wake only there, so a new orb, which can go
-anywhere, prefers an agent that still has room to wake the largest of them (its vCPUs,
-memory and disk headroom, each the most any of them needs) once it takes the new orb;
-only when no agent does is it placed without that room. This comes before the project
-snapshot (a new orb that misses its snapshot boots slower; one that fills an agent leaves
-that agent's sleeping orbs unable to wake). An orb whose first spawn its agent refused
-before creating anything (the agent said nothing of it exists there) is not tied to that
-agent: when the agent cannot take it later (gone, or without room), its next spawn
-places it anew like a new orb (`orbd_unstarted_orbs_replaced_total`).
+anywhere, prefers an agent that still has room to wake the largest of the orbs that went
+to sleep or stopped there in the last 24 hours (their vCPUs, memory and disk headroom,
+each the most any of them needs; not archived, faulted or being deleted ones) once it
+takes the new orb, ranked by the room it has beyond that; only when no agent does is it
+placed without that room. This comes before the project snapshot (a new orb that misses
+its snapshot boots slower; one that fills an agent leaves that agent's sleeping orbs
+unable to wake).
+
+An orb whose first spawn was refused before anything was created (its agent said
+nothing of it exists there) is not tied to that agent. When the agent refused it for
+reasons of its own (its image not in `ORBD_IMAGE_ALLOW`, no room), or the coordinator
+finds it cannot take it now (gone, or without room), its next spawn places it anew like
+a new orb, away from that agent if another fits, and that agent is told to delete what
+it recorded of the old one (`orbd_unstarted_orbs_replaced_total`). Not when the agent
+asked it to wait (its image being prepared there) and can take it.
 
 Running orbs reserve their vCPUs and memory; sleeping orbs reserve nothing. An orb type's
 `disk_gib` is each orb's disk size, a sparse file that grows as the orb writes, so disk is
 admitted by what the host actually has: a new or waking orb needs free space for its
 headroom (up to `running_orb_disk_headroom_gib`, default 10, of growth plus its memory
 checkpoint) after the headroom of the orbs already running and the agent's reserve
-(`ORBD_DISK_RESERVE_GIB`, default max(10 GiB, 5% of the filesystem)) are set aside. An orb
-waking from a memory checkpoint needs only its growth: the checkpoint is already in the
-host's used (or, for a sleep held in RAM, committed) disk and is deleted once the orb runs,
-so its next checkpoint takes the same room.
+(`ORBD_DISK_RESERVE_GIB`, default max(10 GiB, 5% of the filesystem)) are set aside. A wake
+is credited the checkpoint room its agent reports the wake frees, which the orb's next
+checkpoint takes again: a sleep held in RAM frees what its agent committed for its
+checkpoint, and a QEMU checkpoint is read into memory and deleted at the wake. A
+Firecracker checkpoint on disk frees nothing at the wake (the restored VM maps it until
+its next checkpoint is written), so that wake needs room for both.
 `ORBD_CAPACITY_DISK_GIB` optionally limits what orbd allocates on the host (default: the
 whole filesystem). A refusal names each host's limiting resource with its numbers.
 

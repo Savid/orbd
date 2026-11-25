@@ -768,6 +768,32 @@ impl ComputeBackend for FleetBackend {
                 .collect(),
         )
     }
+
+    fn wake_releases(
+        &self,
+        location: &Location,
+    ) -> HashMap<crate::model::OrbId, super::WakeRelease> {
+        let Ok(agent) = self.inner.agent_of(location) else {
+            return HashMap::new();
+        };
+        let st = self.inner.lock();
+        let Some((hb, _)) = st.agents.get(&agent).and_then(|a| a.heartbeat.as_ref()) else {
+            return HashMap::new();
+        };
+        hb.wake_releases
+            .iter()
+            .filter_map(|r| {
+                let id = crate::model::OrbId::parse(&r.orb_id).ok()?;
+                Some((
+                    id,
+                    super::WakeRelease {
+                        checkpoint_generation: r.checkpoint_generation,
+                        bytes: r.bytes,
+                    },
+                ))
+            })
+            .collect()
+    }
 }
 
 fn page_from_wire(resp: pb::ReconcileResponse) -> Result<ReconcilePage, wire::WireError> {

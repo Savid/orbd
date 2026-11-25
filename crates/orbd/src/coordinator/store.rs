@@ -313,28 +313,91 @@ pub fn idle_orbs(c: &Connection, cutoff_ms: u64) -> Result<Vec<OrbRecord>> {
         .collect())
 }
 
-/// The orbs asleep or stopped in one pool (their reservations hold nothing now), not
-/// retired: those that may wake there.
-pub fn stopped_orbs(c: &Connection, backend: &str, pool: &str) -> Result<Vec<OrbRecord>> {
-    let mut st = c.prepare(&format!(
-        "SELECT {ORB_COLS} FROM orbs WHERE retired_ms IS NULL AND id IN
-           (SELECT orb_id FROM reservations
-            WHERE backend_id = ?1 AND pool = ?2 AND kind = 'stopped')"
-    ))?;
-    Ok(st
-        .query_map(params![backend, pool], orb_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
+/// The room one pool keeps for waking the orbs asleep or stopped in it: the largest of
+/// their wakes' needs, resource by resource, as `core::wake_demand` sizes each (growth
+/// headroom up to `headroom`, plus the memory checkpoint of a memory-preserving orb,
+/// less what `releases` reports its wake frees, for the checkpoint generation it sleeps
+/// on). Aggregated here, not loaded orb by orb. Counts only orbs that may wake: known
+/// asleep or stopped (not faulted) since `since_ms` or later, not retired, no delete
+/// begun, and not `excluded` (archived).
+pub fn wake_room(
+    c: &Connection,
+    backend: &str,
+    pool: &str,
+    headroom: u64,
+    since_ms: u64,
+    releases: &[(OrbId, crate::backend::WakeRelease)],
+    excluded: &[OrbId],
+) -> Result<Resources> {
+    let releases = serde_json::to_string(
+        &releases
+            .iter()
+            .map(|(id, r)| (id.to_string(), r.checkpoint_generation, r.bytes))
+            .collect::<Vec<_>>(),
+    )?;
+    let excluded =
+        serde_json::to_string(&excluded.iter().map(|id| id.to_string()).collect::<Vec<_>>())?;
+    Ok(c.query_row(
+        "WITH rel(id, gen, bytes) AS (
+             SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+                    json_extract(value, '$[2]')
+             FROM json_each(?5)),
+         w AS (
+             SELECT json_extract(o.spec_json, '$.template.resources.vcpus') AS vcpus,
+                    json_extract(o.spec_json, '$.template.resources.memory_bytes') AS mem,
+                    MIN(json_extract(o.spec_json, '$.template.resources.disk_bytes'), ?3)
+                        AS growth,
+                    CASE WHEN json_extract(o.spec_json, '$.template.pause_policy.mode')
+                              = 'memory_preserving'
+                         THEN json_extract(o.spec_json, '$.template.resources.memory_bytes')
+                         ELSE 0 END AS ckpt,
+                    CASE WHEN json_extract(o.observation_json, '$.state.state.kind')
+                              = 'sleeping'
+                          AND rel.gen = json_extract(o.observation_json,
+                                                     '$.state.state.checkpoint.generation')
+                         THEN rel.bytes ELSE 0 END AS freed
+             FROM orbs o LEFT JOIN rel ON rel.id = o.id
+             WHERE o.retired_ms IS NULL
+               AND o.id IN (SELECT orb_id FROM reservations
+                            WHERE backend_id = ?1 AND pool = ?2 AND kind = 'stopped')
+               AND json_extract(o.observation_json, '$.state.kind') = 'known'
+               AND json_extract(o.observation_json, '$.state.state.kind')
+                   IN ('sleeping', 'disk_only_stopped')
+               AND json_extract(o.observation_json, '$.observed_at_unix_ms') >= ?4
+               AND NOT EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
+               AND o.id NOT IN (SELECT value FROM json_each(?6)))
+         SELECT COALESCE(MAX(vcpus), 0), COALESCE(MAX(mem), 0),
+                COALESCE(MAX(growth + ckpt - MIN(freed, ckpt)), 0)
+         FROM w",
+        params![
+            backend,
+            pool,
+            headroom as i64,
+            since_ms as i64,
+            releases,
+            excluded
+        ],
+        |r| {
+            Ok(Resources {
+                vcpus: u(r, 0)?.min(u32::MAX as u64) as u32,
+                memory_bytes: u(r, 1)?,
+                disk_bytes: u(r, 2)?,
+            })
+        },
+    )?)
 }
 
-/// Retires an orb that never started, so that its next spawn places a new incarnation
-/// anywhere: only while its last command (`generation`, nothing issued since, none
-/// open) left it known uncreated, none of its commands ever started or paused it, and
-/// no delete has begun. Its host said nothing of it exists there, and is sent nothing
-/// for it again. Returns whether it retired the orb.
-pub fn retire_unstarted(c: &mut Connection, orb: OrbId, generation: u64) -> Result<bool> {
-    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(rec) = get_orb_by_id_live(&tx, orb)? else {
-        return Ok(false);
+/// Whether `orb` never started, and how its last command failed if it did: known
+/// uncreated by its last command (`generation`, nothing issued since, none open), none
+/// of its commands ever started or paused it, not retired, no delete begun. Its host
+/// said nothing of it exists there. None if not such an orb.
+pub fn unstarted(
+    c: &Connection,
+    orb: OrbId,
+    generation: u64,
+) -> Result<Option<Option<FailureCode>>> {
+    let Some(rec) = get_orb_by_id_live(c, orb)? else {
+        return Ok(None);
     };
     let unstarted = rec.last_issued_generation == generation
         && rec.observation.generation == generation
@@ -342,19 +405,38 @@ pub fn retire_unstarted(c: &mut Connection, orb: OrbId, generation: u64) -> Resu
             == OrbState::Known {
                 state: StableOrbState::Uncreated,
             }
-        && open_command(&tx, orb)?.is_none()
-        && last_active(&tx, orb)?.is_none()
-        && !is_tombstoned(&tx, orb)?;
+        && open_command(c, orb)?.is_none()
+        && last_active(c, orb)?.is_none()
+        && !is_tombstoned(c, orb)?;
     if !unstarted {
-        return Ok(false);
+        return Ok(None);
     }
-    retire_orb(&tx, orb)?;
-    tx.execute(
-        "DELETE FROM reservations WHERE orb_id = ?1",
-        params![orb.to_string()],
-    )?;
-    tx.commit()?;
-    Ok(true)
+    let failure = orb_commands(c, orb, 1)?
+        .into_iter()
+        .next()
+        .and_then(|h| h.outcome)
+        .and_then(|o| o.result.err())
+        .map(|f| f.code);
+    Ok(Some(failure))
+}
+
+/// Retired orbs whose delete has not completed and that have no command open: orbs
+/// that never started, replaced by a new incarnation elsewhere ([`CreatePlan::retire`]),
+/// whose old host is still to be told to delete what it recorded of them.
+pub fn retired_undeleted(c: &Connection) -> Result<Vec<OrbRecord>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {ORB_COLS} FROM orbs o WHERE retired_ms IS NOT NULL
+           AND EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
+           AND NOT EXISTS (SELECT 1 FROM commands m
+                           WHERE m.orb_id = o.id AND m.status <> 'terminal')"
+    ))?;
+    let orbs = st
+        .query_map([], orb_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(orbs
+        .into_iter()
+        .filter(|o| !matches!(o.observation.state.last_known(), StableOrbState::Deleted))
+        .collect())
 }
 
 /// The orb, unless it is retired.
@@ -367,7 +449,7 @@ fn get_orb_by_id_live(c: &Connection, id: OrbId) -> Result<Option<OrbRecord>> {
     .optional()?)
 }
 
-/// Retires a deleted orb (or one that never started, [`retire_unstarted`]) so a new
+/// Retires a deleted orb (or one that never started, [`CreatePlan::retire`]) so a new
 /// incarnation can take its Amp id.
 pub fn retire_orb(c: &Connection, orb: OrbId) -> Result<()> {
     c.execute(
@@ -612,12 +694,40 @@ pub struct CreatePlan {
     pub tombstone: Option<(String, String)>,
     /// Sealed guest env for the new operation (aad = operation id).
     pub sealed: Option<Vec<u8>>,
+    /// (orb, its last issued generation): an orb that never started ([`unstarted`]),
+    /// retired in the same transaction, before `new_orb` takes its Amp id, with a
+    /// delete tombstone so its old host is told to delete it (see
+    /// [`retired_undeleted`]). Refused if it is no longer such an orb.
+    pub retire: Option<(OrbId, u64)>,
 }
 
 /// Command creation + generation bump + reservation + outbox intent in one transaction.
 pub fn create_command(c: &mut Connection, p: &CreatePlan) -> Result<()> {
     let now = unix_ms_now() as i64;
     let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some((old, generation)) = p.retire {
+        let Some(new) = &p.new_orb else {
+            bail!("only a new orb replaces an orb that never started");
+        };
+        if unstarted(&tx, old, generation)?.is_none() {
+            bail!("orb {old} changed concurrently");
+        }
+        retire_orb(&tx, old)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO delete_tombstones(amp_endpoint, amp_orb_id, orb_id, created_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                new.identity.amp_endpoint.as_str(),
+                new.identity.amp_orb_id.as_str(),
+                old.to_string(),
+                now
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM reservations WHERE orb_id = ?1",
+            params![old.to_string()],
+        )?;
+    }
     if let Some(orb) = &p.new_orb {
         tx.execute(
             "INSERT INTO orbs(id, amp_endpoint, amp_orb_id, offering_id, spec_json, spec_digest,
@@ -1146,47 +1256,41 @@ mod tests {
         })
     }
 
-    /// Only an orb whose commands never started it, the last of them (nothing issued
-    /// since, none open) leaving it known uncreated, with no delete begun, is retired
-    /// for a new incarnation; retiring frees its Amp id and is done once.
+    /// An orb never started while its last command (nothing issued since, none open)
+    /// left it known uncreated, none ever started or paused it and no delete has begun:
+    /// with how that command failed.
     #[test]
-    fn only_orbs_that_never_started_are_retired_for_a_new_placement() {
-        let mut c = crate::coordinator::db::test_connection();
+    fn orbs_that_never_started_are_told_apart_with_their_last_failure() {
+        let c = crate::coordinator::db::test_connection();
         let uncreated = OrbState::known(StableOrbState::Uncreated);
-        let identity_free = |c: &Connection, id: OrbId| {
-            get_orb_by_identity(c, "amp", &format!("amp-{id}"))
-                .unwrap()
-                .is_none()
-        };
-
         let u = orb(&c, &uncreated, 0);
         command(&c, u, 5, &Action::Spawn, refused(), &uncreated);
-        assert!(
-            !retire_unstarted(&mut c, u, 4).unwrap(),
+        assert_eq!(
+            unstarted(&c, u, 5).unwrap(),
+            Some(Some(FailureCode::InsufficientMemory))
+        );
+        assert_eq!(
+            unstarted(&c, u, 4).unwrap(),
+            None,
             "a newer generation was issued"
         );
-        assert!(retire_unstarted(&mut c, u, 5).unwrap());
-        assert!(
-            identity_free(&c, u),
-            "its Amp id is free for a new incarnation"
-        );
-        assert!(!retire_unstarted(&mut c, u, 5).unwrap(), "once");
 
         // It started once (a spawn succeeded): it has a disk somewhere.
         let s = orb(&c, &uncreated, 0);
+        let spawned = Ok(ActionResult::Spawned {
+            start: StartKind::NewDisk,
+            bootstrap_generation: 4,
+        });
         command(
             &c,
             s,
             4,
             &Action::Spawn,
-            Ok(ActionResult::Spawned {
-                start: StartKind::NewDisk,
-                bootstrap_generation: 4,
-            }),
+            spawned,
             &OrbState::known(StableOrbState::Running),
         );
         command(&c, s, 5, &Action::Spawn, refused(), &uncreated);
-        assert!(!retire_unstarted(&mut c, s, 5).unwrap(), "started before");
+        assert_eq!(unstarted(&c, s, 5).unwrap(), None, "started before");
 
         for state in [
             OrbState::known(StableOrbState::Sleeping {
@@ -1201,10 +1305,9 @@ mod tests {
             },
         ] {
             let o = orb(&c, &state, 0);
-            assert!(!retire_unstarted(&mut c, o, 5).unwrap(), "{state:?}");
+            assert_eq!(unstarted(&c, o, 5).unwrap(), None, "{state:?}");
         }
 
-        // A command still open.
         let o = orb(&c, &uncreated, 0);
         c.execute(
             "INSERT INTO commands(operation_id, orb_id, generation, action_json, command_digest,
@@ -1217,12 +1320,8 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(
-            !retire_unstarted(&mut c, o, 5).unwrap(),
-            "a command is open"
-        );
+        assert_eq!(unstarted(&c, o, 5).unwrap(), None, "a command is open");
 
-        // A delete has begun.
         let d = orb(&c, &uncreated, 0);
         c.execute(
             "INSERT INTO delete_tombstones(amp_endpoint, amp_orb_id, orb_id, created_ms)
@@ -1230,42 +1329,226 @@ mod tests {
             params![format!("amp-{d}"), d.to_string()],
         )
         .unwrap();
-        assert!(!retire_unstarted(&mut c, d, 5).unwrap(), "being deleted");
-        assert!(!identity_free(&c, d));
+        assert_eq!(unstarted(&c, d, 5).unwrap(), None, "being deleted");
     }
 
-    /// The orbs that may wake in a pool are those whose reservations are stopped, live.
+    /// A new incarnation of an orb that never started retires it in the command's own
+    /// transaction (its Amp id is free only once the new one takes it), marks it for its
+    /// old host to delete, and is refused, changing nothing, if the orb is no longer
+    /// such an orb. Once that delete is done, nothing is left to clean up.
     #[test]
-    fn stopped_orbs_are_those_that_may_wake_in_the_pool() {
+    fn a_new_incarnation_retires_an_orb_that_never_started_atomically() {
         let mut c = crate::coordinator::db::test_connection();
-        let asleep = OrbState::known(StableOrbState::Sleeping {
-            checkpoint: SleepCheckpointRef { generation: 3 },
-        });
-        let reserve = |c: &Connection, o: OrbId, pool: &str, kind: &str| {
-            c.execute(
-                "INSERT INTO reservations(orb_id, backend_id, pool, vcpus, memory_bytes,
-                    disk_bytes, kind) VALUES (?1, 'fleet', ?2, 0, 0, 0, ?3)",
-                params![o.to_string(), pool, kind],
-            )
-            .unwrap();
+        let uncreated = OrbState::known(StableOrbState::Uncreated);
+        let old = orb(&c, &uncreated, 0);
+        command(&c, old, 5, &Action::Spawn, refused(), &uncreated);
+        let rec = get_orb(&c, old).unwrap().unwrap();
+        let plan = |retire: (OrbId, u64)| {
+            let mut new = rec.clone();
+            new.id = OrbId::generate();
+            new.location = fleet("agent-b");
+            new.last_issued_generation = 1;
+            CreatePlan {
+                invocation_id: InvocationId::generate(),
+                orb_id: new.id,
+                new_orb: Some(new),
+                prev_generation: 0,
+                generation: 1,
+                operation_id: OperationId::generate(),
+                action: Action::Spawn,
+                command_digest: "d".into(),
+                fingerprint: None,
+                work_deadline_ms: 0,
+                cleanup_deadline_ms: 0,
+                reservation: None,
+                tombstone: None,
+                sealed: None,
+                retire: Some(retire),
+            }
         };
-        let a = orb(&c, &asleep, 0);
-        reserve(&c, a, "agent-a", "stopped");
-        let r = orb(&c, &OrbState::known(StableOrbState::Running), 0);
-        reserve(&c, r, "agent-a", "running");
-        let b = orb(&c, &asleep, 0);
-        reserve(&c, b, "agent-b", "stopped");
-        let gone = orb(&c, &asleep, 0);
-        reserve(&c, gone, "agent-a", "stopped");
-        retire_orb(&c, gone).unwrap();
-        let ids = |c: &mut Connection| -> Vec<OrbId> {
-            stopped_orbs(c, "fleet", "agent-a")
+        let identity = |c: &Connection| {
+            get_orb_by_identity(c, "amp", &format!("amp-{old}"))
                 .unwrap()
-                .into_iter()
                 .map(|o| o.id)
-                .collect()
         };
-        assert_eq!(ids(&mut c), vec![a]);
-        assert!(stopped_orbs(&c, "other", "agent-a").unwrap().is_empty());
+
+        // Stale: a newer generation was issued meanwhile.
+        assert!(create_command(&mut c, &plan((old, 4))).is_err());
+        assert_eq!(identity(&c), Some(old), "nothing changed");
+        assert!(retired_undeleted(&c).unwrap().is_empty());
+
+        let p = plan((old, 5));
+        create_command(&mut c, &p).unwrap();
+        assert_eq!(
+            identity(&c),
+            Some(p.orb_id),
+            "the new incarnation has the Amp id"
+        );
+        assert!(is_tombstoned(&c, old).unwrap());
+        assert!(!is_tombstoned(&c, p.orb_id).unwrap());
+        let pending: Vec<OrbId> = retired_undeleted(&c)
+            .unwrap()
+            .iter()
+            .map(|o| o.id)
+            .collect();
+        assert_eq!(pending, vec![old]);
+        assert!(
+            create_command(&mut c, &plan((old, 5))).is_err(),
+            "retired once"
+        );
+
+        // Its old host deleted it.
+        command(
+            &c,
+            old,
+            6,
+            &Action::Delete,
+            Ok(ActionResult::Deleted),
+            &OrbState::known(StableOrbState::Deleted),
+        );
+        c.execute(
+            "UPDATE orbs SET observation_json = ?2, last_issued_generation = 6 WHERE id = ?1",
+            params![
+                old.to_string(),
+                js(&VersionedObservation {
+                    state: OrbState::known(StableOrbState::Deleted),
+                    generation: 6,
+                    observed_at_unix_ms: 0,
+                })
+            ],
+        )
+        .unwrap();
+        assert!(retired_undeleted(&c).unwrap().is_empty());
+    }
+
+    /// An orb with `resources`, memory-preserving or not, recorded `state` at
+    /// `observed_at`, with a `kind` reservation in `pool`.
+    fn sized_orb(
+        c: &Connection,
+        resources: Resources,
+        memory_preserving: bool,
+        state: &OrbState,
+        observed_at: u64,
+        pool: &str,
+        kind: &str,
+    ) -> OrbRecord {
+        let id = orb(c, state, observed_at);
+        let mut rec = get_orb(c, id).unwrap().unwrap();
+        rec.spec.template.resources = resources;
+        if !memory_preserving {
+            rec.spec.template.pause_policy = PausePolicy::DiskOnly;
+        }
+        c.execute_batch("DROP TRIGGER orbs_identity_immutable").ok();
+        c.execute(
+            "UPDATE orbs SET spec_json = ?2 WHERE id = ?1",
+            params![id.to_string(), js(&rec.spec)],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO reservations(orb_id, backend_id, pool, vcpus, memory_bytes, disk_bytes,
+                kind) VALUES (?1, 'fleet', ?2, 0, 0, 0, ?3)",
+            params![id.to_string(), pool, kind],
+        )
+        .unwrap();
+        rec
+    }
+
+    /// A pool keeps room for the largest wake among the orbs that may wake there, per
+    /// resource and net of what their host reports their wakes free (for the generation
+    /// they sleep on), computed by the database exactly as `wake_demand` sizes each
+    /// wake; not for orbs running, being deleted, faulted, retired, asleep before
+    /// `since`, archived, or in another pool.
+    #[test]
+    fn wake_room_is_the_largest_wake_that_may_come_per_resource() {
+        let c = crate::coordinator::db::test_connection();
+        let policy = crate::coordinator::core::Policy {
+            running_orb_disk_headroom: 10 * GIB,
+            idle_orb_ttl: None,
+        };
+        let res = |vcpus, mem_gib: u64, disk_gib: u64| Resources {
+            vcpus,
+            memory_bytes: mem_gib * GIB,
+            disk_bytes: disk_gib * GIB,
+        };
+        let asleep = |g| {
+            OrbState::known(StableOrbState::Sleeping {
+                checkpoint: SleepCheckpointRef { generation: g },
+            })
+        };
+        let stopped = OrbState::known(StableOrbState::DiskOnlyStopped {
+            reason: "stopped".into(),
+        });
+        let (since, recent) = (1_000, 2_000);
+        let big = sized_orb(
+            &c,
+            res(8, 32, 100),
+            true,
+            &asleep(9),
+            recent,
+            "a",
+            "stopped",
+        );
+        let small = sized_orb(&c, res(2, 4, 50), true, &stopped, recent, "a", "stopped");
+        let disk_only = sized_orb(&c, res(1, 1, 5), false, &stopped, recent, "a", "stopped");
+        // None of these may wake here soon.
+        let huge = res(32, 128, 500);
+        sized_orb(&c, huge, true, &asleep(1), recent, "a", "running");
+        sized_orb(&c, huge, true, &asleep(1), recent, "b", "stopped");
+        sized_orb(&c, huge, true, &asleep(1), since - 1, "a", "stopped");
+        let faulted = OrbState::Faulted {
+            last_known: StableOrbState::Sleeping {
+                checkpoint: SleepCheckpointRef { generation: 1 },
+            },
+            reason: "inspect failed".into(),
+        };
+        sized_orb(&c, huge, true, &faulted, recent, "a", "stopped");
+        let tomb = sized_orb(&c, huge, true, &asleep(1), recent, "a", "stopped");
+        c.execute(
+            "INSERT INTO delete_tombstones(amp_endpoint, amp_orb_id, orb_id, created_ms)
+             VALUES ('amp', ?1, ?2, 0)",
+            params![format!("amp-{}", tomb.id), tomb.id.to_string()],
+        )
+        .unwrap();
+        let retired = sized_orb(&c, huge, true, &asleep(1), recent, "a", "stopped");
+        retire_orb(&c, retired.id).unwrap();
+        let archived = sized_orb(&c, huge, true, &stopped, recent, "a", "stopped");
+
+        let freed = |g, gib: u64| crate::backend::WakeRelease {
+            checkpoint_generation: g,
+            bytes: gib * GIB,
+        };
+        let room = |releases: &[(OrbId, crate::backend::WakeRelease)]| {
+            wake_room(&c, "fleet", "a", 10 * GIB, since, releases, &[archived.id]).unwrap()
+        };
+        // The big one held in RAM: its wake frees its checkpoint room; the small one
+        // stopped without a checkpoint needs its growth and its next checkpoint.
+        let releases = [(big.id, freed(9, 32))];
+        assert_eq!(room(&releases), res(8, 32, 14));
+        // As `wake_demand` would size each one.
+        let by_rust = [&big, &small, &disk_only]
+            .iter()
+            .map(|o| {
+                let r = releases.iter().find(|(id, _)| *id == o.id).map(|(_, r)| *r);
+                crate::coordinator::core::wake_demand(
+                    &policy,
+                    &o.spec.template,
+                    &o.observation.state,
+                    r,
+                )
+            })
+            .fold(Resources::default(), |a, n| Resources {
+                vcpus: a.vcpus.max(n.vcpus),
+                memory_bytes: a.memory_bytes.max(n.memory_bytes),
+                disk_bytes: a.disk_bytes.max(n.disk_bytes),
+            });
+        assert_eq!(room(&releases), by_rust);
+        // Nothing reported for it (a checkpoint on disk a Firecracker VM keeps mapped),
+        // or for another generation: its whole headroom.
+        assert_eq!(room(&[]), res(8, 32, 42));
+        assert_eq!(room(&[(big.id, freed(8, 32))]), res(8, 32, 42));
+        assert_eq!(
+            wake_room(&c, "fleet", "empty", 10 * GIB, since, &[], &[]).unwrap(),
+            Resources::default()
+        );
     }
 }

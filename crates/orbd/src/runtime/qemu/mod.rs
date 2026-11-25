@@ -1390,6 +1390,12 @@ impl QemuRuntime {
 
 #[async_trait]
 impl Runtime for QemuRuntime {
+    /// A restore loads the memory file into the guest's own memory, so the checkpoint's
+    /// blocks are freed when it is discarded right after.
+    fn restore_frees_checkpoint(&self) -> bool {
+        true
+    }
+
     fn capabilities(&self) -> RuntimeCapabilities {
         RuntimeCapabilities {
             kind: RuntimeKind::Qemu,
