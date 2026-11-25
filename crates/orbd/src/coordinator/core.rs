@@ -100,8 +100,6 @@ pub struct Core {
     last_reconcile: HashMap<OperationId, Instant>,
     /// Orbs an idle reclaim was attempted for, and when (retried at most hourly).
     last_reclaim: HashMap<OrbId, Instant>,
-    /// When each retired orb's old host was last told to delete it (`cleanup_retired`).
-    last_cleanup: HashMap<OrbId, Instant>,
     policy: Policy,
     ticks: u64,
     waker: Option<Waker>,
@@ -161,7 +159,6 @@ impl Core {
             last_cancel: HashMap::new(),
             last_reconcile: HashMap::new(),
             last_reclaim: HashMap::new(),
-            last_cleanup: HashMap::new(),
             policy,
             ticks: 0,
         }
@@ -781,7 +778,7 @@ impl Core {
         };
         if p.new_orb
             .as_ref()
-            .is_none_or(|n| n.location == old.location)
+            .is_none_or(|n| same_host(&n.location, &old.location))
         {
             return Ok(None);
         }
@@ -793,29 +790,28 @@ impl Core {
     /// Tells the old host of each orb that never started and was placed anew (retired,
     /// its delete not done; `only` that one) to delete what it recorded of it: an
     /// agent's row and receipt, or a Boat sandbox whose create response was lost. Only
-    /// while that host is available, so no command piles up for one that is gone, and
-    /// at most every [`CLEANUP_EVERY`] per orb.
+    /// while that host is available, so no command piles up for one that is gone; again
+    /// after [`CLEANUP_EVERY`], doubling, at most [`CLEANUP_ATTEMPTS`] times. A host that
+    /// answers it cannot run the orb created nothing of it: done
+    /// ([`store::retired_undeleted`]).
     async fn cleanup_retired(&mut self, only: Option<OrbId>) -> Result<()> {
         let orbs = self.db.call(|c| store::retired_undeleted(c)).await?;
+        let now = unix_ms_now();
         for orb in orbs {
             if only.is_some_and(|id| id != orb.id)
-                || self
-                    .last_cleanup
-                    .get(&orb.id)
-                    .is_some_and(|t| t.elapsed() < CLEANUP_EVERY)
+                || !cleanup_due(orb.attempts, orb.last_attempt_ms, now)
             {
                 continue;
             }
             let Some(backend) = self.backends.get(orb.location.backend_id()).cloned() else {
                 continue;
             };
-            let template = &orb.spec.template;
             let cands = self
                 .candidates(
                     &backend,
                     PlacementRequest {
-                        target: template.target.clone(),
-                        resources: template.resources,
+                        target: orb.target.clone(),
+                        resources: orb.resources,
                         existing: Some(orb.location.clone()),
                         project_snapshot: None,
                     },
@@ -829,8 +825,6 @@ impl Core {
             if !available {
                 continue;
             }
-            self.last_cleanup.insert(orb.id, Instant::now());
-            let now = unix_ms_now();
             let mut plan = CreatePlan {
                 invocation_id: InvocationId::generate(),
                 new_orb: None,
@@ -850,7 +844,7 @@ impl Core {
             };
             plan.command_digest = command_digest(&plan, &orb.spec_digest);
             let op = plan.operation_id;
-            tracing::info!(orb = %orb.id, amp_orb_id = %orb.identity.amp_orb_id, location = ?orb.location, "deleting what its old host recorded of an orb that never started");
+            tracing::info!(orb = %orb.id, amp_orb_id = %orb.amp_orb_id, location = ?orb.location, attempt = orb.attempts + 1, "deleting what its old host recorded of an orb that never started");
             self.db
                 .call(move |c| store::create_command(c, &plan))
                 .await?;
@@ -1281,7 +1275,7 @@ impl Core {
                 } else {
                     room_score(&cand, &used)
                 };
-                let avoided = avoid == Some(&cand.location);
+                let avoided = avoid.is_some_and(|a| same_host(a, &cand.location));
                 fitting.push(Fit {
                     cand,
                     score,
@@ -2286,8 +2280,56 @@ pub(super) fn wake_demand(
     need
 }
 
-/// How often a retired orb's old host is told again to delete it, while it has not.
+/// How long after a delete of a retired orb its old host is told again, while it has
+/// not deleted it; doubling with each try.
 const CLEANUP_EVERY: Duration = Duration::from_secs(600);
+/// How many deletes a retired orb's old host is sent at most (the last one about
+/// 21 hours after the first that went unanswered).
+const CLEANUP_ATTEMPTS: u32 = 8;
+
+/// Whether a retired orb's old host is due another delete: the first at once, then
+/// [`CLEANUP_EVERY`] after the last, doubling, at most [`CLEANUP_ATTEMPTS`] in all.
+fn cleanup_due(attempts: u32, last_attempt_ms: Option<u64>, now_ms: u64) -> bool {
+    if attempts >= CLEANUP_ATTEMPTS {
+        return false;
+    }
+    let Some(last) = last_attempt_ms else {
+        return true;
+    };
+    let doublings = attempts.saturating_sub(1).min(16);
+    let wait = (CLEANUP_EVERY.as_millis() as u64).saturating_mul(1 << doublings);
+    now_ms >= last.saturating_add(wait)
+}
+
+/// Whether `a` and `b` are the same host: the same agent, or the same external backend
+/// and scope (one capacity pool; its allocations differ per orb).
+fn same_host(a: &Location, b: &Location) -> bool {
+    match (a, b) {
+        (
+            Location::Fleet {
+                backend_id: ba,
+                agent_id: aa,
+            },
+            Location::Fleet {
+                backend_id: bb,
+                agent_id: ab,
+            },
+        ) => ba == bb && aa == ab,
+        (
+            Location::External {
+                backend_id: ba,
+                scope: sa,
+                ..
+            },
+            Location::External {
+                backend_id: bb,
+                scope: sb,
+                ..
+            },
+        ) => ba == bb && sa == sb,
+        _ => false,
+    }
+}
 
 /// How long ago an orb may have gone to sleep or stopped and still have its wake room
 /// kept on its host ([`choose`]): orbs asleep longer rarely wake, and keeping room for
@@ -2852,6 +2894,43 @@ mod tests {
         }
     }
 
+    /// A retired orb's old host gets a delete at once, then again only after a wait
+    /// that doubles from [`CLEANUP_EVERY`], and no more than [`CLEANUP_ATTEMPTS`] in all.
+    #[test]
+    fn cleanup_deletes_back_off_and_stop() {
+        let every = CLEANUP_EVERY.as_millis() as u64;
+        assert!(cleanup_due(0, None, 0));
+        assert!(!cleanup_due(1, Some(1_000), 1_000 + every - 1));
+        assert!(cleanup_due(1, Some(1_000), 1_000 + every));
+        assert!(!cleanup_due(2, Some(1_000), 1_000 + 2 * every - 1));
+        assert!(cleanup_due(2, Some(1_000), 1_000 + 2 * every));
+        assert!(cleanup_due(3, Some(0), 4 * every));
+        assert!(!cleanup_due(CLEANUP_ATTEMPTS, Some(0), u64::MAX));
+    }
+
+    /// The same host is the same agent, or the same external backend and scope, whatever
+    /// allocation each orb there got.
+    #[test]
+    fn same_host_ignores_allocations() {
+        let agent = |id: &str| Location::Fleet {
+            backend_id: BackendId::new("fleet"),
+            agent_id: AgentId::new(id.to_owned()),
+        };
+        let boat = |scope: &str| Location::External {
+            backend_id: BackendId::new("boat"),
+            scope: BackendScopeId::new(scope),
+            allocation_id: AllocationId::generate(),
+        };
+        assert!(same_host(&agent("a"), &agent("a")));
+        assert!(!same_host(&agent("a"), &agent("b")));
+        assert!(
+            same_host(&boat("s"), &boat("s")),
+            "fresh allocations, same pool"
+        );
+        assert!(!same_host(&boat("s"), &boat("t")));
+        assert!(!same_host(&agent("a"), &boat("s")));
+    }
+
     /// Which runtimes free a checkpoint at the wake that restores it, and so may report
     /// it as freed: QEMU reads it into the guest's memory; Firecracker maps it for the
     /// life of the restored VM.
@@ -2868,6 +2947,10 @@ mod tests {
                 },
             )
         };
+        const {
+            assert!(crate::runtime::qemu::QemuRuntime::RESTORE_FREES_CHECKPOINT);
+            assert!(!crate::runtime::firecracker::FirecrackerRuntime::RESTORE_FREES_CHECKPOINT);
+        }
         assert!(fake(false).restore_frees_checkpoint(), "like QEMU");
         assert!(!fake(true).restore_frees_checkpoint(), "like Firecracker");
     }

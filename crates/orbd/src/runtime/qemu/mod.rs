@@ -316,6 +316,11 @@ fn cpu_model(nested: bool) -> &'static str {
 }
 
 impl QemuRuntime {
+    /// [`Runtime::restore_frees_checkpoint`]: yes. A restore loads the memory file into
+    /// the guest's own (anonymous) memory, so the checkpoint's blocks are freed when it
+    /// is discarded right after.
+    pub const RESTORE_FREES_CHECKPOINT: bool = true;
+
     /// Checks host prerequisites and identifies the QEMU binary and host CPU. Running
     /// VMs are adopted lazily, by the first `inspect` of each orb (agent recovery).
     pub fn new(
@@ -1390,10 +1395,8 @@ impl QemuRuntime {
 
 #[async_trait]
 impl Runtime for QemuRuntime {
-    /// A restore loads the memory file into the guest's own memory, so the checkpoint's
-    /// blocks are freed when it is discarded right after.
     fn restore_frees_checkpoint(&self) -> bool {
-        true
+        Self::RESTORE_FREES_CHECKPOINT
     }
 
     fn capabilities(&self) -> RuntimeCapabilities {

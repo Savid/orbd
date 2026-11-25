@@ -468,6 +468,19 @@ fn plain(log: &str) -> String {
     out
 }
 
+/// Heartbeats the coordinator has received from its agents.
+fn heartbeats(c: &Cluster) -> u64 {
+    c.metrics()
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("orbd_fleet_messages_total{type=\"heartbeat\"} ")?
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
 /// Whether the coordinator would let `amp_orb` start on its agent now.
 fn wakes_now(c: &Cluster, amp_orb: &str) -> bool {
     let list = c.admin(&["orb", "list", "--json"]);
@@ -504,6 +517,12 @@ fn a_wake_needs_room_for_a_second_checkpoint_only_where_the_first_stays() {
         assert_ok(&c.dispatch("spawn", "amp-2", &[]), "amp-2");
         // 2 GiB left: room for amp-1 to grow, not for a second checkpoint.
         if keeps {
+            // Heartbeats sent after amp-1 slept would carry a release, were there one.
+            let seen = heartbeats(&c);
+            wait_until(Duration::from_secs(10), "two more heartbeats", || {
+                heartbeats(&c) >= seen + 2
+            });
+            assert!(!wakes_now(&c, "amp-1"), "nothing frees amp-1's checkpoint");
             let wake = c.dispatch("spawn", "amp-1", &[]);
             assert_eq!(wake.code, 1, "{}", wake.stderr);
             assert!(

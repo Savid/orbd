@@ -277,6 +277,11 @@ pub struct FirecrackerRuntime {
 }
 
 impl FirecrackerRuntime {
+    /// [`Runtime::restore_frees_checkpoint`]: no. A restored VMM maps its memory file
+    /// (`File` backend) for the life of the VM, so the discarded checkpoint's blocks stay
+    /// allocated until that VMM exits, after the orb's next checkpoint is written.
+    pub const RESTORE_FREES_CHECKPOINT: bool = false;
+
     /// Checks host prerequisites, identifies the Firecracker binary and host CPU and
     /// installs orbd's firewall table. Running VMs are adopted lazily, by the first
     /// `inspect` of each orb.
@@ -1825,11 +1830,8 @@ impl Runtime for FirecrackerRuntime {
         true
     }
 
-    /// No: a restored VMM maps its memory file (`File` backend) for the life of the VM,
-    /// so the discarded checkpoint's blocks stay allocated until that VMM exits, after
-    /// the orb's next checkpoint is written.
     fn restore_frees_checkpoint(&self) -> bool {
-        false
+        Self::RESTORE_FREES_CHECKPOINT
     }
 
     fn archives(&self) -> bool {

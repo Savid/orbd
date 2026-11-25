@@ -420,23 +420,61 @@ pub fn unstarted(
     Ok(Some(failure))
 }
 
-/// Retired orbs whose delete has not completed and that have no command open: orbs
-/// that never started, replaced by a new incarnation elsewhere ([`CreatePlan::retire`]),
-/// whose old host is still to be told to delete what it recorded of them.
-pub fn retired_undeleted(c: &Connection) -> Result<Vec<OrbRecord>> {
-    let mut st = c.prepare(&format!(
-        "SELECT {ORB_COLS} FROM orbs o WHERE retired_ms IS NOT NULL
+/// A retired orb its old host is still to delete ([`retired_undeleted`]).
+#[derive(Clone, Debug)]
+pub struct RetiredUndeleted {
+    pub id: OrbId,
+    pub amp_orb_id: String,
+    pub location: Location,
+    pub last_issued_generation: u64,
+    pub spec_digest: SpecDigest,
+    pub target: ExecutionTarget,
+    pub resources: Resources,
+    /// Deletes sent for it so far, and when the last one was created.
+    pub attempts: u32,
+    pub last_attempt_ms: Option<u64>,
+}
+
+/// Retired orbs whose old host is still to be told to delete them: orbs that never
+/// started, replaced by a new incarnation elsewhere ([`CreatePlan::retire`]). Not those
+/// deleted, with a command open, or whose host answered a delete that it cannot run
+/// them (`UnsupportedCapability`: an agent without their runtime, which created nothing
+/// of them). Filtered here, only the fields a delete needs.
+pub fn retired_undeleted(c: &Connection) -> Result<Vec<RetiredUndeleted>> {
+    let mut st = c.prepare(
+        "SELECT o.id, o.amp_orb_id, o.location_json, o.last_issued_generation, o.spec_digest,
+                json_extract(o.spec_json, '$.template.target'),
+                json_extract(o.spec_json, '$.template.resources'),
+                (SELECT COUNT(*) FROM commands m WHERE m.orb_id = o.id
+                   AND json_extract(m.action_json, '$.kind') = 'delete'),
+                (SELECT MAX(created_ms) FROM commands m WHERE m.orb_id = o.id
+                   AND json_extract(m.action_json, '$.kind') = 'delete')
+         FROM orbs o
+         WHERE o.retired_ms IS NOT NULL
            AND EXISTS (SELECT 1 FROM delete_tombstones t WHERE t.orb_id = o.id)
+           AND COALESCE(json_extract(o.observation_json, '$.state.state.kind'), '') <> 'deleted'
            AND NOT EXISTS (SELECT 1 FROM commands m
-                           WHERE m.orb_id = o.id AND m.status <> 'terminal')"
-    ))?;
-    let orbs = st
-        .query_map([], orb_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(orbs
-        .into_iter()
-        .filter(|o| !matches!(o.observation.state.last_known(), StableOrbState::Deleted))
-        .collect())
+                           WHERE m.orb_id = o.id AND m.status <> 'terminal')
+           AND NOT EXISTS (SELECT 1 FROM commands m
+                           WHERE m.orb_id = o.id AND m.status = 'terminal'
+                             AND json_extract(m.action_json, '$.kind') = 'delete'
+                             AND json_extract(m.outcome_json, '$.result.Err.code')
+                                 = 'unsupported_capability')",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(RetiredUndeleted {
+            id: uuid_col(r, 0, OrbId::parse)?,
+            amp_orb_id: r.get(1)?,
+            location: de(r, 2)?,
+            last_issued_generation: u(r, 3)?,
+            spec_digest: SpecDigest(r.get(4)?),
+            target: de(r, 5)?,
+            resources: de(r, 6)?,
+            attempts: u(r, 7)?.min(u32::MAX as u64) as u32,
+            last_attempt_ms: u_opt(r, 8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// The orb, unless it is retired.
@@ -1397,27 +1435,69 @@ mod tests {
             "retired once"
         );
 
-        // Its old host deleted it.
+        // A delete that failed (its host was busy): still to do, the try counted.
         command(
             &c,
             old,
             6,
             &Action::Delete,
+            Err(CommandFailure {
+                code: FailureCode::BackendFailure,
+                message: "busy".into(),
+            }),
+            &uncreated,
+        );
+        let pending = retired_undeleted(&c).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|o| (o.id, o.attempts, o.last_attempt_ms))
+                .collect::<Vec<_>>(),
+            vec![(old, 1, Some(0))]
+        );
+        // Its old host deleted it.
+        command(
+            &c,
+            old,
+            7,
+            &Action::Delete,
             Ok(ActionResult::Deleted),
             &OrbState::known(StableOrbState::Deleted),
         );
         c.execute(
-            "UPDATE orbs SET observation_json = ?2, last_issued_generation = 6 WHERE id = ?1",
+            "UPDATE orbs SET observation_json = ?2, last_issued_generation = 7 WHERE id = ?1",
             params![
                 old.to_string(),
                 js(&VersionedObservation {
                     state: OrbState::known(StableOrbState::Deleted),
-                    generation: 6,
+                    generation: 7,
                     observed_at_unix_ms: 0,
                 })
             ],
         )
         .unwrap();
+        assert!(retired_undeleted(&c).unwrap().is_empty());
+
+        // A host that cannot run an orb (no runtime for it there) created nothing of it:
+        // its answer to the delete ends the cleanup.
+        let other = orb(&c, &uncreated, 0);
+        command(&c, other, 5, &Action::Spawn, refused(), &uncreated);
+        let rec = get_orb(&c, other).unwrap().unwrap();
+        let mut p = plan((other, 5));
+        p.new_orb.as_mut().unwrap().identity = rec.identity.clone();
+        create_command(&mut c, &p).unwrap();
+        assert_eq!(retired_undeleted(&c).unwrap().len(), 1);
+        command(
+            &c,
+            other,
+            6,
+            &Action::Delete,
+            Err(CommandFailure {
+                code: FailureCode::UnsupportedCapability,
+                message: "this agent has no runtime for the orb's execution target".into(),
+            }),
+            &uncreated,
+        );
         assert!(retired_undeleted(&c).unwrap().is_empty());
     }
 
