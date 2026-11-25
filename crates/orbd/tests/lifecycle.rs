@@ -565,13 +565,22 @@ fn sleeping_orbs_do_not_block_new_orbs_on_disk() {
         list.stdout
     );
 
-    // Waking a sleeping orb needs the same headroom: refused while two run, admitted
-    // once one sleeps.
-    let wake = c.dispatch("spawn", "amp-asleep-0", &[]);
-    assert_eq!(wake.code, 1, "{}", wake.stderr);
-    assert!(wake.stderr.contains("InsufficientDisk"), "{}", wake.stderr);
-    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause amp-1");
+    // Waking a sleeping orb needs only its growth (1 GiB): the memory checkpoint it
+    // wakes from already takes its room, and the next one takes it again. Admitted with
+    // 2 GiB left; the next wake, with none left, is refused until an orb sleeps.
     assert_ok(&c.dispatch("spawn", "amp-asleep-0", &[]), "wake");
+    let wake = c.dispatch("spawn", "amp-asleep-1", &[]);
+    assert_eq!(wake.code, 1, "{}", wake.stderr);
+    assert!(
+        wake.stderr.contains("InsufficientDisk")
+            && wake
+                .stderr
+                .contains("the orb's host lacks capacity to run it: disk: needs 1.0 GiB headroom"),
+        "{}",
+        wake.stderr
+    );
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "pause amp-1");
+    assert_ok(&c.dispatch("spawn", "amp-asleep-1", &[]), "wake");
 }
 
 /// A host whose filesystem is nearly full refuses new orbs with InsufficientDisk and

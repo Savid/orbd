@@ -4,7 +4,7 @@
 //! longer drives.
 
 use super::core::{
-    BACKEND_CALL_TIMEOUT, Msg, OperatorJob, Policy, demand, shortfalls, state_label,
+    BACKEND_CALL_TIMEOUT, Msg, OperatorJob, Policy, shortfalls, state_label, wake_demand,
 };
 use super::db::Db;
 use super::store::{self, CmdHistory};
@@ -441,7 +441,17 @@ impl OrbsService {
                                 used.held.disk_bytes.saturating_sub(own.disk_bytes);
                             used.running = used.running.saturating_sub(1);
                         }
-                        let need = demand(&self.policy, &orb.spec.template);
+                        // Net of the checkpoint it would wake from, as admission does.
+                        let checkpoint = disk
+                            .get(&orb.location)
+                            .and_then(|d| d.get(&orb.id))
+                            .map(|u| u.checkpoint_bytes);
+                        let need = wake_demand(
+                            &self.policy,
+                            &orb.spec.template,
+                            &orb.observation.state,
+                            checkpoint,
+                        );
                         wake_blockers.extend(
                             shortfalls(cand, &used, need)
                                 .into_iter()

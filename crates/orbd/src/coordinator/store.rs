@@ -313,7 +313,62 @@ pub fn idle_orbs(c: &Connection, cutoff_ms: u64) -> Result<Vec<OrbRecord>> {
         .collect())
 }
 
-/// Retires a deleted orb so a new incarnation can take its Amp id.
+/// The orbs asleep or stopped in one pool (their reservations hold nothing now), not
+/// retired: those that may wake there.
+pub fn stopped_orbs(c: &Connection, backend: &str, pool: &str) -> Result<Vec<OrbRecord>> {
+    let mut st = c.prepare(&format!(
+        "SELECT {ORB_COLS} FROM orbs WHERE retired_ms IS NULL AND id IN
+           (SELECT orb_id FROM reservations
+            WHERE backend_id = ?1 AND pool = ?2 AND kind = 'stopped')"
+    ))?;
+    Ok(st
+        .query_map(params![backend, pool], orb_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Retires an orb that never started, so that its next spawn places a new incarnation
+/// anywhere: only while its last command (`generation`, nothing issued since, none
+/// open) left it known uncreated, none of its commands ever started or paused it, and
+/// no delete has begun. Its host said nothing of it exists there, and is sent nothing
+/// for it again. Returns whether it retired the orb.
+pub fn retire_unstarted(c: &mut Connection, orb: OrbId, generation: u64) -> Result<bool> {
+    let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(rec) = get_orb_by_id_live(&tx, orb)? else {
+        return Ok(false);
+    };
+    let unstarted = rec.last_issued_generation == generation
+        && rec.observation.generation == generation
+        && rec.observation.state
+            == OrbState::Known {
+                state: StableOrbState::Uncreated,
+            }
+        && open_command(&tx, orb)?.is_none()
+        && last_active(&tx, orb)?.is_none()
+        && !is_tombstoned(&tx, orb)?;
+    if !unstarted {
+        return Ok(false);
+    }
+    retire_orb(&tx, orb)?;
+    tx.execute(
+        "DELETE FROM reservations WHERE orb_id = ?1",
+        params![orb.to_string()],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The orb, unless it is retired.
+fn get_orb_by_id_live(c: &Connection, id: OrbId) -> Result<Option<OrbRecord>> {
+    Ok(c.query_row(
+        &format!("SELECT {ORB_COLS} FROM orbs WHERE id = ?1 AND retired_ms IS NULL"),
+        params![id.to_string()],
+        orb_row,
+    )
+    .optional()?)
+}
+
+/// Retires a deleted orb (or one that never started, [`retire_unstarted`]) so a new
+/// incarnation can take its Amp id.
 pub fn retire_orb(c: &Connection, orb: OrbId) -> Result<()> {
     c.execute(
         "UPDATE orbs SET retired_ms = ?2 WHERE id = ?1 AND retired_ms IS NULL",
@@ -1051,5 +1106,166 @@ mod tests {
             "faulted"
         );
         assert_eq!(observed(&c, f).state, faulted);
+    }
+
+    /// A command of `orb` at `generation`, terminal with `result` and `observed`.
+    fn command(
+        c: &Connection,
+        orb: OrbId,
+        generation: u64,
+        action: &Action,
+        result: Result<ActionResult, CommandFailure>,
+        observed: &OrbState,
+    ) {
+        let outcome = CommandOutcome {
+            result,
+            observed: observed.clone(),
+            processes: ProcessDisposition::NotApplicable,
+            snapshot: SnapshotDisposition::NotRequested,
+        };
+        c.execute(
+            "INSERT INTO commands(operation_id, orb_id, generation, action_json, command_digest,
+                status, outcome_json, created_ms, terminal_ms, work_deadline_ms,
+                cleanup_deadline_ms)
+             VALUES (?1, ?2, ?3, ?4, 'd', 'terminal', ?5, 0, 1, 0, 0)",
+            params![
+                OperationId::generate().to_string(),
+                orb.to_string(),
+                generation as i64,
+                js(action),
+                js(&outcome)
+            ],
+        )
+        .unwrap();
+    }
+
+    fn refused() -> Result<ActionResult, CommandFailure> {
+        Err(CommandFailure {
+            code: FailureCode::InsufficientMemory,
+            message: "agent capacity exceeded".into(),
+        })
+    }
+
+    /// Only an orb whose commands never started it, the last of them (nothing issued
+    /// since, none open) leaving it known uncreated, with no delete begun, is retired
+    /// for a new incarnation; retiring frees its Amp id and is done once.
+    #[test]
+    fn only_orbs_that_never_started_are_retired_for_a_new_placement() {
+        let mut c = crate::coordinator::db::test_connection();
+        let uncreated = OrbState::known(StableOrbState::Uncreated);
+        let identity_free = |c: &Connection, id: OrbId| {
+            get_orb_by_identity(c, "amp", &format!("amp-{id}"))
+                .unwrap()
+                .is_none()
+        };
+
+        let u = orb(&c, &uncreated, 0);
+        command(&c, u, 5, &Action::Spawn, refused(), &uncreated);
+        assert!(
+            !retire_unstarted(&mut c, u, 4).unwrap(),
+            "a newer generation was issued"
+        );
+        assert!(retire_unstarted(&mut c, u, 5).unwrap());
+        assert!(
+            identity_free(&c, u),
+            "its Amp id is free for a new incarnation"
+        );
+        assert!(!retire_unstarted(&mut c, u, 5).unwrap(), "once");
+
+        // It started once (a spawn succeeded): it has a disk somewhere.
+        let s = orb(&c, &uncreated, 0);
+        command(
+            &c,
+            s,
+            4,
+            &Action::Spawn,
+            Ok(ActionResult::Spawned {
+                start: StartKind::NewDisk,
+                bootstrap_generation: 4,
+            }),
+            &OrbState::known(StableOrbState::Running),
+        );
+        command(&c, s, 5, &Action::Spawn, refused(), &uncreated);
+        assert!(!retire_unstarted(&mut c, s, 5).unwrap(), "started before");
+
+        for state in [
+            OrbState::known(StableOrbState::Sleeping {
+                checkpoint: SleepCheckpointRef { generation: 3 },
+            }),
+            OrbState::known(StableOrbState::DiskOnlyStopped {
+                reason: "stopped".into(),
+            }),
+            OrbState::Faulted {
+                last_known: StableOrbState::Uncreated,
+                reason: "disk is missing".into(),
+            },
+        ] {
+            let o = orb(&c, &state, 0);
+            assert!(!retire_unstarted(&mut c, o, 5).unwrap(), "{state:?}");
+        }
+
+        // A command still open.
+        let o = orb(&c, &uncreated, 0);
+        c.execute(
+            "INSERT INTO commands(operation_id, orb_id, generation, action_json, command_digest,
+                status, created_ms, work_deadline_ms, cleanup_deadline_ms)
+             VALUES (?1, ?2, 5, ?3, 'd', 'accepted', 0, 0, 0)",
+            params![
+                OperationId::generate().to_string(),
+                o.to_string(),
+                js(&Action::Spawn)
+            ],
+        )
+        .unwrap();
+        assert!(
+            !retire_unstarted(&mut c, o, 5).unwrap(),
+            "a command is open"
+        );
+
+        // A delete has begun.
+        let d = orb(&c, &uncreated, 0);
+        c.execute(
+            "INSERT INTO delete_tombstones(amp_endpoint, amp_orb_id, orb_id, created_ms)
+             VALUES ('amp', ?1, ?2, 0)",
+            params![format!("amp-{d}"), d.to_string()],
+        )
+        .unwrap();
+        assert!(!retire_unstarted(&mut c, d, 5).unwrap(), "being deleted");
+        assert!(!identity_free(&c, d));
+    }
+
+    /// The orbs that may wake in a pool are those whose reservations are stopped, live.
+    #[test]
+    fn stopped_orbs_are_those_that_may_wake_in_the_pool() {
+        let mut c = crate::coordinator::db::test_connection();
+        let asleep = OrbState::known(StableOrbState::Sleeping {
+            checkpoint: SleepCheckpointRef { generation: 3 },
+        });
+        let reserve = |c: &Connection, o: OrbId, pool: &str, kind: &str| {
+            c.execute(
+                "INSERT INTO reservations(orb_id, backend_id, pool, vcpus, memory_bytes,
+                    disk_bytes, kind) VALUES (?1, 'fleet', ?2, 0, 0, 0, ?3)",
+                params![o.to_string(), pool, kind],
+            )
+            .unwrap();
+        };
+        let a = orb(&c, &asleep, 0);
+        reserve(&c, a, "agent-a", "stopped");
+        let r = orb(&c, &OrbState::known(StableOrbState::Running), 0);
+        reserve(&c, r, "agent-a", "running");
+        let b = orb(&c, &asleep, 0);
+        reserve(&c, b, "agent-b", "stopped");
+        let gone = orb(&c, &asleep, 0);
+        reserve(&c, gone, "agent-a", "stopped");
+        retire_orb(&c, gone).unwrap();
+        let ids = |c: &mut Connection| -> Vec<OrbId> {
+            stopped_orbs(c, "fleet", "agent-a")
+                .unwrap()
+                .into_iter()
+                .map(|o| o.id)
+                .collect()
+        };
+        assert_eq!(ids(&mut c), vec![a]);
+        assert!(stopped_orbs(&c, "other", "agent-a").unwrap().is_empty());
     }
 }

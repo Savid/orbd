@@ -449,3 +449,115 @@ fn snapshot_misses_count_overflow_and_other_architectures() {
     assert_eq!(placements(&c, "elsewhere"), 1);
     assert_eq!(placements(&c, "absent"), 0);
 }
+
+/// A sleeping orb's wake is admitted net of the memory checkpoint it sleeps on: that
+/// checkpoint already takes its room on the host and is discarded once the orb runs, so
+/// its next one needs no more. Here the agent's disk keeps room for one more orb's
+/// growth (1 GiB of headroom) but not for its growth and a second checkpoint (2 GiB).
+#[test]
+fn a_wake_needs_room_for_its_growth_not_a_second_checkpoint() {
+    let mut c = Cluster::with_runtime(
+        &["agent-a"],
+        2,
+        "fake",
+        "runtime:\n  fake:\n    memory_preserving_sleep: true\n    \
+         disk: { free_gib: 6, total_gib: 100 }\n",
+    );
+    c.agent_env
+        .push(("ORBD_DISK_RESERVE_GIB".into(), "1".into()));
+    c.start_all();
+    // 6 GiB free less the 1 GiB reserve: 5 GiB; a running orb holds 1 + 2 GiB.
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1");
+    assert_ok(&c.dispatch("pause", "amp-1", &[]), "amp-1 sleeps");
+    assert!(!c.fake_orb("agent-a", "amp-1").checkpoints.is_empty());
+    assert_ok(&c.dispatch("spawn", "amp-2", &[]), "amp-2");
+    // 2 GiB left: enough for amp-1 to grow, not for a checkpoint besides its own.
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake amp-1");
+    assert!(c.fake_orb("agent-a", "amp-1").running);
+}
+
+/// A new orb leaves its host the room to wake the orbs asleep there (they cannot wake
+/// anywhere else) when another host can take it, even passing over its project
+/// snapshot, which is counted as a `wake_room` miss.
+#[test]
+fn new_orbs_leave_room_to_wake_the_orbs_asleep_on_their_host() {
+    let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
+    c.start_all();
+    let snap = [("ORB_SNAPSHOT_ID", "project-1")];
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1");
+    assert_ok(
+        &c.dispatch("pause", "amp-1", &snap),
+        "amp-1 publishes project-1",
+    );
+    let (holder, other) = match c.fake_orbs("agent-a").is_empty() {
+        true => ("agent-b", "agent-a"),
+        false => ("agent-a", "agent-b"),
+    };
+
+    // Each agent runs two orbs: amp-2 and amp-1's wake fit on the holder.
+    assert_ok(&c.dispatch("spawn", "amp-2", &snap), "amp-2");
+    assert!(
+        c.fake_orb(holder, "amp-2").running,
+        "amp-2 goes where project-1 is"
+    );
+    // amp-3 there would leave amp-1 unable to wake.
+    assert_ok(&c.dispatch("spawn", "amp-3", &snap), "amp-3");
+    assert!(
+        c.fake_orb(other, "amp-3").running,
+        "amp-3 leaves {holder} the room to wake amp-1"
+    );
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "wake amp-1");
+    assert!(c.fake_orb(holder, "amp-1").running);
+    assert_eq!(placements(&c, "hit"), 1);
+    assert_eq!(placements(&c, "wake_room"), 1);
+    assert_eq!(placements(&c, "elsewhere"), 0);
+    assert_eq!(c.logs().matches(SNAPSHOT_MISS).count(), 1);
+}
+
+/// An orb whose first spawn its agent refused before creating anything has nothing on
+/// that agent: once the agent cannot take it (here it is gone), its next spawn places
+/// a new incarnation on another agent, once. An orb that ever started stays where its
+/// disk is.
+#[test]
+fn an_orb_that_never_started_is_placed_anew_when_its_agent_cannot_take_it() {
+    let mut c = Cluster::new(&["agent-a", "agent-b"], 2);
+    c.start_coordinator("");
+    // agent-a runs only the images its allowlist names: not amp-1's.
+    c.start_agent_with_env(
+        "agent-a",
+        &[("ORBD_IMAGE_ALLOW", "example.invalid/tools/*")],
+    );
+    c.wait_connected(1);
+    let refused = c.dispatch("spawn", "amp-1", &[]);
+    assert_ne!(refused.code, 0, "{}", refused.stdout);
+    assert!(c.fake_orbs("agent-a").iter().all(|o| !o.disk));
+    let tools = [("ORB_IMAGE", "example.invalid/tools/orb:1")];
+    assert_ok(&c.dispatch("spawn", "amp-2", &tools), "amp-2");
+    assert_ok(
+        &c.dispatch("pause", "amp-2", &[]),
+        "amp-2 sleeps on agent-a",
+    );
+
+    c.terminate_agent("agent-a", Duration::from_secs(30));
+    c.start_agent("agent-b", "");
+    c.wait_connected(1);
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1 placed anew");
+    assert!(
+        c.fake_orb("agent-b", "amp-1").running,
+        "amp-1 runs on agent-b"
+    );
+    // Its next spawn finds it where it runs now.
+    assert_ok(&c.dispatch("spawn", "amp-1", &[]), "amp-1 again");
+    assert_eq!(
+        c.logs()
+            .matches("spawn of an orb that never started: placing it anew")
+            .count(),
+        1
+    );
+
+    // amp-2 has its disk on agent-a: it waits for agent-a.
+    let job = c.dispatch("spawn", "amp-2", &tools);
+    assert_eq!(job.code, 75, "{}", job.stderr);
+    assert!(job.stderr.contains("BackendUnavailable"), "{}", job.stderr);
+    assert_eq!(c.fake_orbs("agent-b").len(), 1, "amp-2 is not re-placed");
+}
